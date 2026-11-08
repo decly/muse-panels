@@ -1,0 +1,152 @@
+import {
+  integer,
+  primaryKey,
+  real,
+  sqliteTable,
+  text,
+  uniqueIndex,
+} from "drizzle-orm/sqlite-core";
+
+// Brokerage accounts. Seeded in code with the two built-in accounts
+// (broker-a 券商A, broker-b 券商B); new accounts can be added as rows later
+// without a schema change.
+export const accounts = sqliteTable("accounts", {
+  // Stable machine id, e.g. "broker-a" | "broker-b".
+  id: text("id").primaryKey(),
+  // Display name shown on the account tab, e.g. "券商A".
+  name: text("name").notNull(),
+  sort: integer("sort").notNull(),
+});
+
+// The user's own holdings, seeded once with demo data and editable
+// in the UI afterwards. Every row belongs to
+// exactly one account; the same symbol may exist in several accounts.
+export const holdings = sqliteTable(
+  "holdings",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    accountId: text("account_id").notNull().default("broker-a"),
+    // Display symbol as the broker shows it, e.g. "BRK/B".
+    symbol: text("symbol").notNull(),
+    // Symbol the quote source resolves, e.g. "BRK.B".
+    quoteSymbol: text("quote_symbol").notNull(),
+    name: text("name").notNull(),
+    qty: real("qty").notNull(),
+    costPerShare: real("cost_per_share").notNull(),
+    kind: text("kind", { enum: ["stock", "etf"] }).notNull(),
+    theme: text("theme").notNull(),
+  },
+  (t) => [uniqueIndex("holdings_account_symbol_unique").on(t.accountId, t.symbol)],
+);
+
+// Latest quote per quote_symbol, upserted by refreshQuotes. Quotes are
+// shared across accounts (one row per symbol, not per holding).
+// `price` is always the regular-session price (the official basis).
+// After-hours fields come from Nasdaq's extended-trading feed and are
+// annotation-only: they never enter market value or P/L.
+export const quoteSnapshots = sqliteTable("quote_snapshots", {
+  quoteSymbol: text("quote_symbol").primaryKey(),
+  price: real("price"),
+  change: real("change"),
+  changePercent: real("change_percent"),
+  high: real("high"),
+  low: real("low"),
+  week52High: real("week_52_high"),
+  week52Low: real("week_52_low"),
+  marketCap: real("market_cap"),
+  marketStatus: text("market_status"),
+  asOf: text("as_of"),
+  afterPrice: real("after_price"),
+  // Percent move of the after-hours price versus the regular close.
+  afterChangePercent: real("after_change_percent"),
+  afterAsOf: text("after_as_of"),
+  // Session-aware extended-hours snapshot (plan B, 2026-11-08): the
+  // most relevant extended-session last trade — pre-market when the
+  // pre session is the live/recent one, after-hours otherwise. Stored
+  // separately from the regular close and never used in totals.
+  // extSession: "pre" | "post". Overnight hours have no public feed;
+  // the stored row then holds the after-hours last trade, labeled as
+  // the latest available price. after_* stays as the post-session
+  // mirror for backward compatibility.
+  extPrice: real("ext_price"),
+  // Percent move of the extended price versus its session's regular
+  // close (previous close for pre-market, same-day close for post).
+  extChangePercent: real("ext_change_percent"),
+  extAsOf: text("ext_as_of"),
+  extSession: text("ext_session"),
+  // Which channel supplied the regular quote: "finance" | "nasdaq".
+  source: text("source"),
+  fetchedAt: integer("fetched_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+// Latest USD/CNY rate, upserted by refreshQuotes (one row, pair = "USD/CNY").
+export const fxSnapshots = sqliteTable("fx_snapshots", {
+  pair: text("pair").primaryKey(),
+  rate: real("rate"),
+  source: text("source"),
+  asOf: text("as_of"),
+  fetchedAt: integer("fetched_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+// Market benchmarks (S&P 500, Nasdaq-100, COMEX gold), one row per key,
+// upserted by refreshQuotes from Yahoo Finance chart data.
+export const marketSnapshots = sqliteTable("market_snapshots", {
+  key: text("key").primaryKey(),
+  label: text("label").notNull(),
+  price: real("price"),
+  change: real("change"),
+  changePercent: real("change_percent"),
+  asOf: text("as_of"),
+  source: text("source"),
+  note: text("note"),
+  fetchedAt: integer("fetched_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+// One row per account per US trading day, written by refreshQuotes
+// (deduped by date + account) plus a demo record seeded once. The global history is the per-date sum
+// across accounts, computed at read time, never stored. Benchmark closes
+// ride along so the client can normalize account vs index curves from
+// the same rows. source: "manual" (never overwritten by a refresh)
+// | "refresh".
+export const dailySnapshots = sqliteTable(
+  "daily_snapshots",
+  {
+    // US trading date, YYYY-MM-DD (America/New_York).
+    date: text("date").notNull(),
+    accountId: text("account_id").notNull().default("broker-a"),
+    accountValueUsd: real("account_value_usd").notNull(),
+    securitiesValueUsd: real("securities_value_usd").notNull(),
+    cashUsd: real("cash_usd").notNull(),
+    totalPnlUsd: real("total_pnl_usd"),
+    dayChangeUsd: real("day_change_usd"),
+    dayChangePct: real("day_change_pct"),
+    fxRate: real("fx_rate"),
+    accountValueCny: real("account_value_cny"),
+    spxPrice: real("spx_price"),
+    ndxPrice: real("ndx_price"),
+    source: text("source").notNull(),
+    createdAt: integer("created_at", { mode: "timestamp_ms" })
+      .notNull()
+      .$defaultFn(() => new Date()),
+  },
+  (t) => [primaryKey({ columns: [t.date, t.accountId] })],
+);
+
+// Cash balance per account (one row per account_id), from the user's
+// broker balances entered by hand. Cash has no live feed; each row stays a
+// labeled snapshot the user can update in the UI until they provide a
+// newer figure.
+export const accountBalances = sqliteTable("account_balances", {
+  accountId: text("account_id").primaryKey(),
+  cashUsd: real("cash_usd").notNull(),
+  snapshotLabel: text("snapshot_label").notNull(),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
