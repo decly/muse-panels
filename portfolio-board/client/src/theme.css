@@ -1,0 +1,65 @@
+@import "tailwindcss";
+@import "tailwindcss-safe-area";
+
+@theme {
+  --text-xs: 13px;
+  --text-xs--line-height: 18px;
+  --text-sm: 15px;
+  --text-sm--line-height: 22px;
+  --text-base: 17px;
+  --text-base--line-height: 26px;
+  --text-lg: 19px;
+  --text-lg--line-height: 28px;
+  --text-xl: 22px;
+  --text-xl--line-height: 30px;
+  --text-2xl: 26px;
+  --text-2xl--line-height: 34px;
+  --text-3xl: 32px;
+  --text-3xl--line-height: 38px;
+  --text-4xl: 40px;
+  --text-4xl--line-height: 44px;
+  --text-5xl: 52px;
+  --text-5xl--line-height: 56px;
+}
+
+:root {
+  color-scheme: light dark;
+  --bg: #eef1f4;
+  --surface: #ffffff;
+  --surface-2: #f4f6f8;
+  --text: #131a21;
+  --dim: #5d6b78;
+  --border: #d9dfe6;
+  --accent: #b97e10;
+  /* 红涨绿跌 (Chinese market convention): up/gain = red, down/loss = green.
+     --danger is reserved for errors/warnings, not price movement. */
+  --up: #cf3a32;
+  --down: #128a4c;
+  --danger: #cf3a32;
+  --radius: 10px;
+  --space-surface: var(--surface);
+  --space-surface-alt: var(--surface-2);
+  --space-muted: var(--dim);
+  --space-border: var(--border);
+  --space-accent: var(--accent);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117;
+    --surface: #161c24;
+    --surface-2: #1b232e;
+    --text: #e6ebf0;
+    --dim: #8b98a5;
+    --border: #232b36;
+    --accent: #d29922;
+    --up: #e5534b;
+    --down: #2ebd6e;
+    --danger: #e5534b;
+  }
+}
+
+.num {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
