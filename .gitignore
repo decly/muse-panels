@@ -1,0 +1,18 @@
+# Data plane - NEVER commit: the live database holds the owner's private
+# holdings, cash and snapshots.
+app.db
+app.db-shm
+app.db-wal
+*.db
+
+# Dependencies & build output
+node_modules/
+.bun-cache/
+dist/
+.space-build/
+.space-build-cvm/
+.harness/
+.tsbuildinfo
+
+# Local sync records
+*.muse-github-snapshot-sync.json
