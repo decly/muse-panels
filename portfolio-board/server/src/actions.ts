@@ -8,11 +8,14 @@
 // and cash/history are summed across accounts. The official price
 // basis is the US regular-session
 // close: market value, day change and P/L are computed from regular
-// prices only. Extended-hours prices (Nasdaq extended-trading feeds,
-// pre-market and after-hours) are stored separately (ext_* fields,
-// plus the legacy after_* post-session mirror), shown as annotations
-// and in a clearly-labeled live estimate next to the official total;
-// they never enter the official totals or the daily snapshots.
+// prices only. Extended-hours prices (Nasdaq extended-trading feeds
+// for pre-market and after-hours; Yahoo chart meta.fulldayPrice for
+// the overnight session, which Nasdaq does not cover) are stored
+// separately (ext_* fields, plus the legacy after_* post-session
+// mirror), shown as annotations and in a clearly-labeled live
+// estimate next to the official total; they never enter the official
+// totals or the daily snapshots. The overnight price carries no
+// trade timestamp: its ext_as_of is the fetch moment, labeled 抓取于.
 //
 // Quote channels, in order:
 //  1. ctx.tool.finance_ticker (managed channel) for every holding.
@@ -128,6 +131,14 @@ const marketSchema = z.object({
   as_of: z.string().nullable(),
   source: z.string().nullable(),
   note: z.string().nullable(),
+  // All-time highest close and the date (YYYY-MM-DD) it was set;
+  // null until the one-time seed succeeds.
+  peak_price: z.number().nullable(),
+  peak_date: z.string().nullable(),
+  // Highest close within the trailing 3-year window and its date;
+  // null until its seed succeeds. Client derives 距高点 from this.
+  peak3y_price: z.number().nullable(),
+  peak3y_date: z.string().nullable(),
 });
 
 const snapshotSchema = z.object({
@@ -355,10 +366,14 @@ const SESSION_LABELS: Record<UsSessionKey, string> = {
   closed: "休市",
 };
 
-// Session boundaries (ET, weekdays): pre 04:00–09:30, regular
-// 09:30–16:00, post 16:00–20:00, overnight 20:00–04:00; weekends are
-// closed. Holidays are not modeled — on a holiday the feeds simply
-// return the last session's data with its own timestamp.
+// Session boundaries (ET): pre 04:00–09:30, regular 09:30–16:00,
+// post 16:00–20:00 (Mon–Fri), overnight 20:00–04:00. The overnight
+// (Blue Ocean) session runs Sunday–Thursday nights: its evening leg
+// (20:00–24:00) belongs to Sun–Thu and its after-midnight leg
+// (00:00–04:00) to Mon–Fri, so Sunday evening is overnight (not
+// closed) and Friday night / Saturday are closed (no session).
+// Holidays are not modeled — on a holiday the feeds simply return
+// the last session's data with its own timestamp.
 function currentUsSession(at: Date = new Date()): {
   key: UsSessionKey;
   label: string;
@@ -372,10 +387,19 @@ function currentUsSession(at: Date = new Date()): {
   }).formatToParts(at);
   const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
   const weekday = get("weekday");
+  const minutes = Number(get("hour")) * 60 + Number(get("minute"));
+  const eveningLeg =
+    ["Sun", "Mon", "Tue", "Wed", "Thu"].includes(weekday) &&
+    minutes >= 20 * 60;
+  const morningLeg =
+    ["Mon", "Tue", "Wed", "Thu", "Fri"].includes(weekday) &&
+    minutes < 4 * 60;
+  if (eveningLeg || morningLeg) {
+    return { key: "overnight", label: SESSION_LABELS.overnight };
+  }
   if (weekday === "Sat" || weekday === "Sun") {
     return { key: "closed", label: SESSION_LABELS.closed };
   }
-  const minutes = Number(get("hour")) * 60 + Number(get("minute"));
   if (minutes >= 4 * 60 && minutes < 9 * 60 + 30) {
     return { key: "pre", label: SESSION_LABELS.pre };
   }
@@ -385,7 +409,8 @@ function currentUsSession(at: Date = new Date()): {
   if (minutes < 20 * 60) {
     return { key: "post", label: SESSION_LABELS.post };
   }
-  return { key: "overnight", label: SESSION_LABELS.overnight };
+  // Friday 20:00–24:00: no overnight session into the weekend.
+  return { key: "closed", label: SESSION_LABELS.closed };
 }
 
 async function loadPortfolio(ctx: Ctx): Promise<PortfolioResponse> {
@@ -442,7 +467,19 @@ async function loadPortfolio(ctx: Ctx): Promise<PortfolioResponse> {
         }
       : null;
   const fxRow = fxRows[0];
-  const marketOrder = ["SPX", "NDX", "GOLD", "SGOLD"];
+  const marketOrder = [
+    "SPX",
+    "NDX",
+    "IXIC",
+    "SSEC",
+    "CSI300",
+    "A500",
+    "HSTECH",
+    "N225",
+    "VNI",
+    "GOLD",
+    "SGOLD",
+  ];
   const market = marketRows
     .map((m) => ({
       key: m.key,
@@ -453,6 +490,10 @@ async function loadPortfolio(ctx: Ctx): Promise<PortfolioResponse> {
       as_of: m.asOf,
       source: m.source,
       note: m.note,
+      peak_price: m.peakPrice,
+      peak_date: m.peakDate,
+      peak3y_price: m.peak3yPrice,
+      peak3y_date: m.peak3yDate,
     }))
     .sort(
       (a, b) => marketOrder.indexOf(a.key) - marketOrder.indexOf(b.key),
@@ -558,8 +599,10 @@ type ExtendedQuote = { price: number; asOf: string | null };
 // session's last trade and lastUpdateInfo[0] its update stamp (both
 // verified live 2026-11-08). Outside its session the pre feed returns
 // consolidated = null, which we treat as "no data" (never guessed).
-// There is no Nasdaq feed for the overnight session (Blue Ocean), so
-// overnight hours reuse the post session's last trade, timestamped.
+// There is no Nasdaq feed for the overnight session (Blue Ocean) —
+// overnight prices come from Yahoo fulldayPrice (see below); this
+// post feed remains the per-symbol fallback when Yahoo yields
+// nothing, with its own timestamp.
 async function fetchNasdaqExtended(
   quoteSymbol: string,
   kind: string,
@@ -594,6 +637,40 @@ async function fetchNasdaqExtended(
     ? upd.replace(/^Data last updated\s*/i, "").replace(/\.\s*$/, "")
     : null;
   return { price, asOf };
+}
+
+// ---------- Yahoo overnight (Blue Ocean) price ----------
+//
+// Nasdaq has no overnight quote stream, so during the overnight
+// session (20:00–04:00 ET) the extended price comes from Yahoo
+// Finance's chart API instead: meta.fulldayPrice is the latest price
+// including pre/post/overnight (Blue Ocean) trades — during the
+// overnight session it tracks the live overnight tape while Nasdaq's
+// post feed still shows the stale after-hours last trade.
+// fulldayPrice carries NO trade timestamp, so callers stamp ext_as_of
+// with the fetch moment and the UI labels it 抓取于 (fetched at) —
+// never as a trade time. Yahoo symbols match quoteSymbol except
+// BRK.B, which Yahoo spells BRK-B. Any failure (non-OK status,
+// missing / non-numeric / non-positive fulldayPrice) returns null and
+// the caller keeps the existing after-hours fallback behavior.
+async function fetchYahooOvernightPrice(
+  quoteSymbol: string,
+): Promise<number | null> {
+  const yahooSymbol = quoteSymbol === "BRK.B" ? "BRK-B" : quoteSymbol;
+  try {
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}?range=1d&interval=1m`;
+    const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+    if (!res.ok) return null;
+    const json = (await res.json()) as {
+      chart?: {
+        result?: { meta?: { fulldayPrice?: number } }[];
+      };
+    };
+    const p = json.chart?.result?.[0]?.meta?.fulldayPrice;
+    return typeof p === "number" && Number.isFinite(p) && p > 0 ? p : null;
+  } catch {
+    return null;
+  }
 }
 
 // ---------- USD/CNY ----------
@@ -659,12 +736,37 @@ async function fetchUsdCny(): Promise<{
   return null;
 }
 
-// ---------- Market benchmarks (Yahoo Finance chart API) ----------
+// ---------- Market benchmarks ----------
 
-// ^GSPC / ^NDX are the cash indices on their regular-session basis.
+// Yahoo chart API: ^GSPC / ^NDX / ^IXIC / ^N225 are the cash indices
+// on their regular-session basis. `tz` is the market's own timezone,
+// used to date-stamp the all-time peak (seed + ratchet).
 const BENCHMARKS = [
-  { key: "SPX", label: "标普500", yahoo: "^GSPC", note: "指数 · 常规收盘" },
-  { key: "NDX", label: "纳指100", yahoo: "^NDX", note: "指数 · 常规收盘" },
+  { key: "SPX", label: "标普500", yahoo: "^GSPC", note: "指数 · 常规收盘", tz: "America/New_York" },
+  { key: "NDX", label: "纳指100", yahoo: "^NDX", note: "指数 · 常规收盘", tz: "America/New_York" },
+  { key: "IXIC", label: "纳指综合", yahoo: "^IXIC", note: "指数 · 常规收盘", tz: "America/New_York" },
+  { key: "N225", label: "日经225", yahoo: "^N225", note: "指数 · 常规收盘", tz: "Asia/Tokyo" },
+] as const;
+
+// Eastmoney K-line indices (same endpoint family as the gold seeds
+// below): A-share indices under market 1, global indices under market
+// 100, Hong Kong indices under market 124. 100.VNINDEX is Eastmoney's
+// Ho Chi Minh index (data.name 越南胡志明， verified live 2026-11-09;
+// Yahoo has no VN-Index symbol). 124.HSTECH is the Hang Seng TECH
+// Index (data.name 恒生科技指数， verified live 2026-11-09; Yahoo's
+// ^HSTECH returns "No data found, symbol may be delisted", so
+// Eastmoney is its source — price/change from the last two daily
+// closes, peak seeded from the full history back to the 2014 base
+// period: max close 10,945.22 on 2021-02-17).
+// Price/change come from the last two daily closes; the peak seed is
+// the same endpoint's full history. 中证A500's series carries
+// back-calculated history before its 2024 launch — seeded as returned.
+const EM_INDICES = [
+  { key: "SSEC", label: "上证指数", secid: "1.000001", note: "指数 · 常规收盘" },
+  { key: "CSI300", label: "沪深300", secid: "1.000300", note: "指数 · 常规收盘" },
+  { key: "A500", label: "中证A500", secid: "1.000510", note: "指数 · 常规收盘" },
+  { key: "HSTECH", label: "恒生科技", secid: "124.HSTECH", note: "指数 · 常规收盘" },
+  { key: "VNI", label: "越南胡志明", secid: "100.VNINDEX", note: "指数 · 常规收盘" },
 ] as const;
 
 async function fetchBenchmark(b: (typeof BENCHMARKS)[number]): Promise<{
@@ -700,22 +802,512 @@ async function fetchBenchmark(b: (typeof BENCHMARKS)[number]): Promise<{
     typeof meta.fulldayChangePercent === "number"
       ? meta.fulldayChangePercent
       : null;
-  if (change == null) {
-    const closes = (r?.indicators?.quote?.[0]?.close ?? []).filter(
-      (c): c is number => typeof c === "number",
-    );
-    const last = closes[closes.length - 1];
-    const prev = closes[closes.length - 2];
-    if (last != null && prev != null && prev !== 0) {
-      change = last - prev;
-      changePercent = ((last - prev) / prev) * 100;
-    }
+  // The daily closes are authoritative whenever the reported price IS
+  // the latest close (always true outside that market's live session):
+  // some index feeds report a bogus fulldayChange of 0 (^N225 does —
+  // verified 2026-11-09: meta said 0 while the Nov 6 close was −5.97%
+  // vs Nov 5). During a live session the price is intraday and ahead
+  // of the last daily close, so the meta change stands.
+  const closes = (r?.indicators?.quote?.[0]?.close ?? []).filter(
+    (c): c is number => typeof c === "number",
+  );
+  const lastClose = closes[closes.length - 1];
+  const prevClose = closes[closes.length - 2];
+  if (
+    lastClose != null &&
+    prevClose != null &&
+    prevClose !== 0 &&
+    Math.abs(lastClose - meta.regularMarketPrice) <=
+      Math.max(0.01, meta.regularMarketPrice * 0.0005)
+  ) {
+    change = lastClose - prevClose;
+    changePercent = ((lastClose - prevClose) / prevClose) * 100;
+  } else if (change == null && lastClose != null && prevClose != null && prevClose !== 0) {
+    change = lastClose - prevClose;
+    changePercent = ((lastClose - prevClose) / prevClose) * 100;
   }
   const asOf =
     typeof meta.regularMarketTime === "number"
       ? new Date(meta.regularMarketTime * 1000).toISOString()
       : new Date().toISOString();
   return { price: meta.regularMarketPrice, change, changePercent, asOf, note: b.note };
+}
+
+// ---------- All-time peak (highest close) seeds + rolling ratchet ----------
+//
+// peak_price / peak_date power the 距高点 line. A peak is seeded ONCE,
+// only while the stored value is null, from long history:
+//  - SPX / NDX / IXIC / N225: Yahoo chart daily closes, range=10y
+//    (the same endpoint fetchBenchmark uses, wider range) — max close
+//    + the date of its bar, read in the market's own timezone
+//    (America/New_York for the US indices, Asia/Tokyo for N225).
+//  - SSEC / CSI300 / A500 / VNI: Eastmoney K-line full history (the
+//    fetchEastmoneyKlines endpoint below) — max close + its date.
+//    A500's series includes back-calculated history predating its
+//    2024 launch; it is seeded exactly as returned.
+//  - GOLD (spot XAU/USD; live price from Sina): the seed comes from
+//    Eastmoney's London-gold K-line (secid 122.XAU, daily, full
+//    history back to 1992) — max close + its date. Yahoo's XAUUSD=X
+//    was delisted (verified 2026-11-08) and Stooq is unreachable
+//    through the server egress, so Eastmoney is primary and Stooq's
+//    XAU/USD spot CSV (s=xauusd) stays as the fallback — always spot,
+//    never GC=F futures. Either seed is accepted only when the
+//    series' last close sits within 1.5% of the board's live Sina
+//    spot price; otherwise the GOLD peak stays null.
+//  - SGOLD: Eastmoney K-line for SGE Au99.99 (secid 118.Au9999, daily,
+//    full history back to 2004) — max close column + its date string.
+// After seeding, refreshQuotes only ever ratchets the peak up: a new
+// price above the stored peak replaces it (date = the new price's
+// asOf date); a lower price never touches it, and a later seed attempt
+// never overwrites an existing peak.
+
+type PeakSeed = { price: number; date: string };
+
+// YYYY-MM-DD of an instant in a given IANA timezone.
+function dateInTz(d: Date, timeZone: string): string {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(d);
+}
+
+// Date (YYYY-MM-DD) an asOf stamp belongs to, in the market's own
+// timezone (US series → America/New_York, China series → Asia/Shanghai).
+function asOfDate(asOf: string | null, timeZone: string): string | null {
+  if (!asOf) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(asOf)) return asOf;
+  const d = new Date(asOf);
+  if (Number.isNaN(d.getTime())) return null;
+  return dateInTz(d, timeZone);
+}
+
+async function fetchYahooPeak(
+  yahooSymbol: string,
+  timeZone: string = "America/New_York",
+): Promise<PeakSeed | null> {
+  try {
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}?range=10y&interval=1d`;
+    const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+    if (!res.ok) return null;
+    const json = (await res.json()) as {
+      chart?: {
+        result?: {
+          timestamp?: (number | null)[];
+          indicators?: { quote?: { close?: (number | null)[] }[] };
+        }[];
+      };
+    };
+    const r = json.chart?.result?.[0];
+    const stamps = r?.timestamp ?? [];
+    const closes = r?.indicators?.quote?.[0]?.close ?? [];
+    let best: PeakSeed | null = null;
+    for (let i = 0; i < closes.length; i++) {
+      const c = closes[i];
+      const t = stamps[i];
+      if (typeof c !== "number" || !(c > 0)) continue;
+      if (typeof t !== "number") continue;
+      if (!best || c > best.price) {
+        best = { price: c, date: dateInTz(new Date(t * 1000), timeZone) };
+      }
+    }
+    return best;
+  } catch {
+    return null;
+  }
+}
+
+// GOLD seed fallback: Stooq's XAU/USD spot daily history CSV
+// (Date,Open,High,Low,Close,Volume). Used only while the GOLD peak
+// is null (via resolvePeak's seed-once rule); the live GOLD price
+// stays on Sina hf_XAU. Consistency guard: the CSV's last close must
+// be within 1.5% of the board's current spot price (referencePrice),
+// otherwise the whole seed is refused — a stale or mismatched series
+// must never pose as the all-time high.
+async function fetchStooqGoldPeak(
+  referencePrice: number | null,
+): Promise<PeakSeed | null> {
+  try {
+    const res = await fetch("https://stooq.com/q/d/l/?s=xauusd&i=d", {
+      headers: { "User-Agent": "Mozilla/5.0" },
+    });
+    if (!res.ok) return null;
+    const text = await res.text();
+    let best: PeakSeed | null = null;
+    let lastClose: number | null = null;
+    for (const line of text.split(/\r?\n/)) {
+      const parts = line.split(",");
+      const date = parts[0] ?? "";
+      const close = Number(parts[4]);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
+      if (!Number.isFinite(close) || close <= 0) continue;
+      lastClose = close;
+      if (!best || close > best.price) best = { price: close, date };
+    }
+    if (!best || lastClose == null) return null;
+    if (referencePrice == null || !(referencePrice > 0)) return null;
+    if (Math.abs(lastClose - referencePrice) / referencePrice > 0.015) {
+      return null;
+    }
+    return best;
+  } catch {
+    return null;
+  }
+}
+
+// GOLD seed (primary): Eastmoney K-line for London spot gold
+// (secid 122.XAU — data.name 黄金/美元， code XAU; daily closes back
+// to 1992-05-19, the full listed history). Same endpoint and row
+// shape as the SGOLD seed below. Consistency guard, identical to the
+// Stooq fallback's: the series' last close must be within 1.5% of
+// the board's live Sina spot price (referencePrice), otherwise the
+// seed is refused and the GOLD peak stays null.
+async function fetchEastmoneyGoldPeak(
+  referencePrice: number | null,
+): Promise<PeakSeed | null> {
+  try {
+    const url =
+      "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=122.XAU&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56&klt=101&fqt=0&beg=0&end=20500101&lmt=100000";
+    const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+    if (!res.ok) return null;
+    const json = (await res.json()) as {
+      data?: { klines?: string[] } | null;
+    };
+    const klines = json.data?.klines ?? [];
+    // Each row: "日期,开,收,高,低,量" — index 2 is the close; rows are
+    // chronological, so the last valid close is the latest close.
+    let best: PeakSeed | null = null;
+    let lastClose: number | null = null;
+    for (const line of klines) {
+      const parts = line.split(",");
+      const date = parts[0] ?? "";
+      const close = Number(parts[2]);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
+      if (!Number.isFinite(close) || close <= 0) continue;
+      lastClose = close;
+      if (!best || close > best.price) best = { price: close, date };
+    }
+    if (!best || lastClose == null) return null;
+    if (referencePrice == null || !(referencePrice > 0)) return null;
+    if (Math.abs(lastClose - referencePrice) / referencePrice > 0.015) {
+      return null;
+    }
+    return best;
+  } catch {
+    return null;
+  }
+}
+
+// Shared Eastmoney K-line fetch (daily bars, klt=101): rows are
+// "日期，开，收，高，低，量" in chronological order; index 2 is the
+// close. `beg` is YYYYMMDD or "0" for the full listed history.
+// push2his is flaky per request (intermittent empty bodies / 502s —
+// observed live for individual secids while sibling requests in the
+// same batch succeed), and a single failed attempt used to be enough
+// to skip a one-shot consumer for a whole refresh cycle: CSI300's
+// trailing-3-year peak seed failed exactly that way in production
+// (2026-11-09) while the other ten benchmarks' seeds landed, leaving
+// its 距高点 cell empty. So the fetch retries up to 3 attempts with
+// backoff on any failure shape (network error, non-OK status,
+// unparseable/empty body, zero usable rows) before giving up; the
+// callers' keep-old-value-on-null behavior is unchanged.
+async function fetchEastmoneyKlines(
+  secid: string,
+  beg: string,
+): Promise<{ date: string; close: number }[] | null> {
+  const url = `https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=${encodeURIComponent(secid)}&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56&klt=101&fqt=0&beg=${beg}&end=20500101&lmt=100000`;
+  const backoffMs = [0, 400, 1200];
+  for (let attempt = 0; attempt < backoffMs.length; attempt++) {
+    const wait = backoffMs[attempt] ?? 0;
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    try {
+      const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+      if (!res.ok) continue;
+      const json = (await res.json()) as {
+        data?: { klines?: string[] } | null;
+      };
+      const klines = json.data?.klines ?? [];
+      const rows: { date: string; close: number }[] = [];
+      for (const line of klines) {
+        const parts = line.split(",");
+        const date = parts[0] ?? "";
+        const close = Number(parts[2]);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
+        if (!Number.isFinite(close) || close <= 0) continue;
+        rows.push({ date, close });
+      }
+      if (rows.length > 0) return rows;
+    } catch {
+      // fall through to the next attempt
+    }
+  }
+  return null;
+}
+
+// Peak seed from an Eastmoney series' full history: max close + date.
+async function fetchEastmoneyKlinePeak(
+  secid: string,
+): Promise<PeakSeed | null> {
+  const rows = await fetchEastmoneyKlines(secid, "0");
+  if (!rows) return null;
+  let best: PeakSeed | null = null;
+  for (const r of rows) {
+    if (!best || r.close > best.price) best = { price: r.close, date: r.date };
+  }
+  return best;
+}
+
+// Eastmoney index quote: the last close is the price, the previous
+// close gives the day change; asOf is the last row's own date (that
+// market's latest trading day — Asia-Pacific indices refresh on their
+// own calendar, independent of the US session).
+async function fetchEastmoneyIndexQuote(secid: string): Promise<{
+  price: number;
+  change: number | null;
+  changePercent: number | null;
+  asOf: string;
+} | null> {
+  const d = new Date(Date.now() - 40 * 24 * 3600 * 1000);
+  const beg = `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, "0")}${String(d.getUTCDate()).padStart(2, "0")}`;
+  const rows = await fetchEastmoneyKlines(secid, beg);
+  const last = rows?.[rows.length - 1];
+  if (!rows || !last) return null;
+  const prev = rows[rows.length - 2];
+  const change = prev ? last.close - prev.close : null;
+  return {
+    price: last.close,
+    change,
+    changePercent:
+      change != null && prev && prev.close !== 0
+        ? (change / prev.close) * 100
+        : null,
+    asOf: last.date,
+  };
+}
+
+async function fetchSgoldPeak(): Promise<PeakSeed | null> {
+  return fetchEastmoneyKlinePeak("118.Au9999");
+}
+
+// Computes the peak to store alongside a fresh price: seed once when
+// the stored peak is null (a failed seed leaves it null — never
+// back-filled from just the current price, which would understate the
+// drawdown), otherwise ratchet up only.
+async function resolvePeak(
+  existing: { peakPrice: number | null; peakDate: string | null } | undefined,
+  price: number,
+  asOf: string | null,
+  timeZone: string,
+  seed: () => Promise<PeakSeed | null>,
+): Promise<{ peakPrice: number | null; peakDate: string | null }> {
+  let peakPrice = existing?.peakPrice ?? null;
+  let peakDate = existing?.peakDate ?? null;
+  if (peakPrice == null) {
+    const s = await seed();
+    if (s) {
+      peakPrice = s.price;
+      peakDate = s.date;
+    }
+  }
+  if (peakPrice != null && price > peakPrice) {
+    peakPrice = price;
+    peakDate = asOfDate(asOf, timeZone) ?? peakDate;
+  }
+  return { peakPrice, peakDate };
+}
+
+// ---------- Trailing-3-year peak (peak3y) seeds + maintenance ----------
+//
+// peak3y_price / peak3y_date are the highest close within the trailing
+// 3-year window (right end = the series' latest close date; a close
+// counts when its date is >= latest date minus 3 calendar years). The
+// strip's 距高点 is computed against this peak; the all-time peak
+// above is stored and maintained unchanged alongside it.
+// Maintenance differs from the all-time peak in one way: a stored
+// peak3y can EXPIRE — once its date slides out of the window it no
+// longer bounds the drawdown, and the next-highest close inside the
+// window is not recoverable from the scalar. So resolvePeak3y
+// re-seeds from the source series whenever the stored date has slid
+// out (and once, while null); a failed re-seed keeps the old value
+// rather than clearing it. Between expiries it ratchets up exactly
+// like the all-time peak. Seeds come from the same sources as the
+// all-time seeds, windowed:
+//  - Yahoo indices: chart API range=5y daily closes (fetched wider
+//    than 3y so the window's right end is never truncated), windowed
+//    by bar date in the market's own timezone.
+//  - Eastmoney indices + SGOLD + GOLD: the shared K-line endpoint
+//    with beg ~3 years back (plus a small buffer), windowed by the
+//    last row's date. GOLD keeps its spot-only rule and 1.5%
+//    last-close consistency guard (Eastmoney 122.XAU primary, Stooq
+//    XAU/USD CSV fallback — never GC=F futures).
+
+// YYYY-MM-DD exactly `years` calendar years before the given date
+// (Feb 29 clamps to Feb 28 in a non-leap target year).
+function yearsBefore(dateStr: string, years: number): string {
+  const parts = dateStr.split("-").map(Number);
+  const y = (parts[0] ?? 1970) - years;
+  const m = parts[1] ?? 1;
+  let d = parts[2] ?? 1;
+  const daysInMonth = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  if (d > daysInMonth) d = daysInMonth;
+  const p = (n: number, w: number) => String(n).padStart(w, "0");
+  return `${p(y, 4)}-${p(m, 2)}-${p(d, 2)}`;
+}
+
+// Max close within the trailing-3-year window of a chronological
+// daily series; the window's right end is the series' last row date.
+function windowPeak3y(
+  rows: { date: string; close: number }[],
+): PeakSeed | null {
+  const last = rows[rows.length - 1];
+  if (!last) return null;
+  const cutoff = yearsBefore(last.date, 3);
+  let best: PeakSeed | null = null;
+  for (const r of rows) {
+    if (r.date < cutoff) continue;
+    if (!best || r.close > best.price) best = { price: r.close, date: r.date };
+  }
+  return best;
+}
+
+async function fetchYahooPeak3y(
+  yahooSymbol: string,
+  timeZone: string = "America/New_York",
+): Promise<PeakSeed | null> {
+  try {
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(yahooSymbol)}?range=5y&interval=1d`;
+    const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+    if (!res.ok) return null;
+    const json = (await res.json()) as {
+      chart?: {
+        result?: {
+          timestamp?: (number | null)[];
+          indicators?: { quote?: { close?: (number | null)[] }[] };
+        }[];
+      };
+    };
+    const r = json.chart?.result?.[0];
+    const stamps = r?.timestamp ?? [];
+    const closes = r?.indicators?.quote?.[0]?.close ?? [];
+    const rows: { date: string; close: number }[] = [];
+    for (let i = 0; i < closes.length; i++) {
+      const c = closes[i];
+      const t = stamps[i];
+      if (typeof c !== "number" || !(c > 0)) continue;
+      if (typeof t !== "number") continue;
+      rows.push({ date: dateInTz(new Date(t * 1000), timeZone), close: c });
+    }
+    return windowPeak3y(rows);
+  } catch {
+    return null;
+  }
+}
+
+// Eastmoney beg (YYYYMMDD) ~3 years + 45 days back from today (UTC):
+// wide enough that the fetched series always covers the full window
+// ending at its own last row.
+function eastmoneyBeg3y(): string {
+  const now = new Date();
+  const p = (n: number, w: number) => String(n).padStart(w, "0");
+  const today = `${p(now.getUTCFullYear(), 4)}-${p(now.getUTCMonth() + 1, 2)}-${p(now.getUTCDate(), 2)}`;
+  const start = new Date(`${yearsBefore(today, 3)}T00:00:00Z`);
+  start.setUTCDate(start.getUTCDate() - 45);
+  return `${p(start.getUTCFullYear(), 4)}${p(start.getUTCMonth() + 1, 2)}${p(start.getUTCDate(), 2)}`;
+}
+
+// 3y peak seed from an Eastmoney K-line series (indices, SGOLD).
+async function fetchEastmoneyKlinePeak3y(
+  secid: string,
+): Promise<PeakSeed | null> {
+  const rows = await fetchEastmoneyKlines(secid, eastmoneyBeg3y());
+  if (!rows) return null;
+  return windowPeak3y(rows);
+}
+
+// GOLD 3y seed (primary): Eastmoney London spot gold (122.XAU),
+// windowed like the all-time seed, with the same 1.5% last-close
+// consistency guard against the board's live Sina spot price.
+async function fetchEastmoneyGoldPeak3y(
+  referencePrice: number | null,
+): Promise<PeakSeed | null> {
+  const rows = await fetchEastmoneyKlines("122.XAU", eastmoneyBeg3y());
+  if (!rows) return null;
+  const last = rows[rows.length - 1];
+  if (!last) return null;
+  if (referencePrice == null || !(referencePrice > 0)) return null;
+  if (Math.abs(last.close - referencePrice) / referencePrice > 0.015) {
+    return null;
+  }
+  return windowPeak3y(rows);
+}
+
+// GOLD 3y seed (fallback): Stooq's XAU/USD spot daily CSV, windowed,
+// same consistency guard as the all-time Stooq seed.
+async function fetchStooqGoldPeak3y(
+  referencePrice: number | null,
+): Promise<PeakSeed | null> {
+  try {
+    const res = await fetch("https://stooq.com/q/d/l/?s=xauusd&i=d", {
+      headers: { "User-Agent": "Mozilla/5.0" },
+    });
+    if (!res.ok) return null;
+    const text = await res.text();
+    const rows: { date: string; close: number }[] = [];
+    for (const line of text.split(/\r?\n/)) {
+      const parts = line.split(",");
+      const date = parts[0] ?? "";
+      const close = Number(parts[4]);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
+      if (!Number.isFinite(close) || close <= 0) continue;
+      rows.push({ date, close });
+    }
+    const last = rows[rows.length - 1];
+    if (!last) return null;
+    if (referencePrice == null || !(referencePrice > 0)) return null;
+    if (Math.abs(last.close - referencePrice) / referencePrice > 0.015) {
+      return null;
+    }
+    return windowPeak3y(rows);
+  } catch {
+    return null;
+  }
+}
+
+// Computes the 3y peak to store alongside a fresh price: seed once
+// while null; re-seed when the stored peak date has slid out of the
+// trailing-3-year window ending at the new price's date (a failed
+// re-seed keeps the stored value); otherwise ratchet up only.
+async function resolvePeak3y(
+  existing:
+    | { peak3yPrice: number | null; peak3yDate: string | null }
+    | undefined,
+  price: number,
+  asOf: string | null,
+  timeZone: string,
+  seed: () => Promise<PeakSeed | null>,
+): Promise<{ peak3yPrice: number | null; peak3yDate: string | null }> {
+  let peak3yPrice = existing?.peak3yPrice ?? null;
+  let peak3yDate = existing?.peak3yDate ?? null;
+  const latestDate =
+    asOfDate(asOf, timeZone) ?? dateInTz(new Date(), timeZone);
+  const missing = peak3yPrice == null || peak3yDate == null;
+  const expired =
+    !missing &&
+    peak3yDate != null &&
+    peak3yDate < yearsBefore(latestDate, 3);
+  if (missing || expired) {
+    const s = await seed();
+    if (s) {
+      peak3yPrice = s.price;
+      peak3yDate = s.date;
+    }
+  }
+  if (peak3yPrice != null && price > peak3yPrice) {
+    peak3yPrice = price;
+    peak3yDate = asOfDate(asOf, timeZone) ?? peak3yDate;
+  }
+  return { peak3yPrice, peak3yDate };
 }
 
 // ---------- Gold: spot XAU/USD + Shanghai Gold (Sina quote feed) ----------
@@ -881,8 +1473,8 @@ async function ensureSeedSnapshot(ctx: Ctx): Promise<boolean> {
 // Only runs for an account when every one of its holdings has a quote
 // (totals complete) and a trading date can be derived; a
 // manual-sourced row for the same date + account is never
-// overwritten. Accounts with no holdings (e.g. Broker B before the user
-// is still empty) record nothing.
+// overwritten. Accounts with no holdings (e.g. Broker B with nothing
+// entered yet) record nothing.
 async function recordDailySnapshot(
   ctx: Ctx,
   portfolio: PortfolioResponse,
@@ -979,7 +1571,7 @@ const refreshResponse = z.object({
 export const Actions = {
   getPortfolio: defineAction({
     description:
-      "Returns all accounts （券商A/券商B…) with their stored holdings, per-account cash and per-account daily history, plus the merged global view (same-symbol holdings combined across accounts, cash and history summed), the latest cached regular-close quotes, session-aware extended-hours annotations (pre-market / after-hours), the current US market session (America/New_York), the cached USD/CNY rate, and market benchmarks (S&P 500, Nasdaq-100, spot gold XAU/USD, Shanghai Gold Au99.99 in CNY/gram).",
+      "Returns all accounts （券商A/券商B…) with their stored holdings, per-account cash and per-account daily history, plus the merged global view (same-symbol holdings combined across accounts, cash and history summed), the latest cached regular-close quotes, session-aware extended-hours annotations (pre-market / after-hours), the current US market session (America/New_York), the cached USD/CNY rate, and market benchmarks (S&P 500, Nasdaq-100, Nasdaq Composite, Shanghai Composite, CSI 300, CSI A500, Nikkei 225, Vietnam Ho Chi Minh Index, spot gold XAU/USD, Shanghai Gold Au99.99 in CNY/gram) — each benchmark carrying both its all-time highest close (peak_price/peak_date) and its trailing-3-year highest close (peak3y_price/peak3y_date).",
     request: z.object({}),
     response: portfolioResponse,
     handler: async (ctx): Promise<PortfolioResponse> => loadPortfolio(ctx),
@@ -987,7 +1579,7 @@ export const Actions = {
 
   refreshQuotes: defineAction({
     description:
-      "Refreshes regular-session quotes for the union of holding symbols across all accounts (finance channel, Nasdaq API fallback), extended-hours annotations from Nasdaq (pre-market feed while the pre session is live/just ended, after-hours feed otherwise; overnight reuses the after-hours last trade), and the live USD/CNY rate; records one daily snapshot per account; returns the refreshed portfolio.",
+      "Refreshes regular-session quotes for the union of holding symbols across all accounts (finance channel, Nasdaq API fallback for BE), extended-hours annotations (Nasdaq pre-market feed while the pre session is live/just ended, Nasdaq after-hours feed in the post session; during the overnight session 20:00–04:00 ET the extended price comes from Yahoo Finance chart meta.fulldayPrice with ext_session \"overnight\" and ext_as_of set to the fetch moment — labeled 抓取于 in the UI — falling back per-symbol to the after-hours last trade when Yahoo yields nothing), and the live USD/CNY rate; seeds (once, from long history) and ratchets the all-time highest close (peak_price/peak_date) behind each market benchmark, and maintains the trailing-3-year highest close (peak3y_price/peak3y_date — seeded once from ~3 years of daily closes, ratcheted up, and re-seeded from the source series when the stored peak date slides out of the 3-year window) that the strip's 距高点 figure is computed from; records one daily snapshot per account; returns the refreshed portfolio.",
     request: z.object({}),
     response: refreshResponse,
     handler: async (ctx): Promise<z.infer<typeof refreshResponse>> => {
@@ -1028,6 +1620,18 @@ export const Actions = {
               pre = await fetchNasdaqExtended(h.quoteSymbol, h.kind, "pre");
             } catch {
               pre = null;
+            }
+          }
+          // Overnight session: the extended price comes from Yahoo's
+          // fulldayPrice (the only live overnight source) instead of
+          // Nasdaq. Its asOf is the FETCH moment (fulldayPrice has no
+          // trade timestamp) — the UI labels it 抓取于 accordingly.
+          // A null result keeps the after-hours fallback below.
+          let overnight: ExtendedQuote | null = null;
+          if (session.key === "overnight") {
+            const p = await fetchYahooOvernightPrice(h.quoteSymbol);
+            if (p != null) {
+              overnight = { price: p, asOf: now.toISOString() };
             }
           }
 
@@ -1095,9 +1699,11 @@ export const Actions = {
                     : after
                       ? { q: after, s: "post" as const }
                       : null
-                  : after
-                    ? { q: after, s: "post" as const }
-                    : null;
+                  : session.key === "overnight" && overnight
+                    ? { q: overnight, s: "overnight" as const }
+                    : after
+                      ? { q: after, s: "post" as const }
+                      : null;
               if (chosen) {
                 await db
                   .update(schema.quoteSnapshots)
@@ -1142,7 +1748,7 @@ export const Actions = {
             regular.change != null ? regular.price - regular.change : null;
           let chosen: {
             q: ExtendedQuote;
-            s: "pre" | "post";
+            s: "pre" | "post" | "overnight";
             ref: number;
           } | null = null;
           if (session.key === "pre") {
@@ -1154,9 +1760,18 @@ export const Actions = {
             if (pre && prevClose != null && prevClose > 0) {
               chosen = { q: pre, s: "pre", ref: prevClose };
             }
+          } else if (session.key === "overnight") {
+            // Overnight: Yahoo fulldayPrice is the live price, measured
+            // against the regular close. When Yahoo yields nothing for
+            // this symbol, fall back to the after-hours last trade
+            // (the previous behavior), timestamped as Nasdaq's own.
+            if (overnight) {
+              chosen = { q: overnight, s: "overnight", ref: regular.price };
+            } else if (after) {
+              chosen = { q: after, s: "post", ref: regular.price };
+            }
           } else {
-            // post / overnight / closed: after-hours is the latest
-            // extended session; overnight reuses its last trade.
+            // post / closed: after-hours is the latest extended session.
             if (after) chosen = { q: after, s: "post", ref: regular.price };
           }
           if (chosen && chosen.ref > 0) {
@@ -1233,12 +1848,31 @@ export const Actions = {
         effectiveFxRate = cachedFx[0]?.rate ?? null;
       }
 
-      // Market benchmarks, refreshed alongside the quotes.
+      // Market benchmarks, refreshed alongside the quotes. Existing
+      // rows are read first so the peak can seed (once) / ratchet.
+      const existingMarket = await db.select().from(schema.marketSnapshots);
+      const existingMarketByKey = new Map(
+        existingMarket.map((m) => [m.key, m]),
+      );
       await Promise.all(
         BENCHMARKS.map(async (b) => {
           try {
             const bench = await fetchBenchmark(b);
             if (!bench) return;
+            const peak = await resolvePeak(
+              existingMarketByKey.get(b.key),
+              bench.price,
+              bench.asOf,
+              b.tz,
+              () => fetchYahooPeak(b.yahoo, b.tz),
+            );
+            const peak3y = await resolvePeak3y(
+              existingMarketByKey.get(b.key),
+              bench.price,
+              bench.asOf,
+              b.tz,
+              () => fetchYahooPeak3y(b.yahoo, b.tz),
+            );
             const values = {
               key: b.key,
               label: b.label,
@@ -1248,6 +1882,10 @@ export const Actions = {
               asOf: bench.asOf,
               source: "Yahoo Finance",
               note: bench.note,
+              peakPrice: peak.peakPrice,
+              peakDate: peak.peakDate,
+              peak3yPrice: peak3y.peak3yPrice,
+              peak3yDate: peak3y.peak3yDate,
               fetchedAt: now,
             };
             await db
@@ -1263,11 +1901,109 @@ export const Actions = {
         }),
       );
 
-      // Gold: spot XAU/USD + Shanghai Gold (CNY per gram).
+      // Eastmoney indices （上证 / 沪深300 / 中证A500 / 恒生科技 / 越南胡志明）:
+      // price + day change from the last two daily closes, peak
+      // seeded once from the same endpoint's full history.
+      await Promise.all(
+        EM_INDICES.map(async (b) => {
+          try {
+            const q = await fetchEastmoneyIndexQuote(b.secid);
+            if (!q) return;
+            const peak = await resolvePeak(
+              existingMarketByKey.get(b.key),
+              q.price,
+              q.asOf,
+              "Asia/Shanghai",
+              () => fetchEastmoneyKlinePeak(b.secid),
+            );
+            const peak3y = await resolvePeak3y(
+              existingMarketByKey.get(b.key),
+              q.price,
+              q.asOf,
+              "Asia/Shanghai",
+              () => fetchEastmoneyKlinePeak3y(b.secid),
+            );
+            const values = {
+              key: b.key,
+              label: b.label,
+              price: q.price,
+              change: q.change,
+              changePercent: q.changePercent,
+              asOf: q.asOf,
+              source: "东方财富",
+              note: b.note,
+              peakPrice: peak.peakPrice,
+              peakDate: peak.peakDate,
+              peak3yPrice: peak3y.peak3yPrice,
+              peak3yDate: peak3y.peak3yDate,
+              fetchedAt: now,
+            };
+            await db
+              .insert(schema.marketSnapshots)
+              .values(values)
+              .onConflictDoUpdate({
+                target: schema.marketSnapshots.key,
+                set: values,
+              });
+          } catch {
+            // keep the last cached benchmark row
+          }
+        }),
+      );
+
+      // Gold: spot XAU/USD + Shanghai Gold (CNY per gram). Peaks seed
+      // once (GOLD from Eastmoney's London-gold full-history K-line,
+      // secid 122.XAU, with Stooq's XAU/USD spot CSV as fallback now
+      // that Yahoo's XAUUSD=X is delisted — a failed or inconsistent
+      // seed leaves it null, never a futures substitute; SGOLD from
+      // the Eastmoney full-history K-line) and ratchet on every
+      // refresh.
       try {
         const gold = await fetchGoldQuotes(effectiveFxRate);
+        const goldPeak = gold.spot
+          ? await resolvePeak(
+              existingMarketByKey.get("GOLD"),
+              gold.spot.price,
+              gold.spot.asOf,
+              "Asia/Shanghai",
+              () =>
+                fetchEastmoneyGoldPeak(gold.spot?.price ?? null).then(
+                  (s) => s ?? fetchStooqGoldPeak(gold.spot?.price ?? null),
+                ),
+            )
+          : null;
+        const goldPeak3y = gold.spot
+          ? await resolvePeak3y(
+              existingMarketByKey.get("GOLD"),
+              gold.spot.price,
+              gold.spot.asOf,
+              "Asia/Shanghai",
+              () =>
+                fetchEastmoneyGoldPeak3y(gold.spot?.price ?? null).then(
+                  (s) => s ?? fetchStooqGoldPeak3y(gold.spot?.price ?? null),
+                ),
+            )
+          : null;
+        const sgoldPeak = gold.shanghai
+          ? await resolvePeak(
+              existingMarketByKey.get("SGOLD"),
+              gold.shanghai.price,
+              gold.shanghai.asOf,
+              "Asia/Shanghai",
+              fetchSgoldPeak,
+            )
+          : null;
+        const sgoldPeak3y = gold.shanghai
+          ? await resolvePeak3y(
+              existingMarketByKey.get("SGOLD"),
+              gold.shanghai.price,
+              gold.shanghai.asOf,
+              "Asia/Shanghai",
+              () => fetchEastmoneyKlinePeak3y("118.Au9999"),
+            )
+          : null;
         const goldRows = [
-          gold.spot
+          gold.spot && goldPeak
             ? {
                 key: "GOLD",
                 label: "现货黄金",
@@ -1277,10 +2013,14 @@ export const Actions = {
                 asOf: gold.spot.asOf,
                 source: gold.spot.source,
                 note: "现货 XAU/USD · 美元/盎司",
+                peakPrice: goldPeak.peakPrice,
+                peakDate: goldPeak.peakDate,
+                peak3yPrice: goldPeak3y?.peak3yPrice ?? null,
+                peak3yDate: goldPeak3y?.peak3yDate ?? null,
                 fetchedAt: now,
               }
             : null,
-          gold.shanghai
+          gold.shanghai && sgoldPeak
             ? {
                 key: "SGOLD",
                 label: "上海黄金",
@@ -1290,6 +2030,10 @@ export const Actions = {
                 asOf: gold.shanghai.asOf,
                 source: gold.shanghai.source,
                 note: gold.shanghai.note,
+                peakPrice: sgoldPeak.peakPrice,
+                peakDate: sgoldPeak.peakDate,
+                peak3yPrice: sgoldPeak3y?.peak3yPrice ?? null,
+                peak3yDate: sgoldPeak3y?.peak3yDate ?? null,
                 fetchedAt: now,
               }
             : null,
