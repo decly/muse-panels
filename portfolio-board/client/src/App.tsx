@@ -18,12 +18,6 @@ const cny = (v: number) => `¥${money(v, 0)}`;
 // standalone flag; smaller ones stay visible in the row detail only.
 const AFTER_ALERT_PCT = 3;
 
-// Example issuer merges for the concentration view: dual-class shares of
-// one issuer counted as a single exposure. Edit for your own portfolio.
-const ISSUER_MERGES: { label: string; symbols: string[] }[] = [
-  { label: "GOOG + GOOGL", symbols: ["GOOG", "GOOGL"] },
-];
-
 // Effective extended-hours quote for a holding: the session-aware ext_*
 // fields (pre-market or after-hours, whichever session is current),
 // falling back to the legacy after_* post-session mirror for rows
@@ -55,7 +49,8 @@ function effExt(q: Holding["quote"]): {
   return null;
 }
 
-const extLabel = (session: string) => (session === "pre" ? "盘前" : "盘后");
+const extLabel = (session: string) =>
+  session === "pre" ? "盘前" : session === "overnight" ? "夜盘" : "盘后";
 // Table mode (replaces the old two-line compact list): columns in the
 // user-confirmed order. Clicking a header sorts by that column.
 type SortKey =
@@ -108,6 +103,13 @@ function fmtTime(iso: string | null): string {
   }).format(d);
 }
 
+// Overnight prices come from Yahoo fulldayPrice, which has no trade
+// timestamp — the stored ext_as_of is the fetch moment. List rows
+// (standard + table) show only the price and its move vs the close so
+// the columns stay aligned; the fetch moment itself (a bare time,
+// no label words) appears only in the expanded detail (RowDetail,
+// via fmtTime).
+
 function RowDetail({
   h,
   privacy,
@@ -122,8 +124,10 @@ function RowDetail({
   // Global view is read-only: no qty/cost editing, no removal.
   readOnly?: boolean;
   // Current US session key from the portfolio response; during the
-  // overnight session the extended price is the latest available
-  // (after-hours last trade) and is labeled as such.
+  // overnight session a "post" extended price is only the latest
+  // available (after-hours last trade, Yahoo yielded nothing) and is
+  // labeled as such — an "overnight" one is the live Yahoo price,
+  // shown with its fetch time (bare time, no label words).
   sessionKey?: string;
   onSave: (qty: number, cost: number) => void;
   onRemove: () => void;
@@ -211,10 +215,12 @@ function RowDetail({
             )}
             {ext?.asOf && (
               <span className="block text-xs font-normal text-[var(--dim)]">
-                {ext.asOf}
+                {ext.session === "overnight"
+                  ? fmtTime(ext.asOf)
+                  : ext.asOf}
               </span>
             )}
-            {ext && sessionKey === "overnight" && (
+            {ext && sessionKey === "overnight" && ext.session !== "overnight" && (
               <span className="block text-xs font-normal text-[var(--dim)]">
                 夜盘最近可得价
               </span>
@@ -322,14 +328,17 @@ export function App() {
 
   // Fetch-on-open: refresh when there is no cache or it is stale. The
   // staleness window tightens to 2 minutes while an extended session
-  // is live （盘前/盘后）, so the realtime extended prices and the live
-  // estimate are near-current on open; otherwise 5 minutes.
+  // is live （盘前/盘后/夜盘）, so the realtime extended prices and the
+  // live estimate are near-current on open; otherwise 5 minutes.
   const autoRefreshed = useRef(false);
   useEffect(() => {
     if (autoRefreshed.current || !portfolio.data) return;
     const last = portfolio.data.last_fetched_at;
     const sk = portfolio.data.session.key;
-    const staleMs = sk === "pre" || sk === "post" ? 2 * 60 * 1000 : 5 * 60 * 1000;
+    const staleMs =
+      sk === "pre" || sk === "post" || sk === "overnight"
+        ? 2 * 60 * 1000
+        : 5 * 60 * 1000;
     const stale =
       !last || Date.now() - new Date(last).getTime() > staleMs;
     if (stale && portfolio.data.holdings.length > 0) {
@@ -347,7 +356,8 @@ export function App() {
   refreshPending.current = refresh.isPending;
   const sessionKey = portfolio.data?.session.key;
   useEffect(() => {
-    if (sessionKey !== "pre" && sessionKey !== "post") return;
+    if (sessionKey !== "pre" && sessionKey !== "post" && sessionKey !== "overnight")
+      return;
     const t = setInterval(() => {
       if (!refreshPending.current && !document.hidden) refresh.mutate();
     }, 2 * 60 * 1000);
@@ -507,6 +517,27 @@ export function App() {
     setShowAdd(false);
     setShowCashEdit(false);
   };
+  // Market strip collapse: the ten benchmark rows can be folded down
+  // to just the first two (SPX / NDX, user-confirmed 2026-11-09); the
+  // column-header row doubles as the full-width toggle and always
+  // stays visible. Default expanded; the choice persists across opens.
+  const [marketExpanded, setMarketExpanded] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("portfolio-board-market-expanded") !== "0";
+    } catch {
+      return true;
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        "portfolio-board-market-expanded",
+        marketExpanded ? "1" : "0",
+      );
+    } catch {
+      /* storage unavailable */
+    }
+  }, [marketExpanded]);
 
   const data = portfolio.data;
 
@@ -572,7 +603,7 @@ export function App() {
       .map(([theme, v]) => ({ theme, v, pct: totalMv > 0 ? (v / totalMv) * 100 : 0 }))
       .sort((a, b) => b.v - a.v);
     const alphabet = rows
-      .filter((r) => ISSUER_MERGES.some((m) => m.symbols.includes(r.h.symbol)))
+      .filter((r) => r.h.symbol === "GOOG" || r.h.symbol === "GOOGL")
       .reduce((s, r) => s + (r.mv ?? 0), 0);
     const semi = themes.get("半导体") ?? 0;
     const losers = rows
@@ -580,17 +611,17 @@ export function App() {
       .sort((a, b) => (a.pnl ?? 0) - (b.pnl ?? 0));
     const totalLoss = losers.reduce((s, r) => s + (r.pnl ?? 0), 0);
     const top3Loss = losers.slice(0, 3).reduce((s, r) => s + (r.pnl ?? 0), 0);
-    // Top holdings with configured issuer merges applied (see ISSUER_MERGES).
+    // Top holdings with GOOG + GOOGL merged into one Alphabet exposure.
     const byCompany = new Map<
       string,
       { label: string; sub: string; mv: number }
     >();
     for (const r of priced) {
-      const merge = ISSUER_MERGES.find((m) => m.symbols.includes(r.h.symbol));
-      const key = merge ? merge.label : r.h.symbol;
+      const isAlphabet = r.h.symbol === "GOOG" || r.h.symbol === "GOOGL";
+      const key = isAlphabet ? "ALPHABET" : r.h.symbol;
       const cur = byCompany.get(key) ?? {
-        label: merge ? merge.label : r.h.symbol,
-        sub: merge ? "合并口径" : r.h.name,
+        label: isAlphabet ? "GOOG + GOOGL" : r.h.symbol,
+        sub: isAlphabet ? "合并口径" : r.h.name,
         mv: 0,
       };
       cur.mv += r.mv ?? 0;
@@ -667,7 +698,9 @@ export function App() {
     );
     const estLabel =
       data.session.key === "overnight"
-        ? "夜盘最近可得"
+        ? estSessions.has("overnight")
+          ? "夜盘"
+          : "夜盘最近可得"
         : estSessions.size === 1
           ? extLabel([...estSessions][0] ?? "post")
           : "延长时段";
@@ -803,17 +836,67 @@ export function App() {
 
         {data && derived && view && data.holdings.length > 0 && (
           <>
-            {/* Market strip: 2x2 grid at the very top — name line, price
-                line, then the enlarged change badge on its own line below
-                the price (stacked so price + badge never overflow the
-                ~170px cell at phone width). */}
+            {/* Market strip: single-column compact list at the very top
+                (plan C, 2026-11-08) — one row per benchmark with four
+                aligned columns: bold name | right-aligned price | day
+                change badge | 距高点 (drawdown). A slim column-header
+                row （现价 / 日涨跌 / 距高点） sits above the rows so the
+                drawdown column needs no in-row label — just the number.
+                The drawdown is measured against the trailing-3-year
+                highest close (peak3y, dual-stored server-side with the
+                all-time peak since 2026-11-09); a row at its 3-year
+                peak still reads 历史新高. Public market data, never
+                masked by privacy mode.
+                Fixed-width right columns keep the rows aligned and
+                overflow-free at phone width. Eleven benchmarks since
+                2026-11-09 （纳指综合 / 上证 / 沪深300 / 中证A500 /
+                恒生科技 / 日经225 / 越南胡志明 added). Prices render
+                as integers (display-only rounding via money(v, 0);
+                the stored price and the 距高点 math keep full
+                precision), which lets the price column run narrower
+                and gives the two percentage columns more room. The
+                header row itself is the collapse toggle (full-width
+                button, ~36px tall): tapping anywhere on it folds the
+                strip down to the first two rows （标普500 / 纳指100）
+                or expands it back to all eleven; default expanded
+                and the choice persists. */}
             {data.market.length > 0 && (
               <section
                 aria-label="市场行情"
-                className="mt-3 rounded-[var(--radius)] bg-[var(--surface)] px-3 py-3"
+                className="mt-3 rounded-[var(--radius)] bg-[var(--surface)] px-3 py-1.5"
               >
-                <div className="grid grid-cols-2 gap-x-4 gap-y-3">
-                  {data.market.map((m) => {
+                <div className="divide-y divide-[color-mix(in_srgb,var(--border)_55%,transparent)]">
+                  {/* Column-header row = the collapse toggle: the
+                      whole row is one full-width button (~36px tall),
+                      so tapping anywhere on it — labels included —
+                      folds/expands the strip. The name column shows the
+                      state hint （收起/展开 + arrow) instead of a label
+                      (names are self-evident); the three right columns
+                      keep the exact widths / alignment of the data
+                      rows below, in both states, so nothing shifts. */}
+                  <button
+                    type="button"
+                    aria-expanded={marketExpanded}
+                    aria-label={marketExpanded ? "收起市场行情" : "展开市场行情"}
+                    onClick={() => setMarketExpanded((v) => !v)}
+                    className="flex min-h-[36px] w-full items-center gap-x-2 text-left text-[11px] leading-4 text-[var(--dim)] transition-opacity active:opacity-50"
+                  >
+                    <span className="flex min-w-0 flex-1 items-center gap-1">
+                      {marketExpanded ? "收起" : "展开"}
+                      <span aria-hidden className="text-[8px]">
+                        {marketExpanded ? "▲" : "▼"}
+                      </span>
+                    </span>
+                    <span aria-hidden="true" className="w-[74px] shrink-0 text-right">现价</span>
+                    <span aria-hidden="true" className="w-[74px] shrink-0">日涨跌</span>
+                    <span aria-hidden="true" className="w-[62px] shrink-0 text-right">
+                      距高点
+                    </span>
+                  </button>
+                  {(marketExpanded
+                    ? data.market
+                    : data.market.slice(0, 2)
+                  ).map((m) => {
                     const cp = m.change_percent;
                     const badgeColor =
                       cp == null
@@ -825,41 +908,67 @@ export function App() {
                       cp == null
                         ? "transparent"
                         : cp >= 0
-                          ? "color-mix(in srgb, var(--up) 13%, transparent)"
-                          : "color-mix(in srgb, var(--down) 13%, transparent)";
+                          ? "color-mix(in srgb, var(--up) 9%, transparent)"
+                          : "color-mix(in srgb, var(--down) 9%, transparent)";
+                    // Current drawdown from the trailing-3-year highest
+                    // close （距高点）: null peak3y (seed not landed yet)
+                    // → the column stays empty, no placeholder text.
+                    // The all-time peak stays stored server-side; only
+                    // the 3-year figure drives this column.
+                    const dd =
+                      m.price != null &&
+                      m.peak3y_price != null &&
+                      m.peak3y_price > 0
+                        ? ((m.price - m.peak3y_price) / m.peak3y_price) * 100
+                        : null;
                     return (
-                      <div key={m.key} className="min-w-0">
-                        <p className="flex items-baseline gap-1.5 whitespace-nowrap text-[13px] leading-snug">
-                          <span className="font-medium">{m.label}</span>
+                      <div
+                        key={m.key}
+                        className="flex items-center gap-x-2 py-[5px]"
+                      >
+                        <p className="flex min-w-0 flex-1 items-baseline gap-1.5 overflow-hidden whitespace-nowrap text-[15px] font-semibold leading-[22px]">
+                          <span>{m.label}</span>
                           {m.key === "SGOLD" ? (
-                            <span className="text-[11px] text-[var(--dim)]">
+                            <span className="text-[11px] font-normal text-[var(--dim)]">
                               元/克
                               {m.source === "换算" ? " · 换算价" : ""}
                             </span>
                           ) : null}
                         </p>
-                        <div className="mt-1">
-                          <span className="num block whitespace-nowrap text-[17px] font-semibold leading-tight tracking-tight">
-                            {m.price != null
-                              ? m.key === "GOLD"
-                                ? `$${money(m.price)}`
-                                : m.key === "SGOLD"
-                                  ? `¥${money(m.price)}`
-                                  : money(m.price)
-                              : "—"}
-                          </span>
+                        <span className="num w-[74px] shrink-0 whitespace-nowrap text-right text-[17px] font-semibold leading-[22px] tracking-tight">
+                          {m.price != null
+                            ? m.key === "GOLD"
+                              ? `$${money(m.price, 0)}`
+                              : m.key === "SGOLD"
+                                ? `¥${money(m.price, 0)}`
+                                : money(m.price, 0)
+                            : "—"}
+                        </span>
+                        <span className="flex w-[74px] shrink-0 items-center">
                           <span
-                            className="num mt-1 inline-flex items-center gap-1 whitespace-nowrap rounded px-1.5 py-0.5 text-[15px] font-bold leading-tight"
+                            className="num inline-flex items-center gap-1 whitespace-nowrap rounded px-1.5 py-0.5 text-[14px] font-bold leading-tight"
                             style={{ color: badgeColor, backgroundColor: badgeBg }}
                           >
                             {cp != null && cp !== 0 && (
-                              <span aria-hidden className="text-[11px]">
+                              <span aria-hidden className="text-[9px]">
                                 {cp > 0 ? "▲" : "▼"}
                               </span>
                             )}
                             {cp != null ? signedPct(cp) : "—"}
                           </span>
-                        </div>
+                        </span>
+                        <span className="num w-[62px] shrink-0 whitespace-nowrap text-right text-[13px] font-medium leading-[22px]">
+                          {dd != null &&
+                            (dd > -0.05 ? (
+                              <span style={{ color: "var(--up)" }}>
+                                历史新高
+                              </span>
+                            ) : (
+                              <span style={{ color: "var(--down)" }}>
+                                {dd.toFixed(1)}%
+                              </span>
+                            ))}
+                        </span>
                       </div>
                     );
                   })}
@@ -905,7 +1014,11 @@ export function App() {
             <p className="mt-2 text-xs text-[var(--dim)]">
               当前美东时段：{data.session.label}
               {data.session.key === "overnight"
-                ? " · 夜盘显示盘后最后成交价"
+                ? data.holdings.some(
+                    (h) => h.quote?.ext_session === "overnight",
+                  )
+                  ? " · 夜盘价实时抓取自 Yahoo"
+                  : " · 夜盘显示盘后最后成交价"
                 : ""}
             </p>
             {view.readOnly && (
@@ -1223,161 +1336,9 @@ export function App() {
               </section>
             )}
 
-            {/* Concentration, visualized: 100% stacked theme bar, top-5
-                holdings bars, loss-source bars, key metric rows. All
-                figures derive from the active view's holdings + latest
-                quotes (global view = merged across accounts). */}
-            {view.holdings.length > 0 && (
-            <section className="mt-3 rounded-[var(--radius)] bg-[var(--surface)] p-4">
-              <h2 className="text-lg font-semibold">集中度与结构</h2>
-
-              <p className="mt-3 text-sm text-[var(--dim)]">主题占比（占证券市值）</p>
-              <div
-                className="mt-1.5 flex h-4 w-full overflow-hidden rounded-md"
-                role="img"
-                aria-label={derived.themeRows
-                  .map((t) => `${t.theme} ${t.pct.toFixed(1)}%`)
-                  .join("，")}
-              >
-                {derived.themeRows.map((t, i) => (
-                  <div
-                    key={t.theme}
-                    className="h-full"
-                    style={{
-                      width: `${t.pct}%`,
-                      background:
-                        THEME_COLORS[i % THEME_COLORS.length],
-                    }}
-                  />
-                ))}
-              </div>
-              <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-sm">
-                {derived.themeRows.map((t, i) => (
-                  <span
-                    key={t.theme}
-                    className="inline-flex items-center gap-1.5 whitespace-nowrap"
-                  >
-                    <span
-                      className="inline-block h-2.5 w-2.5 shrink-0 rounded-sm"
-                      style={{
-                        background:
-                          THEME_COLORS[i % THEME_COLORS.length],
-                      }}
-                    />
-                    {t.theme}
-                    <span className="num text-[var(--dim)]">
-                      {t.pct.toFixed(1)}%
-                    </span>
-                  </span>
-                ))}
-              </div>
-
-              <p className="mt-4 text-sm text-[var(--dim)]">
-                前五大持仓（占证券市值）
-              </p>
-              <div className="mt-1.5 space-y-2">
-                {derived.topHoldings.map((t) => (
-                  <div key={t.label}>
-                    <div className="flex items-baseline justify-between gap-2 text-base">
-                      <span className="num min-w-0 truncate font-medium">
-                        {t.label}
-                        <span className="ml-1.5 text-sm font-normal text-[var(--dim)]">
-                          {t.sub}
-                        </span>
-                      </span>
-                      <span className="num shrink-0 text-[var(--dim)]">
-                        {t.pct.toFixed(1)}%
-                      </span>
-                    </div>
-                    <div className="mt-1 h-2 overflow-hidden rounded-full bg-[var(--surface-2)]">
-                      <div
-                        className="h-full rounded-full"
-                        style={{
-                          width: `${Math.max(t.pct, 1.5)}%`,
-                          background: "var(--accent)",
-                        }}
-                      />
-                    </div>
-                  </div>
-                ))}
-              </div>
-
-              {derived.loserRows.length > 0 && (
-                <>
-                  <p className="mt-4 text-sm text-[var(--dim)]">
-                    浮亏来源（占总浮亏）
-                  </p>
-                  <div className="mt-1.5 space-y-2">
-                    {derived.loserRows.map((l) => (
-                      <div key={l.symbol}>
-                        <div className="flex items-baseline justify-between gap-2 text-base">
-                          <span className="num font-medium">{l.symbol}</span>
-                          <span
-                            className="num shrink-0"
-                            style={{ color: "var(--down)" }}
-                          >
-                            {mask(signedMoney(l.pnl))} ·{" "}
-                            {l.share.toFixed(1)}%
-                          </span>
-                        </div>
-                        <div className="mt-1 h-2 overflow-hidden rounded-full bg-[var(--surface-2)]">
-                          <div
-                            className="h-full rounded-full"
-                            style={{
-                              width: `${Math.max(l.share, 1.5)}%`,
-                              background: "var(--down)",
-                            }}
-                          />
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </>
-              )}
-
-              <div className="mt-4 space-y-2.5 border-t border-[var(--border)] pt-3">
-                {[
-                  {
-                    label: `${ISSUER_MERGES[0]?.label ?? "最大单一公司"} 单一公司敞口`,
-                    pct: derived.alphabetPct,
-                  },
-                  { label: "半导体主题", pct: derived.semiPct },
-                  ...(derived.topLosers
-                    ? [
-                        {
-                          label: `前三浮亏股占总浮亏（${derived.topLosers}）`,
-                          pct: derived.lossConcentration,
-                        },
-                      ]
-                    : []),
-                ].map((m) => (
-                  <div
-                    key={m.label}
-                    className="flex items-center gap-2.5"
-                  >
-                    <span className="min-w-0 flex-1 text-sm leading-snug text-[var(--dim)]">
-                      {m.label}
-                    </span>
-                    <div className="h-1.5 w-20 shrink-0 overflow-hidden rounded-full bg-[var(--surface-2)] min-[480px]:w-28">
-                      <div
-                        className="h-full rounded-full"
-                        style={{
-                          width: `${Math.min(Math.max(m.pct, 1.5), 100)}%`,
-                          background:
-                            m.pct >= 30 ? "var(--danger)" : "var(--accent)",
-                        }}
-                      />
-                    </div>
-                    <span className="num w-14 shrink-0 text-right text-sm font-medium">
-                      {m.pct.toFixed(1)}%
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </section>
-            )}
-
-            {/* Holdings list */}
+            {/* Holdings list. Section order below the overview is
+                user-confirmed (2026-11-09): 持仓明细 first, then
+                集中度与结构 — do not swap them back. */}
             <section className="mt-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <h2 className="text-lg font-semibold">持仓明细</h2>
@@ -2059,6 +2020,160 @@ export function App() {
                   : ""}
               </p>
             </section>
+            {/* Concentration, visualized: 100% stacked theme bar, top-5
+                holdings bars, loss-source bars, key metric rows. All
+                figures derive from the active view's holdings + latest
+                quotes (global view = merged across accounts). */}
+            {view.holdings.length > 0 && (
+            <section className="mt-3 rounded-[var(--radius)] bg-[var(--surface)] p-4">
+              <h2 className="text-lg font-semibold">集中度与结构</h2>
+
+              <p className="mt-3 text-sm text-[var(--dim)]">主题占比（占证券市值）</p>
+              <div
+                className="mt-1.5 flex h-4 w-full overflow-hidden rounded-md"
+                role="img"
+                aria-label={derived.themeRows
+                  .map((t) => `${t.theme} ${t.pct.toFixed(1)}%`)
+                  .join("，")}
+              >
+                {derived.themeRows.map((t, i) => (
+                  <div
+                    key={t.theme}
+                    className="h-full"
+                    style={{
+                      width: `${t.pct}%`,
+                      background:
+                        THEME_COLORS[i % THEME_COLORS.length],
+                    }}
+                  />
+                ))}
+              </div>
+              <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-sm">
+                {derived.themeRows.map((t, i) => (
+                  <span
+                    key={t.theme}
+                    className="inline-flex items-center gap-1.5 whitespace-nowrap"
+                  >
+                    <span
+                      className="inline-block h-2.5 w-2.5 shrink-0 rounded-sm"
+                      style={{
+                        background:
+                          THEME_COLORS[i % THEME_COLORS.length],
+                      }}
+                    />
+                    {t.theme}
+                    <span className="num text-[var(--dim)]">
+                      {t.pct.toFixed(1)}%
+                    </span>
+                  </span>
+                ))}
+              </div>
+
+              <p className="mt-4 text-sm text-[var(--dim)]">
+                前五大持仓（占证券市值）
+              </p>
+              <div className="mt-1.5 space-y-2">
+                {derived.topHoldings.map((t) => (
+                  <div key={t.label}>
+                    <div className="flex items-baseline justify-between gap-2 text-base">
+                      <span className="num min-w-0 truncate font-medium">
+                        {t.label}
+                        <span className="ml-1.5 text-sm font-normal text-[var(--dim)]">
+                          {t.sub}
+                        </span>
+                      </span>
+                      <span className="num shrink-0 text-[var(--dim)]">
+                        {t.pct.toFixed(1)}%
+                      </span>
+                    </div>
+                    <div className="mt-1 h-2 overflow-hidden rounded-full bg-[var(--surface-2)]">
+                      <div
+                        className="h-full rounded-full"
+                        style={{
+                          width: `${Math.max(t.pct, 1.5)}%`,
+                          background: "var(--accent)",
+                        }}
+                      />
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {derived.loserRows.length > 0 && (
+                <>
+                  <p className="mt-4 text-sm text-[var(--dim)]">
+                    浮亏来源（占总浮亏）
+                  </p>
+                  <div className="mt-1.5 space-y-2">
+                    {derived.loserRows.map((l) => (
+                      <div key={l.symbol}>
+                        <div className="flex items-baseline justify-between gap-2 text-base">
+                          <span className="num font-medium">{l.symbol}</span>
+                          <span
+                            className="num shrink-0"
+                            style={{ color: "var(--down)" }}
+                          >
+                            {mask(signedMoney(l.pnl))} ·{" "}
+                            {l.share.toFixed(1)}%
+                          </span>
+                        </div>
+                        <div className="mt-1 h-2 overflow-hidden rounded-full bg-[var(--surface-2)]">
+                          <div
+                            className="h-full rounded-full"
+                            style={{
+                              width: `${Math.max(l.share, 1.5)}%`,
+                              background: "var(--down)",
+                            }}
+                          />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+
+              <div className="mt-4 space-y-2.5 border-t border-[var(--border)] pt-3">
+                {[
+                  {
+                    label: "Alphabet 单一公司敞口",
+                    pct: derived.alphabetPct,
+                  },
+                  { label: "半导体主题（含 SMH）", pct: derived.semiPct },
+                  ...(derived.topLosers
+                    ? [
+                        {
+                          label: `前三浮亏股占总浮亏（${derived.topLosers}）`,
+                          pct: derived.lossConcentration,
+                        },
+                      ]
+                    : []),
+                ].map((m) => (
+                  <div
+                    key={m.label}
+                    className="flex items-center gap-2.5"
+                  >
+                    <span className="min-w-0 flex-1 text-sm leading-snug text-[var(--dim)]">
+                      {m.label}
+                    </span>
+                    <div className="h-1.5 w-20 shrink-0 overflow-hidden rounded-full bg-[var(--surface-2)] min-[480px]:w-28">
+                      <div
+                        className="h-full rounded-full"
+                        style={{
+                          width: `${Math.min(Math.max(m.pct, 1.5), 100)}%`,
+                          background:
+                            m.pct >= 30 ? "var(--danger)" : "var(--accent)",
+                        }}
+                      />
+                    </div>
+                    <span className="num w-14 shrink-0 text-right text-sm font-medium">
+                      {m.pct.toFixed(1)}%
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </section>
+            )}
+
           </>
         )}
       </main>
