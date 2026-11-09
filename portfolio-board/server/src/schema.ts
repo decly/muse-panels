@@ -64,10 +64,13 @@ export const quoteSnapshots = sqliteTable("quote_snapshots", {
   // most relevant extended-session last trade — pre-market when the
   // pre session is the live/recent one, after-hours otherwise. Stored
   // separately from the regular close and never used in totals.
-  // extSession: "pre" | "post". Overnight hours have no public feed;
-  // the stored row then holds the after-hours last trade, labeled as
-  // the latest available price. after_* stays as the post-session
-  // mirror for backward compatibility.
+  // extSession: "pre" | "post" | "overnight". The overnight price
+  // comes from Yahoo chart meta.fulldayPrice (Nasdaq has no overnight
+  // stream); its ext_as_of is the fetch moment (fulldayPrice carries
+  // no trade timestamp) and is labeled 抓取于 in the UI. When Yahoo
+  // yields nothing for a symbol, the row keeps the after-hours last
+  // trade ("post"), labeled as the latest available price. after_*
+  // stays as the post-session mirror for backward compatibility.
   extPrice: real("ext_price"),
   // Percent move of the extended price versus its session's regular
   // close (previous close for pre-market, same-day close for post).
@@ -92,8 +95,20 @@ export const fxSnapshots = sqliteTable("fx_snapshots", {
     .$defaultFn(() => new Date()),
 });
 
-// Market benchmarks (S&P 500, Nasdaq-100, COMEX gold), one row per key,
-// upserted by refreshQuotes from Yahoo Finance chart data.
+// Market benchmarks (S&P 500, Nasdaq-100, Nasdaq Composite, Shanghai
+// Composite, CSI 300, CSI A500, Hang Seng TECH, Nikkei 225, Vietnam
+// Ho Chi Minh Index, spot gold, Shanghai gold), one row per key, upserted by
+// refreshQuotes. peak_price / peak_date
+// hold the all-time highest close and the date it was set (YYYY-MM-DD):
+// seeded once from long history when empty, afterwards only ratcheted
+// up by refreshQuotes — never lowered. peak3y_price / peak3y_date hold
+// the highest close within the trailing 3-year window (ending at the
+// latest close): seeded once from ~3 years of daily closes, ratcheted
+// up the same way, and re-seeded from the source series whenever the
+// stored peak date slides out of the window (a failed re-seed keeps
+// the old value). The client renders the current drawdown （距高点）
+// from price vs peak3y_price; the all-time peak is kept alongside so
+// the display basis can switch back without re-seeding.
 export const marketSnapshots = sqliteTable("market_snapshots", {
   key: text("key").primaryKey(),
   label: text("label").notNull(),
@@ -103,6 +118,10 @@ export const marketSnapshots = sqliteTable("market_snapshots", {
   asOf: text("as_of"),
   source: text("source"),
   note: text("note"),
+  peakPrice: real("peak_price"),
+  peakDate: text("peak_date"),
+  peak3yPrice: real("peak3y_price"),
+  peak3yDate: text("peak3y_date"),
   fetchedAt: integer("fetched_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
