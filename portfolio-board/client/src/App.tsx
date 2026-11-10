@@ -18,11 +18,14 @@ const cny = (v: number) => `¥${money(v, 0)}`;
 // standalone flag; smaller ones stay visible in the row detail only.
 const AFTER_ALERT_PCT = 3;
 
-// Effective extended-hours quote for a holding: the session-aware ext_*
-// fields (pre-market or after-hours, whichever session is current),
-// falling back to the legacy after_* post-session mirror for rows
-// stored before the ext fields existed. Extended prices are always
-// annotation / live-estimate material — never the official basis.
+// Effective extended-hours quote for a holding: the ext_* fields,
+// which the server derives from the per-session saved slots
+// (pre_*/post_*/overnight_*, plan B) for the CURRENT session — so
+// the first paint already shows that session's last saved price
+// before any new refresh lands. Falls back to the legacy after_*
+// post-session mirror for rows stored before the ext fields
+// existed. Extended prices are always annotation / live-estimate
+// material — never the official basis.
 function effExt(q: Holding["quote"]): {
   price: number;
   pct: number | null;
@@ -103,12 +106,104 @@ function fmtTime(iso: string | null): string {
   }).format(d);
 }
 
-// Overnight prices come from Yahoo fulldayPrice, which has no trade
-// timestamp — the stored ext_as_of is the fetch moment. List rows
-// (standard + table) show only the price and its move vs the close so
-// the columns stay aligned; the fetch moment itself (a bare time,
-// no label words) appears only in the expanded detail (RowDetail,
-// via fmtTime).
+// "刷新于 M/D HH:MM" for the server-recorded quote fetch time shown
+// under the refresh button. Takes the ISO instant getPortfolio returns
+// (quote_snapshots.fetched_at, max over the batch) and only formats it
+// in Beijing time — never a client-side clock. Null when there is no
+// usable timestamp, in which case the line is hidden entirely.
+function fmtFetchedAt(iso: string | null): string | null {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Shanghai",
+    hourCycle: "h23",
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).formatToParts(d);
+  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+  return `刷新于 ${get("month")}/${get("day")} ${get("hour")}:${get("minute")}`;
+}
+
+// Extended-hours detail time, one bare numeric time for every
+// session. Overnight ext_as_of is the Yahoo fetch moment (fulldayPrice
+// has no trade timestamp); pre/post ext_as_of is the Nasdaq session's
+// last-trade stamp, stored server-side as a UTC ISO instant. Rows
+// stored before that cleanup still hold the raw Nasdaq page stamp
+// ("Nov 6, 2026 4:15 PM ET This page refreshes every 30 seconds") —
+// parse the ET wall-clock stamp out of those here. A value with no
+// parseable time yields null and the detail shows no time line at
+// all: the raw source copy is never rendered. List rows (standard +
+// table) show no time at all, so the columns stay aligned.
+const EXT_MONTHS: Record<string, number> = {
+  jan: 0,
+  feb: 1,
+  mar: 2,
+  apr: 3,
+  may: 4,
+  jun: 5,
+  jul: 6,
+  aug: 7,
+  sep: 8,
+  oct: 9,
+  nov: 10,
+  dec: 11,
+};
+
+function tzOffsetMs(at: Date, timeZone: string): number {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    hourCycle: "h23",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).formatToParts(at);
+  const get = (t: string) =>
+    Number(parts.find((p) => p.type === t)?.value ?? 0);
+  const wallAsUtc = Date.UTC(
+    get("year"),
+    get("month") - 1,
+    get("day"),
+    get("hour"),
+    get("minute"),
+    get("second"),
+  );
+  return wallAsUtc - Math.floor(at.getTime() / 1000) * 1000;
+}
+
+function parseLegacyEtStamp(raw: string): Date | null {
+  const m = raw.match(
+    /([A-Za-z]{3,9})\.?\s+(\d{1,2}),\s+(\d{4}),?\s+(\d{1,2}):(\d{2})\s*([AaPp])[Mm]/,
+  );
+  if (!m) return null;
+  const month = EXT_MONTHS[(m[1] ?? "").slice(0, 3).toLowerCase()];
+  if (month == null) return null;
+  let hour = Number(m[4]) % 12;
+  if ((m[6] ?? "").toLowerCase() === "p") hour += 12;
+  const wallAsUtc = Date.UTC(
+    Number(m[3]),
+    month,
+    Number(m[2]),
+    hour,
+    Number(m[5]),
+  );
+  const utc = wallAsUtc - tzOffsetMs(new Date(wallAsUtc), "America/New_York");
+  const refined =
+    wallAsUtc - tzOffsetMs(new Date(utc), "America/New_York");
+  return new Date(refined);
+}
+
+function fmtExtTime(asOf: string | null): string | null {
+  if (!asOf) return null;
+  if (!Number.isNaN(new Date(asOf).getTime())) return fmtTime(asOf);
+  const legacy = parseLegacyEtStamp(asOf);
+  return legacy ? fmtTime(legacy.toISOString()) : null;
+}
 
 function RowDetail({
   h,
@@ -126,8 +221,8 @@ function RowDetail({
   // Current US session key from the portfolio response; during the
   // overnight session a "post" extended price is only the latest
   // available (after-hours last trade, Yahoo yielded nothing) and is
-  // labeled as such — an "overnight" one is the live Yahoo price,
-  // shown with its fetch time (bare time, no label words).
+  // labeled as such. Every session's time renders as one bare numeric
+  // time via fmtExtTime (the overnight one is its fetch moment).
   sessionKey?: string;
   onSave: (qty: number, cost: number) => void;
   onRemove: () => void;
@@ -138,6 +233,7 @@ function RowDetail({
   const [cost, setCost] = useState(String(h.cost_per_share));
   const q = h.quote;
   const ext = effExt(q);
+  const extTime = ext ? fmtExtTime(ext.asOf) : null;
   return (
     <div className="mt-3 border-t border-[var(--border)] pt-3">
       <div className="grid grid-cols-3 gap-x-2 gap-y-3 text-sm text-[var(--dim)]">
@@ -213,11 +309,9 @@ function RowDetail({
                 {signedPct(ext.pct)}
               </span>
             )}
-            {ext?.asOf && (
+            {extTime && (
               <span className="block text-xs font-normal text-[var(--dim)]">
-                {ext.session === "overnight"
-                  ? fmtTime(ext.asOf)
-                  : ext.asOf}
+                {extTime}
               </span>
             )}
             {ext && sessionKey === "overnight" && ext.session !== "overnight" && (
@@ -1011,19 +1105,26 @@ export function App() {
                 );
               })}
             </nav>
-            <p className="mt-2 text-xs text-[var(--dim)]">
-              当前美东时段：{data.session.label}
-              {data.session.key === "overnight"
-                ? data.holdings.some(
-                    (h) => h.quote?.ext_session === "overnight",
-                  )
-                  ? " · 夜盘价实时抓取自 Yahoo"
-                  : " · 夜盘显示盘后最后成交价"
-                : ""}
-            </p>
+            <div className="mt-2 text-xs leading-snug text-[var(--dim)]">
+              <p>
+                当前美东时段：{data.session.label}
+                {data.session.key === "overnight"
+                  ? data.holdings.some(
+                      (h) => h.quote?.ext_session === "overnight",
+                    )
+                    ? " · 夜盘价实时抓取自 Yahoo"
+                    : " · 夜盘显示盘后最后成交价"
+                  : ""}
+              </p>
+              {data.session.rangeEt && data.session.rangeBj && (
+                <p className="num mt-0.5 whitespace-nowrap">
+                  美东 {data.session.rangeEt} · 北京 {data.session.rangeBj}
+                </p>
+              )}
+            </div>
             {view.readOnly && (
-              <p className="mt-2 text-xs text-[var(--dim)]">
-                全局为各账户汇总，只读；切到具体账户可编辑持仓与现金。
+              <p className="mt-1.5 text-xs text-[var(--dim)]">
+                全局 · 只读汇总，切到单账户可编辑
               </p>
             )}
 
@@ -1050,7 +1151,8 @@ export function App() {
                         （汇率 {derived.fxRate.toFixed(3)}）
                       </p>
                     )}
-                  {derived.estDiff != null &&
+                  {data.session.key !== "regular" &&
+                    derived.estDiff != null &&
                     derived.estAccountValue != null && (
                       <p className="mt-1 text-[13px] leading-snug">
                         <span className="text-[var(--dim)]">
@@ -1076,7 +1178,8 @@ export function App() {
                       </p>
                     )}
                 </div>
-                <div className="flex shrink-0 items-center gap-2">
+                <div className="flex shrink-0 flex-col items-end gap-1.5">
+                  <div className="flex items-center gap-2">
                   <button
                     type="button"
                     aria-label={privacy ? "显示账户数值" : "隐藏账户数值"}
@@ -1126,6 +1229,12 @@ export function App() {
                   >
                     {refresh.isPending ? "刷新中…" : "刷新报价"}
                   </button>
+                  </div>
+                  {fmtFetchedAt(data.last_fetched_at) && (
+                    <p className="num whitespace-nowrap text-right text-[11px] leading-none text-[var(--dim)]">
+                      {fmtFetchedAt(data.last_fetched_at)}
+                    </p>
+                  )}
                 </div>
               </div>
 
@@ -1906,13 +2015,6 @@ export function App() {
                                 <p className="truncate text-xs leading-snug text-[var(--dim)]">
                                   {h.name}
                                 </p>
-                                <p className="mt-0.5 text-xs leading-snug text-[var(--dim)]">
-                                  {h.theme} ·{" "}
-                                  {h.kind === "etf" ? "ETF" : "个股"}
-                                  {weight != null
-                                    ? ` · 占比 ${weight.toFixed(2)}%`
-                                    : ""}
-                                </p>
                               </div>
                               <div className="shrink-0 text-right">
                                 <p className="num whitespace-nowrap text-base font-medium leading-snug">
@@ -1935,39 +2037,56 @@ export function App() {
                                     ? `今日 ${signedPct(q.change_percent)}`
                                     : "—"}
                                 </span>
-                                {showExt && ext && (
-                                  <p className="num mt-1 whitespace-nowrap text-[13px] leading-snug">
-                                    <span className="text-[var(--dim)]">
-                                      {extLabel(ext.session)}
-                                    </span>{" "}
-                                    ${money(ext.price)}
-                                    {ext.pct != null && (
-                                      <span
-                                        className={
-                                          extAlert ? "font-semibold" : ""
-                                        }
-                                        style={{
-                                          color:
-                                            ext.pct >= 0
-                                              ? "var(--up)"
-                                              : "var(--down)",
-                                        }}
-                                      >
-                                        {" "}
-                                        {signedPct(ext.pct)}
-                                      </span>
-                                    )}
-                                  </p>
-                                )}
                               </div>
                             </div>
-                            <div className="mt-1.5 flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1 border-t border-[var(--border)] pt-1.5 text-sm">
+                            {/* Line 3 is one full-width row shared by both
+                                sides: 主题·占比 on the left, the extended-
+                                hours price right-aligned — same line, same
+                                baseline, so the two sides can never drift
+                                apart vertically. No kind segment and no
+                                truncation: the theme always shows in full
+                                and no bare "…" can appear. When there is
+                                no extended price (regular session), the row
+                                keeps the same height with left content only. */}
+                            <div className="mt-0.5 flex items-baseline justify-between gap-x-3 text-xs leading-snug">
+                              <span className="num whitespace-nowrap text-[var(--dim)]">
+                                {h.theme}
+                                {weight != null && (
+                                  <> · 占比 {weight.toFixed(2)}%</>
+                                )}
+                              </span>
+                              {showExt && ext && (
+                                <span className="num shrink-0 whitespace-nowrap text-[13px]">
+                                  <span className="text-[var(--dim)]">
+                                    {extLabel(ext.session)}
+                                  </span>{" "}
+                                  ${money(ext.price)}
+                                  {ext.pct != null && (
+                                    <span
+                                      className={
+                                        extAlert ? "font-semibold" : ""
+                                      }
+                                      style={{
+                                        color:
+                                          ext.pct >= 0
+                                            ? "var(--up)"
+                                            : "var(--down)",
+                                      }}
+                                    >
+                                      {" "}
+                                      {signedPct(ext.pct)}
+                                    </span>
+                                  )}
+                                </span>
+                              )}
+                            </div>
+                            <div className="mt-1.5 flex flex-nowrap items-baseline justify-between gap-x-2 border-t border-[var(--border)] pt-1.5 text-[13px]">
                               <span className="num whitespace-nowrap text-[var(--dim)]">
                                 市值{" "}
                                 {r.mv != null ? mask(`$${money(r.mv)}`) : "—"}
                               </span>
                               <span
-                                className="num whitespace-nowrap"
+                                className="num shrink-0 whitespace-nowrap"
                                 style={{ color: pnlColor }}
                               >
                                 浮盈亏{" "}
