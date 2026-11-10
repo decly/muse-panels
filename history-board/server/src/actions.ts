@@ -142,6 +142,203 @@ const recordResponse = z.object({
   snapshot: snapshotSchema.nullable(),
 });
 
+// --- Personal-data export / import -------------------------------------
+//
+// Stateless data actions for the muse-data backup flow: this board
+// knows nothing about GitHub, repositories, or pushes. export returns
+// the board's ONLY personal data — the daily_snapshots rows (overall
+// account totals; the index closes and FX rate stored on a row are
+// part of that personal history record and travel with it). There is
+// no other table to export: this board stores no holdings and no
+// market-quote cache.
+//
+// Format v2 (self-describing dataset envelope, the industry-standard
+// shape for portable data packages): each exported table carries its
+// own primary_key declaration alongside its rows, so generic tooling
+// can validate and merge without hardcoding this board's schema.
+// Serialization is deterministic — rows sorted by the declared
+// primary key, fields in a fixed order — so the same state exports
+// byte-identically except for exported_at; `checksum` is an FNV-1a
+// hash over the canonical payload (format/version/panel/tables)
+// without exported_at. Import accepts v2 and the legacy v1 envelope
+// (tables as bare row arrays, panel named "history"), ignores unknown
+// fields, and skips unknown tables (noted in the import summary)
+// instead of failing on additive changes.
+
+const personalDataRowSchema = z.object({
+  account_id: z.string(),
+  date: z.string(),
+  account_value_usd: z.number(),
+  securities_value_usd: z.number(),
+  cash_usd: z.number(),
+  total_pnl_usd: z.number().nullable(),
+  day_change_usd: z.number().nullable(),
+  day_change_pct: z.number().nullable(),
+  fx_rate: z.number().nullable(),
+  account_value_cny: z.number().nullable(),
+  spx_price: z.number().nullable(),
+  ndx_price: z.number().nullable(),
+  source: z.string(),
+  created_at: z.string().nullable(),
+});
+
+type PersonalDataRow = z.infer<typeof personalDataRowSchema>;
+
+// The one personal table this board owns, with its declared primary
+// key (field names as they appear in the export rows).
+const SNAPSHOTS_PRIMARY_KEY = ["date", "account_id"] as const;
+
+const tableEnvelopeSchema = z.object({
+  primary_key: z.array(z.string()),
+  rows: z.array(personalDataRowSchema),
+});
+
+const personalDataSchema = z.object({
+  format: z.literal("muse-personal-data"),
+  version: z.literal(2),
+  panel: z.literal("history-board"),
+  exported_at: z.string(),
+  tables: z.object({
+    daily_snapshots: tableEnvelopeSchema,
+  }),
+});
+
+const exportResponse = personalDataSchema.extend({
+  checksum: z.string(),
+});
+
+type ExportResponse = z.infer<typeof exportResponse>;
+
+// Field order in this literal IS the export field order — do not
+// reorder; deterministic bytes depend on it.
+function toPersonalRow(
+  s: typeof schema.dailySnapshots.$inferSelect,
+): PersonalDataRow {
+  return {
+    account_id: s.accountId,
+    date: s.date,
+    account_value_usd: s.accountValueUsd,
+    securities_value_usd: s.securitiesValueUsd,
+    cash_usd: s.cashUsd,
+    total_pnl_usd: s.totalPnlUsd,
+    day_change_usd: s.dayChangeUsd,
+    day_change_pct: s.dayChangePct,
+    fx_rate: s.fxRate,
+    account_value_cny: s.accountValueCny,
+    spx_price: s.spxPrice,
+    ndx_price: s.ndxPrice,
+    source: s.source,
+    created_at: s.createdAt ? new Date(s.createdAt).toISOString() : null,
+  };
+}
+
+function fnv1a64(input: string): string {
+  let hash = 0xcbf29ce484222325n;
+  const prime = 0x100000001b3n;
+  const mask = 0xffffffffffffffffn;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= BigInt(input.charCodeAt(i));
+    hash = (hash * prime) & mask;
+  }
+  return hash.toString(16).padStart(16, "0");
+}
+
+// Canonical payloads the checksum is computed over. The v2 form is
+// the full envelope minus exported_at/checksum; the v1 form is kept
+// so checksums on legacy v1 payloads can still be verified at import.
+function canonicalPayloadV2(rows: PersonalDataRow[]): string {
+  return JSON.stringify({
+    format: "muse-personal-data",
+    version: 2,
+    panel: "history-board",
+    tables: {
+      daily_snapshots: {
+        primary_key: [...SNAPSHOTS_PRIMARY_KEY],
+        rows,
+      },
+    },
+  });
+}
+
+function canonicalPayloadV1(rows: PersonalDataRow[]): string {
+  return JSON.stringify({
+    format: "muse-personal-data",
+    version: 1,
+    board: "history",
+    tables: { daily_snapshots: rows },
+  });
+}
+
+function sortRows(rows: PersonalDataRow[]): PersonalDataRow[] {
+  return [...rows].sort((a, b) =>
+    a.date < b.date
+      ? -1
+      : a.date > b.date
+        ? 1
+        : a.account_id < b.account_id
+          ? -1
+          : a.account_id > b.account_id
+            ? 1
+            : 0,
+  );
+}
+
+async function buildExport(ctx: Ctx): Promise<ExportResponse> {
+  const db = ctx.db<typeof schema>();
+  const stored = await db.select().from(schema.dailySnapshots);
+  const rows = sortRows(stored.map(toPersonalRow));
+  return {
+    format: "muse-personal-data",
+    version: 2,
+    panel: "history-board",
+    exported_at: new Date().toISOString(),
+    tables: {
+      daily_snapshots: {
+        primary_key: [...SNAPSHOTS_PRIMARY_KEY],
+        rows,
+      },
+    },
+    checksum: fnv1a64(canonicalPayloadV2(rows)),
+  };
+}
+
+const importResponse = z.object({
+  ok: z.boolean(),
+  reason: z.string().nullable(),
+  mode: z.string().nullable(),
+  written: z.number(),
+  skipped_protected: z.number(),
+  // Tables present in the payload that this board does not know —
+  // skipped wholesale (additive format evolution must not fail an
+  // import), and named here so the caller sees what was left out.
+  skipped_tables: z.array(z.string()),
+  total_rows: z.number(),
+});
+
+type ImportResponse = z.infer<typeof importResponse>;
+
+// Import accepts both envelope generations. v2: `panel` +
+// tables as {primary_key, rows} envelopes + `checksum`. v1: `board`
+// ("history") + tables as bare row arrays + `content_checksum`.
+// Unknown top-level and per-table fields are ignored by design.
+const importRequestData = z.object({
+  format: z.string(),
+  version: z.number(),
+  board: z.string().optional(),
+  panel: z.string().optional(),
+  exported_at: z.string().optional(),
+  checksum: z.string().optional(),
+  content_checksum: z.string().optional(),
+  tables: z
+    .object({
+      daily_snapshots: z.union([
+        z.array(personalDataRowSchema),
+        tableEnvelopeSchema,
+      ]),
+    })
+    .catchall(z.unknown()),
+});
+
 const statusResponse = z.object({
   count: z.number(),
   latest_date: z.string().nullable(),
@@ -340,6 +537,152 @@ export const Actions = {
         latest_date: latest?.date ?? null,
         latest_account_value_usd: latest?.accountValueUsd ?? null,
         accounts,
+      };
+    },
+  }),
+
+  exportPersonalData: defineAction({
+    description:
+      "Read-only export of this board's personal data only: every daily_snapshots row (all fields, including the per-row index closes and FX rate that belong to the personal history record), deterministically serialized as a self-describing v2 envelope {format: 'muse-personal-data', version: 2, panel: 'history-board', exported_at, checksum, tables: {daily_snapshots: {primary_key: ['date', 'account_id'], rows}}} — rows sorted by the declared primary key with fixed field order, checksum over the canonical payload without exported_at. No side effects; knows nothing about any repository or push.",
+    request: z.object({}),
+    response: exportResponse,
+    handler: async (ctx): Promise<ExportResponse> => buildExport(ctx),
+  }),
+
+  importPersonalData: defineAction({
+    description:
+      "Restores personal data previously produced by exportPersonalData (format v2 envelope, or legacy v1 which is normalized onto the same path). Validates format/version/panel first and rejects the whole file without writing when invalid or when a carried checksum does not match the payload. Unknown tables are skipped and named in the summary; unknown fields are ignored. mode=restore replaces daily_snapshots wholesale with the file's rows (single batch: clear then insert) and requires confirm=true. mode=merge upserts by (date, account_id) without deleting rows absent from the file, and never overwrites an existing manual-sourced protected record. Returns written/skipped counts.",
+    request: z.object({
+      data: importRequestData,
+      mode: z.enum(["restore", "merge"]),
+      confirm: z.boolean(),
+    }),
+    response: importResponse,
+    handler: async (ctx, args): Promise<ImportResponse> => {
+      // Normalize both envelope generations onto one row list.
+      // v2 wraps rows in {primary_key, rows}; v1 is a bare array.
+      const rawTable = args.data.tables.daily_snapshots;
+      const incoming: PersonalDataRow[] = Array.isArray(rawTable)
+        ? rawTable
+        : rawTable.rows;
+      const skippedTables = Object.keys(args.data.tables).filter(
+        (name) => name !== "daily_snapshots",
+      );
+      const reject = (reason: string): ImportResponse => ({
+        ok: false,
+        reason,
+        mode: args.mode,
+        written: 0,
+        skipped_protected: 0,
+        skipped_tables: skippedTables,
+        total_rows: incoming.length,
+      });
+      if (args.data.format !== "muse-personal-data")
+        return reject("bad_format");
+      if (args.data.version !== 1 && args.data.version !== 2)
+        return reject("unsupported_version");
+      // v1 named the panel in `board` ("history"); v2 uses `panel`
+      // ("history-board"). Both denote this same board.
+      const panelId = args.data.panel ?? args.data.board;
+      if (panelId !== "history-board" && panelId !== "history")
+        return reject("wrong_board");
+      const rows = sortRows(incoming);
+      // Integrity: when the payload carries a checksum, it must match
+      // the canonical form of its own generation — a mismatch means
+      // the file is corrupt or tampered with; reject without writing.
+      const carriedChecksum =
+        args.data.version === 2
+          ? (args.data.checksum ?? args.data.content_checksum)
+          : (args.data.content_checksum ?? args.data.checksum);
+      if (carriedChecksum != null) {
+        const expected =
+          args.data.version === 2
+            ? fnv1a64(canonicalPayloadV2(rows))
+            : fnv1a64(canonicalPayloadV1(rows));
+        if (carriedChecksum !== expected) return reject("checksum_mismatch");
+      }
+      if (args.mode === "restore" && !args.confirm)
+        return reject("confirmation_required");
+      for (const r of rows) {
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(r.date) || r.account_id.length === 0)
+          return reject("invalid_row");
+      }
+      const db = ctx.db<typeof schema>();
+      const toDb = (r: PersonalDataRow) => {
+        const created = r.created_at ? new Date(r.created_at) : new Date();
+        return {
+          accountId: r.account_id,
+          date: r.date,
+          accountValueUsd: r.account_value_usd,
+          securitiesValueUsd: r.securities_value_usd,
+          cashUsd: r.cash_usd,
+          totalPnlUsd: r.total_pnl_usd,
+          dayChangeUsd: r.day_change_usd,
+          dayChangePct: r.day_change_pct,
+          fxRate: r.fx_rate,
+          accountValueCny: r.account_value_cny,
+          spxPrice: r.spx_price,
+          ndxPrice: r.ndx_price,
+          source: r.source,
+          createdAt: Number.isNaN(created.getTime()) ? new Date() : created,
+        };
+      };
+      if (args.mode === "restore") {
+        // Wholesale replacement in one batch: clear, then insert the
+        // file's rows. An explicit confirmed restore is the recovery
+        // path, so manual protection does not apply here (it
+        // guards syncs and merges, not a deliberate full restore).
+        await db.batch([
+          db.delete(schema.dailySnapshots),
+          ...rows.map((r) => db.insert(schema.dailySnapshots).values(toDb(r))),
+        ]);
+        ctx.invalidateQueries();
+        return {
+          ok: true,
+          reason: null,
+          mode: args.mode,
+          written: rows.length,
+          skipped_protected: 0,
+          skipped_tables: skippedTables,
+          total_rows: rows.length,
+        };
+      }
+      // merge: upsert per (date, account_id); existing rows absent
+      // from the file stay untouched, and an existing
+      // manual-sourced record is never overwritten — same
+      // protection semantics as recordSnapshot.
+      const existing = await db.select().from(schema.dailySnapshots);
+      const protectedKeys = new Set(
+        existing
+          .filter((s) => s.source === "manual")
+          .map((s) => `${s.date}|${s.accountId}`),
+      );
+      let written = 0;
+      let skipped = 0;
+      for (const r of rows) {
+        if (protectedKeys.has(`${r.date}|${r.account_id}`)) {
+          skipped++;
+          continue;
+        }
+        const values = toDb(r);
+        await db
+          .insert(schema.dailySnapshots)
+          .values(values)
+          .onConflictDoUpdate({
+            target: [schema.dailySnapshots.accountId, schema.dailySnapshots.date],
+            set: values,
+          });
+        written++;
+      }
+      if (written > 0) ctx.invalidateQueries();
+      return {
+        ok: true,
+        reason: null,
+        mode: args.mode,
+        written,
+        skipped_protected: skipped,
+        skipped_tables: skippedTables,
+        total_rows: rows.length,
       };
     },
   }),
