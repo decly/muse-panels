@@ -10,12 +10,15 @@
 // close: market value, day change and P/L are computed from regular
 // prices only. Extended-hours prices (Nasdaq extended-trading feeds
 // for pre-market and after-hours; Yahoo chart meta.fulldayPrice for
-// the overnight session, which Nasdaq does not cover) are stored
-// separately (ext_* fields, plus the legacy after_* post-session
-// mirror), shown as annotations and in a clearly-labeled live
-// estimate next to the official total; they never enter the official
-// totals or the daily snapshots. The overnight price carries no
-// trade timestamp: its ext_as_of is the fetch moment, labeled 抓取于.
+// the overnight session, which Nasdaq does not cover) are stored in
+// per-session slots (pre_* / post_* / overnight_* — plan B: each
+// session's last saved value, written only by that session's
+// refreshes; ext_* is the effective view of the current session's
+// slot derived at read time, and after_* mirrors the post slot),
+// shown as annotations and in a clearly-labeled live estimate next
+// to the official total; they never enter the official totals or
+// the daily snapshots. The overnight price carries no trade
+// timestamp: its overnight_as_of is the fetch moment.
 //
 // Quote channels, in order:
 //  1. ctx.tool.finance_ticker (managed channel) for every holding.
@@ -82,6 +85,19 @@ const quoteSchema = z.object({
   ext_change_percent: z.number().nullable(),
   ext_as_of: z.string().nullable(),
   ext_session: z.string().nullable(),
+  // Per-session saved extended prices (plan B): each session's own
+  // last value, never overwritten by another session's refresh.
+  // ext_* above is the effective view for the CURRENT session,
+  // derived server-side from these slots in loadPortfolio.
+  pre_price: z.number().nullable(),
+  pre_change_percent: z.number().nullable(),
+  pre_as_of: z.string().nullable(),
+  post_price: z.number().nullable(),
+  post_change_percent: z.number().nullable(),
+  post_as_of: z.string().nullable(),
+  overnight_price: z.number().nullable(),
+  overnight_change_percent: z.number().nullable(),
+  overnight_as_of: z.string().nullable(),
   source: z.string().nullable(),
   fetched_at: z.string().nullable(),
 });
@@ -174,6 +190,16 @@ const sessionSchema = z.object({
   // "pre" | "regular" | "post" | "overnight" | "closed".
   key: z.string(),
   label: z.string(),
+  // The current session window's start/end as ISO instants, and the
+  // same window formatted as "HH:MM–HH:MM" ranges in ET and Beijing
+  // time (bare clock times; cross-midnight ends carry no 次日 marker).
+  // Null when the market is closed (no current window). Computed from
+  // the real instants, so the Beijing range shifts by an hour across
+  // US DST changes automatically.
+  start: z.string().nullable(),
+  end: z.string().nullable(),
+  rangeEt: z.string().nullable(),
+  rangeBj: z.string().nullable(),
 });
 
 const portfolioResponse = z.object({
@@ -194,11 +220,102 @@ type PortfolioResponse = z.infer<typeof portfolioResponse>;
 type HoldingOut = z.infer<typeof holdingSchema>;
 type SnapshotOut = z.infer<typeof snapshotSchema>;
 
+// ---------- Per-session extended-price slots (plan B) ----------
+
+type ExtSlotName = "pre" | "post" | "overnight";
+type ExtSlot = {
+  price: number | null;
+  pct: number | null;
+  asOf: string | null;
+};
+
+function slotOf(
+  s: typeof schema.quoteSnapshots.$inferSelect,
+  slot: ExtSlotName,
+): ExtSlot {
+  if (slot === "pre") {
+    return { price: s.prePrice, pct: s.preChangePercent, asOf: s.preAsOf };
+  }
+  if (slot === "overnight") {
+    return {
+      price: s.overnightPrice,
+      pct: s.overnightChangePercent,
+      asOf: s.overnightAsOf,
+    };
+  }
+  // Post slot, with the legacy after_* mirror as its fallback (rows
+  // written before migration 0010 seeded the slot from after_*).
+  return {
+    price: s.postPrice ?? s.afterPrice,
+    pct: s.postChangePercent ?? s.afterChangePercent,
+    asOf: s.postAsOf ?? s.afterAsOf,
+  };
+}
+
+// The effective extended quote for display: the saved slot of the
+// session the board is opened in (plan B — only that session's saved
+// price shows; the regular session keeps the status quo, where the
+// inline rows are hidden client-side and the detail/estimate keep
+// this morning's pre-market slot). Cross-slot fallbacks mirror the
+// pre-plan-B behavior: pre-market with no pre data yet shows the
+// after-hours last trade, overnight with no Yahoo price shows the
+// after-hours last trade (labeled 夜盘最近可得价 in the detail), and
+// a row whose slots are all empty falls back to the legacy stored
+// ext_* mirror.
+function effectiveExt(
+  s: typeof schema.quoteSnapshots.$inferSelect,
+  sessionKey: string,
+): { price: number; pct: number | null; asOf: string | null; session: ExtSlotName } | null {
+  const pick = (
+    slot: ExtSlotName,
+  ): { price: number; pct: number | null; asOf: string | null; session: ExtSlotName } | null => {
+    const v = slotOf(s, slot);
+    return v.price != null
+      ? { price: v.price, pct: v.pct, asOf: v.asOf, session: slot }
+      : null;
+  };
+  let eff: ReturnType<typeof pick> = null;
+  if (sessionKey === "pre") {
+    eff = pick("pre") ?? pick("post");
+  } else if (sessionKey === "overnight") {
+    eff = pick("overnight") ?? pick("post");
+  } else if (sessionKey === "regular") {
+    eff = pick("pre") ?? pick("post");
+  } else {
+    // post / closed: the after-hours slot is the latest extended save.
+    eff = pick("post") ?? pick("pre");
+  }
+  if (eff) return eff;
+  if (s.extPrice != null) {
+    const sess =
+      s.extSession === "pre" || s.extSession === "overnight"
+        ? s.extSession
+        : "post";
+    return {
+      price: s.extPrice,
+      pct: s.extChangePercent,
+      asOf: s.extAsOf,
+      session: sess as ExtSlotName,
+    };
+  }
+  if (s.afterPrice != null) {
+    return {
+      price: s.afterPrice,
+      pct: s.afterChangePercent,
+      asOf: s.afterAsOf,
+      session: "post",
+    };
+  }
+  return null;
+}
+
 function toHoldingOut(
   h: typeof schema.holdings.$inferSelect,
   bySymbol: Map<string, typeof schema.quoteSnapshots.$inferSelect>,
+  sessionKey: string = "closed",
 ): HoldingOut {
   const s = bySymbol.get(h.quoteSymbol);
+  const eff = s ? effectiveExt(s, sessionKey) : null;
   return {
     id: h.id,
     account_id: h.accountId,
@@ -224,10 +341,20 @@ function toHoldingOut(
           after_price: s.afterPrice,
           after_change_percent: s.afterChangePercent,
           after_as_of: s.afterAsOf,
-          ext_price: s.extPrice,
-          ext_change_percent: s.extChangePercent,
-          ext_as_of: s.extAsOf,
-          ext_session: s.extSession,
+          ext_price: eff?.price ?? null,
+          ext_change_percent: eff?.pct ?? null,
+          ext_as_of: eff?.asOf ?? null,
+          ext_session: eff?.session ?? null,
+          pre_price: s.prePrice,
+          pre_change_percent: s.preChangePercent,
+          pre_as_of: s.preAsOf,
+          post_price: s.postPrice ?? s.afterPrice,
+          post_change_percent:
+            s.postChangePercent ?? s.afterChangePercent,
+          post_as_of: s.postAsOf ?? s.afterAsOf,
+          overnight_price: s.overnightPrice,
+          overnight_change_percent: s.overnightChangePercent,
+          overnight_as_of: s.overnightAsOf,
           source: s.source,
           fetched_at: s.fetchedAt.toISOString(),
         }
@@ -374,13 +501,88 @@ const SESSION_LABELS: Record<UsSessionKey, string> = {
 // closed) and Friday night / Saturday are closed (no session).
 // Holidays are not modeled — on a holiday the feeds simply return
 // the last session's data with its own timestamp.
-function currentUsSession(at: Date = new Date()): {
+// Convert an America/New_York wall-clock time (y/m/d + hh:mm) to the
+// real instant it denotes. The UTC offset is derived from Intl at a
+// first guess and refined once, which lands on the right side of DST
+// transitions for the (non-transition-hour) session boundaries.
+function etWallClockToInstant(
+  year: number,
+  month: number,
+  day: number,
+  hh: number,
+  mm: number,
+): Date {
+  const wallAsUtc = Date.UTC(year, month - 1, day, hh, mm);
+  let instant = wallAsUtc;
+  for (let i = 0; i < 2; i++) {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: "America/New_York",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hourCycle: "h23",
+    }).formatToParts(new Date(instant));
+    const g = (t: string) => Number(parts.find((p) => p.type === t)?.value ?? 0);
+    const shownAsUtc = Date.UTC(
+      g("year"),
+      g("month") - 1,
+      g("day"),
+      g("hour") % 24,
+      g("minute"),
+      g("second"),
+    );
+    const next = wallAsUtc - (shownAsUtc - instant);
+    if (next === instant) break;
+    instant = next;
+  }
+  return new Date(instant);
+}
+
+// Format one session window (real start/end instants) as an
+// "HH:MM–HH:MM" range in the given timezone. Cross-midnight ends are
+// shown as bare clock times (no 次日 marker, per user request).
+function formatSessionRange(start: Date, end: Date, timeZone: string): string {
+  const fmt = new Intl.DateTimeFormat("en-GB", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  });
+  const fields = (d: Date) => {
+    const p = fmt.formatToParts(d);
+    const g = (t: string) => p.find((x) => x.type === t)?.value ?? "";
+    return {
+      day: `${g("year")}-${g("month")}-${g("day")}`,
+      hm: `${g("hour")}:${g("minute")}`,
+    };
+  };
+  const s = fields(start);
+  const e = fields(end);
+  return `${s.hm}–${e.hm}`;
+}
+
+type UsSession = {
   key: UsSessionKey;
   label: string;
-} {
+  start: string | null;
+  end: string | null;
+  rangeEt: string | null;
+  rangeBj: string | null;
+};
+
+function currentUsSession(at: Date = new Date()): UsSession {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: "America/New_York",
     weekday: "short",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
     hourCycle: "h23",
@@ -388,29 +590,76 @@ function currentUsSession(at: Date = new Date()): {
   const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
   const weekday = get("weekday");
   const minutes = Number(get("hour")) * 60 + Number(get("minute"));
+  const year = Number(get("year"));
+  const month = Number(get("month"));
+  const day = Number(get("day"));
+  // ET wall-clock date n days from today (date fields only).
+  const shiftDay = (n: number) => {
+    const d = new Date(Date.UTC(year, month - 1, day + n));
+    return {
+      y: d.getUTCFullYear(),
+      m: d.getUTCMonth() + 1,
+      d: d.getUTCDate(),
+    };
+  };
+  const atTime = (
+    date: { y: number; m: number; d: number },
+    hh: number,
+    mm: number,
+  ) => etWallClockToInstant(date.y, date.m, date.d, hh, mm);
+  const today = { y: year, m: month, d: day };
+
+  // Resolve the session key and its ET wall-clock window
+  // ([startDayOffset, startHh, startMm] → [endDayOffset, endHh, endMm]).
+  let key: UsSessionKey = "closed";
+  let win: [number, number, number, number, number, number] | null = null;
   const eveningLeg =
     ["Sun", "Mon", "Tue", "Wed", "Thu"].includes(weekday) &&
     minutes >= 20 * 60;
   const morningLeg =
     ["Mon", "Tue", "Wed", "Thu", "Fri"].includes(weekday) &&
     minutes < 4 * 60;
-  if (eveningLeg || morningLeg) {
-    return { key: "overnight", label: SESSION_LABELS.overnight };
+  if (eveningLeg) {
+    key = "overnight";
+    win = [0, 20, 0, 1, 4, 0];
+  } else if (morningLeg) {
+    key = "overnight";
+    win = [-1, 20, 0, 0, 4, 0];
+  } else if (weekday !== "Sat" && weekday !== "Sun") {
+    if (minutes >= 4 * 60 && minutes < 9 * 60 + 30) {
+      key = "pre";
+      win = [0, 4, 0, 0, 9, 30];
+    } else if (minutes >= 9 * 60 + 30 && minutes < 16 * 60) {
+      key = "regular";
+      win = [0, 9, 30, 0, 16, 0];
+    } else if (minutes >= 16 * 60 && minutes < 20 * 60) {
+      key = "post";
+      win = [0, 16, 0, 0, 20, 0];
+    }
+    // Friday 20:00–24:00 stays closed: no overnight into the weekend.
   }
-  if (weekday === "Sat" || weekday === "Sun") {
-    return { key: "closed", label: SESSION_LABELS.closed };
+
+  if (!win) {
+    return {
+      key,
+      label: SESSION_LABELS[key],
+      start: null,
+      end: null,
+      rangeEt: null,
+      rangeBj: null,
+    };
   }
-  if (minutes >= 4 * 60 && minutes < 9 * 60 + 30) {
-    return { key: "pre", label: SESSION_LABELS.pre };
-  }
-  if (minutes < 16 * 60) {
-    return { key: "regular", label: SESSION_LABELS.regular };
-  }
-  if (minutes < 20 * 60) {
-    return { key: "post", label: SESSION_LABELS.post };
-  }
-  // Friday 20:00–24:00: no overnight session into the weekend.
-  return { key: "closed", label: SESSION_LABELS.closed };
+  const [sd, sh, sm, ed, eh, em] = win;
+  const start = atTime(shiftDay(sd), sh, sm);
+  const end = atTime(shiftDay(ed), eh, em);
+  return {
+    key,
+    label: SESSION_LABELS[key],
+    start: start.toISOString(),
+    end: end.toISOString(),
+    rangeEt: formatSessionRange(start, end, "America/New_York"),
+    rangeBj: formatSessionRange(start, end, "Asia/Shanghai"),
+  };
 }
 
 async function loadPortfolio(ctx: Ctx): Promise<PortfolioResponse> {
@@ -431,7 +680,8 @@ async function loadPortfolio(ctx: Ctx): Promise<PortfolioResponse> {
     const f = s.fetchedAt.toISOString();
     if (!lastFetched || f > lastFetched) lastFetched = f;
   }
-  const allHoldings = rows.map((h) => toHoldingOut(h, bySymbol));
+  const session = currentUsSession();
+  const allHoldings = rows.map((h) => toHoldingOut(h, bySymbol, session.key));
   const cashByAccount = new Map(cashRows.map((c) => [c.accountId, c]));
   const snapRows = await db.select().from(schema.dailySnapshots);
   const allSnapshots = snapRows.map(toSnapshotOut);
@@ -499,7 +749,7 @@ async function loadPortfolio(ctx: Ctx): Promise<PortfolioResponse> {
       (a, b) => marketOrder.indexOf(a.key) - marketOrder.indexOf(b.key),
     );
   return {
-    session: currentUsSession(),
+    session,
     accounts,
     holdings: mergeHoldings(allHoldings, accountNames),
     last_fetched_at: lastFetched,
@@ -552,21 +802,40 @@ async function fetchNasdaqQuote(
   const url = `https://api.nasdaq.com/api/quote/${encodeURIComponent(quoteSymbol)}/info?assetclass=${assetclass}`;
   const res = await fetch(url, { headers: NASDAQ_HEADERS });
   if (!res.ok) return null;
+  type NasdaqDataBlock = {
+    lastSalePrice?: string;
+    netChange?: string;
+    percentageChange?: string;
+    lastTradeTimestamp?: string;
+  };
   const json = (await res.json()) as {
     data?: {
-      primaryData?: {
-        lastSalePrice?: string;
-        netChange?: string;
-        percentageChange?: string;
-        lastTradeTimestamp?: string;
-      };
+      primaryData?: NasdaqDataBlock;
+      secondaryData?: NasdaqDataBlock;
       marketStatus?: string;
       keyStats?: { fiftyTwoWeekHighLow?: { value?: string } };
     } | null;
   };
   const d = json.data;
-  const p = d?.primaryData;
-  if (!d || !p) return null;
+  if (!d) return null;
+  // During an extended session (Pre-Market / After-Hours) Nasdaq's
+  // primaryData is the LIVE extended-hours trade, not the regular
+  // close — verified live 2026-11-09 pre-market: primaryData
+  // carried a real-time extended-hours print while secondaryData
+  // carried the settled regular close. The regular
+  // quote — this board's official basis — is secondaryData in
+  // those sessions. Outside them primaryData is the regular quote
+  // (live intraday, or the last close when the market is closed).
+  const status = (d.marketStatus ?? "").toLowerCase();
+  let p: NasdaqDataBlock | undefined = d.primaryData;
+  if (
+    (status === "pre-market" || status === "after-hours") &&
+    d.secondaryData &&
+    parseMoneyText(d.secondaryData.lastSalePrice) != null
+  ) {
+    p = d.secondaryData;
+  }
+  if (!p) return null;
   const price = parseMoneyText(p.lastSalePrice);
   if (price == null) return null;
   let w52l: number | null = null;
@@ -591,13 +860,121 @@ async function fetchNasdaqQuote(
   };
 }
 
+// Wrong-instrument guard for regular-quote candidates, checked
+// against the stored close. The band is deliberately wide — it
+// detects a DIFFERENT security (a $7.63 quote for a $141 stock),
+// not a big genuine move: outside the regular session a candidate
+// must be the settled close itself (a one-session catch-up after
+// a missed refresh still lands well inside the band); during the
+// regular session the candidate's implied previous close
+// (price − change) must match the stored close the same way.
+function regularQuotePlausible(
+  q: RegularQuote,
+  cachedPrice: number | null,
+  sessionKey: string,
+): boolean {
+  if (cachedPrice == null || !(cachedPrice > 0)) return true;
+  const inBand = (v: number) => {
+    if (!(v > 0)) return false;
+    const r = v / cachedPrice;
+    return r >= 0.4 && r <= 2.5;
+  };
+  if (sessionKey === "regular" && q.change != null) {
+    const impliedPrev = q.price - q.change;
+    if (impliedPrev > 0) return inBand(impliedPrev);
+  }
+  return inBand(q.price);
+}
+
 type ExtendedQuote = { price: number; asOf: string | null };
+
+// Nasdaq's lastUpdateInfo stamp is page copy, not a clean timestamp:
+// "Data last updated Nov 9, 2026 5:45 AM ET. This page refreshes
+// every 30 seconds." Extract just the ET wall-clock stamp and store
+// it as a UTC ISO instant, so the UI renders a bare numeric time for
+// pre/post exactly like the overnight fetch stamp. Anything that
+// does not parse is dropped (null) rather than stored as prose.
+const ET_MONTHS: Record<string, number> = {
+  jan: 0,
+  feb: 1,
+  mar: 2,
+  apr: 3,
+  may: 4,
+  jun: 5,
+  jul: 6,
+  aug: 7,
+  sep: 8,
+  oct: 9,
+  nov: 10,
+  dec: 11,
+};
+
+// Offset (ms) of an IANA timezone at an instant: the zone's wall
+// clock read as UTC, minus the instant itself.
+function tzOffsetMs(at: Date, timeZone: string): number {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    hourCycle: "h23",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  }).formatToParts(at);
+  const get = (t: string) =>
+    Number(parts.find((p) => p.type === t)?.value ?? 0);
+  const wallAsUtc = Date.UTC(
+    get("year"),
+    get("month") - 1,
+    get("day"),
+    get("hour"),
+    get("minute"),
+    get("second"),
+  );
+  return wallAsUtc - Math.floor(at.getTime() / 1000) * 1000;
+}
+
+// America/New_York wall-clock time → the UTC instant it names (the
+// offset is resolved at the instant itself, so DST is handled).
+function etWallToUtc(
+  year: number,
+  monthIdx: number,
+  day: number,
+  hour: number,
+  minute: number,
+): Date {
+  const wallAsUtc = Date.UTC(year, monthIdx, day, hour, minute);
+  const utc = wallAsUtc - tzOffsetMs(new Date(wallAsUtc), "America/New_York");
+  const refined = wallAsUtc - tzOffsetMs(new Date(utc), "America/New_York");
+  return new Date(refined);
+}
+
+function parseNasdaqStamp(raw: string): string | null {
+  const m = raw.match(
+    /([A-Za-z]{3,9})\.?\s+(\d{1,2}),\s+(\d{4}),?\s+(\d{1,2}):(\d{2})\s*([AaPp])[Mm]/,
+  );
+  if (!m) return null;
+  const month = ET_MONTHS[(m[1] ?? "").slice(0, 3).toLowerCase()];
+  if (month == null) return null;
+  let hour = Number(m[4]) % 12;
+  if ((m[6] ?? "").toLowerCase() === "p") hour += 12;
+  return etWallToUtc(
+    Number(m[3]),
+    month,
+    Number(m[2]),
+    hour,
+    Number(m[5]),
+  ).toISOString();
+}
 
 // Nasdaq extended-trading feed, parameterized by session: markettype
 // "pre" (04:00–09:30 ET) and "post" (16:00–20:00 ET) share one shape —
 // infoTable.rows[0].consolidated is "<price> <chg> (<pct>)" for the
-// session's last trade and lastUpdateInfo[0] its update stamp (both
-// verified live 2026-11-08). Outside its session the pre feed returns
+// session's last trade and a "Data last updated …" entry inside
+// lastUpdateInfo its update stamp (both verified live 2026-11-08;
+// the stamp's position in that array varies by session — see below).
+// Outside its session the pre feed returns
 // consolidated = null, which we treat as "no data" (never guessed).
 // There is no Nasdaq feed for the overnight session (Blue Ocean) —
 // overnight prices come from Yahoo fulldayPrice (see below); this
@@ -632,10 +1009,16 @@ async function fetchNasdaqExtended(
     if (lastTrade) price = parseMoneyText(lastTrade);
   }
   if (price == null) return null;
-  const upd = d.lastUpdateInfo?.[0];
-  const asOf = upd
-    ? upd.replace(/^Data last updated\s*/i, "").replace(/\.\s*$/, "")
-    : null;
+  // lastUpdateInfo mixes the "Data last updated <stamp>" entry with
+  // page copy ("This page refreshes every 30 seconds."), and which
+  // slot the stamp sits in varies by session — during a live
+  // pre-market it is second, after hours it is first. Take the first
+  // entry that actually carries a parseable stamp.
+  let asOf: string | null = null;
+  for (const info of d.lastUpdateInfo ?? []) {
+    asOf = parseNasdaqStamp(info);
+    if (asOf) break;
+  }
   return { price, asOf };
 }
 
@@ -1457,7 +1840,7 @@ async function ensureSeedSnapshot(ctx: Ctx): Promise<boolean> {
     cashUsd: 800,
     totalPnlUsd: 320,
     dayChangeUsd: 150,
-    dayChangePct: 1.52,
+    dayChangePct: 3.04,
     fxRate,
     accountValueCny: fxRate != null ? 10000 * fxRate : null,
     spxPrice: spx,
@@ -1568,6 +1951,477 @@ const refreshResponse = z.object({
   portfolio: portfolioResponse,
 });
 
+const extendedRefreshResponse = z.object({
+  updated: z.number(),
+  // True when the current US session is regular/closed and the run
+  // deliberately wrote nothing.
+  skipped: z.boolean(),
+  session: z.string(),
+  portfolio: portfolioResponse,
+});
+
+// ---------- Personal-data export / import (stateless data actions) ----------
+//
+// The user's own data is exactly four tables: accounts, holdings,
+// account_balances, daily_snapshots. The three market caches
+// (quote_snapshots, market_snapshots, fx_snapshots) are NEVER part of
+// an export — every value in them can be re-fetched from market
+// sources. The fx_rate / spx_price / ndx_price values stored INSIDE a
+// daily_snapshots row are part of that personal history record and
+// travel with the row. These actions are deliberately stateless with
+// respect to any repository or backup pipeline: export returns the
+// payload, import consumes one; nothing here knows about git.
+//
+// Format history: v1 was {board: "portfolio", tables: name -> rows[]}.
+// v2 (current export) is a self-describing dataset envelope:
+// {panel: "portfolio-board", tables: name -> {primary_key, rows}}.
+// Import accepts both; see the v2 notes below.
+
+const personalAccountRow = z.object({
+  id: z.string(),
+  name: z.string(),
+  sort: z.number(),
+});
+
+const personalHoldingRow = z.object({
+  account_id: z.string(),
+  symbol: z.string(),
+  quote_symbol: z.string(),
+  name: z.string(),
+  qty: z.number(),
+  cost_per_share: z.number(),
+  kind: z.enum(["stock", "etf"]),
+  theme: z.string(),
+});
+
+const personalBalanceRow = z.object({
+  account_id: z.string(),
+  cash_usd: z.number(),
+  snapshot_label: z.string(),
+  // ISO timestamp of the stored row; null only for hand-written files.
+  updated_at: z.string().nullable(),
+});
+
+const personalSnapshotRow = z.object({
+  date: z.string(),
+  account_id: z.string(),
+  account_value_usd: z.number(),
+  securities_value_usd: z.number(),
+  cash_usd: z.number(),
+  total_pnl_usd: z.number().nullable(),
+  day_change_usd: z.number().nullable(),
+  day_change_pct: z.number().nullable(),
+  fx_rate: z.number().nullable(),
+  account_value_cny: z.number().nullable(),
+  spx_price: z.number().nullable(),
+  ndx_price: z.number().nullable(),
+  source: z.string(),
+});
+
+const personalTables = z.object({
+  accounts: z.array(personalAccountRow),
+  holdings: z.array(personalHoldingRow),
+  account_balances: z.array(personalBalanceRow),
+  daily_snapshots: z.array(personalSnapshotRow),
+});
+
+type PersonalTables = z.infer<typeof personalTables>;
+
+// --- v2 self-describing dataset envelope (industry-standard shape) ---
+// Each table carries its own primary_key declaration alongside its
+// rows, so generic tooling can validate, sort and merge without
+// hard-coding this panel's keys. Additive evolution rule: unknown
+// fields (top level, per-table envelope, or per-row) are IGNORED and
+// unknown tables are SKIPPED (and reported in the import summary) —
+// neither fails the import. Only a format mismatch, a version newer
+// than the importer understands, or a checksum mismatch rejects the
+// whole file.
+const TABLE_PRIMARY_KEYS = {
+  accounts: ["id"],
+  holdings: ["account_id", "symbol"],
+  account_balances: ["account_id"],
+  daily_snapshots: ["date", "account_id"],
+} as const;
+
+const KNOWN_TABLE_NAMES: readonly string[] = [
+  "accounts",
+  "holdings",
+  "account_balances",
+  "daily_snapshots",
+];
+
+function tableEnvelope<Row extends z.ZodType>(row: Row) {
+  return z.looseObject({
+    primary_key: z.array(z.string()),
+    rows: z.array(row),
+  });
+}
+
+const personalTablesV2 = z.looseObject({
+  accounts: tableEnvelope(personalAccountRow),
+  holdings: tableEnvelope(personalHoldingRow),
+  account_balances: tableEnvelope(personalBalanceRow),
+  daily_snapshots: tableEnvelope(personalSnapshotRow),
+});
+
+type PersonalTablesV2 = z.infer<typeof personalTablesV2>;
+
+// v1 file shape: tables map table name -> bare row array, panel
+// identified by `board: "portfolio"`. Still accepted on import and
+// normalized to the v2 envelope shape before the restore/merge flow.
+const personalTablesV1 = z.looseObject({
+  accounts: z.array(personalAccountRow),
+  holdings: z.array(personalHoldingRow),
+  account_balances: z.array(personalBalanceRow),
+  daily_snapshots: z.array(personalSnapshotRow),
+});
+
+const personalDataFileV1 = z.looseObject({
+  format: z.literal("muse-personal-data"),
+  version: z.literal(1),
+  board: z.literal("portfolio"),
+  exported_at: z.string().optional(),
+  checksum: z.string().optional(),
+  tables: personalTablesV1,
+});
+
+const personalDataFileV2 = z.looseObject({
+  format: z.literal("muse-personal-data"),
+  version: z.literal(2),
+  panel: z.literal("portfolio-board"),
+  exported_at: z.string().optional(),
+  checksum: z.string().optional(),
+  tables: personalTablesV2,
+});
+
+// Union of every format version this importer understands. A version
+// greater than 2 (or a different format / panel) matches neither arm
+// and is rejected wholesale by request validation — nothing written.
+const personalDataFile = z.union([personalDataFileV2, personalDataFileV1]);
+
+const personalExportResponse = z.object({
+  format: z.literal("muse-personal-data"),
+  version: z.literal(2),
+  panel: z.literal("portfolio-board"),
+  exported_at: z.string(),
+  // Content checksum over the canonical serialization of `tables`
+  // only (exported_at excluded), so two exports of the same state
+  // compare equal byte-for-byte apart from the timestamp.
+  checksum: z.string(),
+  tables: personalTablesV2,
+});
+
+type PersonalExportResponse = z.infer<typeof personalExportResponse>;
+
+// Deterministic 128-bit string hash (cyrb128) rendered as hex. Used
+// only as a content checksum for comparing exports, not for security.
+function contentChecksum(text: string): string {
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  let h3 = 0x9e3779b9;
+  let h4 = 0x85ebca6b;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507);
+    h1 ^= Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507);
+    h2 ^= Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    h4 = Math.imul(h4 ^ ch, 668265263);
+    h3 = Math.imul(h3 ^ ch, 2246822519);
+    h4 = Math.imul(h4 ^ (h4 >>> 21), 2654435761);
+    h3 = Math.imul(h3 ^ (h3 >>> 24), 1597334677);
+    h3 ^= Math.imul(h4 ^ (h4 >>> 15), 3266489909);
+    h4 = Math.imul(h4 ^ (h4 >>> 16), 2246822507);
+    h4 ^= Math.imul(h3 ^ (h3 >>> 13), 3266489909);
+  }
+  h3 = Math.imul(h3 ^ (h3 >>> 16), 2246822507);
+  h3 ^= Math.imul(h4 ^ (h4 >>> 13), 3266489909);
+  h4 = Math.imul(h4 ^ (h4 >>> 16), 2246822507);
+  h4 ^= Math.imul(h3 ^ (h3 >>> 13), 3266489909);
+  const hex = (n: number) => (n >>> 0).toString(16).padStart(8, "0");
+  return hex(h2) + hex(h1) + hex(h4) + hex(h3);
+}
+
+const cmpStr = (a: string, b: string): number =>
+  a < b ? -1 : a > b ? 1 : 0;
+
+// Reads the four personal tables and serializes them canonically:
+// rows sorted by natural key, fields in a fixed order, so the same
+// database state always produces the same payload (and checksum).
+async function buildPersonalTables(ctx: Ctx): Promise<PersonalTables> {
+  const db = ctx.db<typeof schema>();
+  const [accountRows, holdingRows, balanceRows, snapshotRows] =
+    await Promise.all([
+      db.select().from(schema.accounts),
+      db.select().from(schema.holdings),
+      db.select().from(schema.accountBalances),
+      db.select().from(schema.dailySnapshots),
+    ]);
+  const accounts = accountRows
+    .map((a) => ({ id: a.id, name: a.name, sort: a.sort }))
+    .sort((x, y) => x.sort - y.sort || cmpStr(x.id, y.id));
+  const holdings = holdingRows
+    .map((h) => ({
+      account_id: h.accountId,
+      symbol: h.symbol,
+      quote_symbol: h.quoteSymbol,
+      name: h.name,
+      qty: h.qty,
+      cost_per_share: h.costPerShare,
+      kind: h.kind,
+      theme: h.theme,
+    }))
+    .sort(
+      (x, y) =>
+        cmpStr(x.account_id, y.account_id) || cmpStr(x.symbol, y.symbol),
+    );
+  const account_balances = balanceRows
+    .map((b) => ({
+      account_id: b.accountId,
+      cash_usd: b.cashUsd,
+      snapshot_label: b.snapshotLabel,
+      updated_at: b.updatedAt.toISOString(),
+    }))
+    .sort((x, y) => cmpStr(x.account_id, y.account_id));
+  const daily_snapshots = snapshotRows
+    .map((s) => ({
+      date: s.date,
+      account_id: s.accountId,
+      account_value_usd: s.accountValueUsd,
+      securities_value_usd: s.securitiesValueUsd,
+      cash_usd: s.cashUsd,
+      total_pnl_usd: s.totalPnlUsd,
+      day_change_usd: s.dayChangeUsd,
+      day_change_pct: s.dayChangePct,
+      fx_rate: s.fxRate,
+      account_value_cny: s.accountValueCny,
+      spx_price: s.spxPrice,
+      ndx_price: s.ndxPrice,
+      source: s.source,
+    }))
+    .sort(
+      (x, y) => cmpStr(x.date, y.date) || cmpStr(x.account_id, y.account_id),
+    );
+  return { accounts, holdings, account_balances, daily_snapshots };
+}
+
+// Canonical form of a tables payload: rows rebuilt with the fixed
+// field order and sorted by each table's primary key. Both checksum
+// flavors are computed over canonical forms, so key order / row order
+// differences in a hand-carried file never cause a false mismatch,
+// and unknown fields/tables (already stripped or ignored before this
+// point) never enter the checksum.
+function canonicalizeTables(t: PersonalTables): PersonalTables {
+  return {
+    accounts: t.accounts
+      .map((a) => ({ id: a.id, name: a.name, sort: a.sort }))
+      .sort((x, y) => x.sort - y.sort || cmpStr(x.id, y.id)),
+    holdings: t.holdings
+      .map((h) => ({
+        account_id: h.account_id,
+        symbol: h.symbol,
+        quote_symbol: h.quote_symbol,
+        name: h.name,
+        qty: h.qty,
+        cost_per_share: h.cost_per_share,
+        kind: h.kind,
+        theme: h.theme,
+      }))
+      .sort(
+        (x, y) =>
+          cmpStr(x.account_id, y.account_id) || cmpStr(x.symbol, y.symbol),
+      ),
+    account_balances: t.account_balances
+      .map((b) => ({
+        account_id: b.account_id,
+        cash_usd: b.cash_usd,
+        snapshot_label: b.snapshot_label,
+        updated_at: b.updated_at,
+      }))
+      .sort((x, y) => cmpStr(x.account_id, y.account_id)),
+    daily_snapshots: t.daily_snapshots
+      .map((s) => ({
+        date: s.date,
+        account_id: s.account_id,
+        account_value_usd: s.account_value_usd,
+        securities_value_usd: s.securities_value_usd,
+        cash_usd: s.cash_usd,
+        total_pnl_usd: s.total_pnl_usd,
+        day_change_usd: s.day_change_usd,
+        day_change_pct: s.day_change_pct,
+        fx_rate: s.fx_rate,
+        account_value_cny: s.account_value_cny,
+        spx_price: s.spx_price,
+        ndx_price: s.ndx_price,
+        source: s.source,
+      }))
+      .sort(
+        (x, y) => cmpStr(x.date, y.date) || cmpStr(x.account_id, y.account_id),
+      ),
+  };
+}
+
+// Wraps canonical tables in the v2 envelope: every table declares its
+// own primary_key next to its rows.
+function buildTablesEnvelope(t: PersonalTables): PersonalTablesV2 {
+  const c = canonicalizeTables(t);
+  return {
+    accounts: {
+      primary_key: [...TABLE_PRIMARY_KEYS.accounts],
+      rows: c.accounts,
+    },
+    holdings: {
+      primary_key: [...TABLE_PRIMARY_KEYS.holdings],
+      rows: c.holdings,
+    },
+    account_balances: {
+      primary_key: [...TABLE_PRIMARY_KEYS.account_balances],
+      rows: c.account_balances,
+    },
+    daily_snapshots: {
+      primary_key: [...TABLE_PRIMARY_KEYS.daily_snapshots],
+      rows: c.daily_snapshots,
+    },
+  };
+}
+
+function v1Checksum(t: PersonalTables): string {
+  return contentChecksum(JSON.stringify(canonicalizeTables(t)));
+}
+
+function v2Checksum(t: PersonalTables): string {
+  return contentChecksum(JSON.stringify(buildTablesEnvelope(t)));
+}
+
+// Normalizes an accepted v1 or v2 payload to the internal tables
+// shape plus the list of unknown tables that were skipped. v1's
+// `board: "portfolio"` and v2's `panel: "portfolio-board"` name the
+// same panel; the union schema has already enforced the right
+// identifier for the payload's version.
+function normalizePersonalImport(data: z.infer<typeof personalDataFile>): {
+  tables: PersonalTables;
+  ignoredTables: string[];
+  version: 1 | 2;
+} {
+  const rawTables = data.tables as unknown as Record<string, unknown>;
+  const ignoredTables = Object.keys(rawTables)
+    .filter((k) => !KNOWN_TABLE_NAMES.includes(k))
+    .sort(cmpStr);
+  if (data.version === 1) {
+    const t = data.tables as unknown as PersonalTables;
+    return {
+      tables: {
+        accounts: t.accounts,
+        holdings: t.holdings,
+        account_balances: t.account_balances,
+        daily_snapshots: t.daily_snapshots,
+      },
+      ignoredTables,
+      version: 1,
+    };
+  }
+  const t = data.tables as unknown as PersonalTablesV2;
+  return {
+    tables: {
+      accounts: t.accounts.rows,
+      holdings: t.holdings.rows,
+      account_balances: t.account_balances.rows,
+      daily_snapshots: t.daily_snapshots.rows,
+    },
+    ignoredTables,
+    version: 2,
+  };
+}
+
+// Semantic validation beyond the zod shape: duplicate natural keys
+// inside the file, or rows pointing at accounts the file does not
+// define, make the whole file invalid — nothing is written.
+function validatePersonalTables(t: PersonalTables): void {
+  const accountIds = new Set<string>();
+  for (const a of t.accounts) {
+    if (accountIds.has(a.id)) {
+      throw new Error(`importPersonalData: duplicate account id "${a.id}"`);
+    }
+    accountIds.add(a.id);
+  }
+  const holdingKeys = new Set<string>();
+  for (const h of t.holdings) {
+    const key = `${h.account_id} ${h.symbol}`;
+    if (holdingKeys.has(key)) {
+      throw new Error(
+        `importPersonalData: duplicate holding ${h.account_id}/${h.symbol}`,
+      );
+    }
+    holdingKeys.add(key);
+    if (!accountIds.has(h.account_id)) {
+      throw new Error(
+        `importPersonalData: holding ${h.symbol} references unknown account "${h.account_id}"`,
+      );
+    }
+  }
+  const balanceKeys = new Set<string>();
+  for (const b of t.account_balances) {
+    if (balanceKeys.has(b.account_id)) {
+      throw new Error(
+        `importPersonalData: duplicate balance for account "${b.account_id}"`,
+      );
+    }
+    balanceKeys.add(b.account_id);
+    if (!accountIds.has(b.account_id)) {
+      throw new Error(
+        `importPersonalData: balance references unknown account "${b.account_id}"`,
+      );
+    }
+  }
+  const snapshotKeys = new Set<string>();
+  for (const s of t.daily_snapshots) {
+    const key = `${s.date} ${s.account_id}`;
+    if (snapshotKeys.has(key)) {
+      throw new Error(
+        `importPersonalData: duplicate snapshot ${s.date}/${s.account_id}`,
+      );
+    }
+    snapshotKeys.add(key);
+    if (!accountIds.has(s.account_id)) {
+      throw new Error(
+        `importPersonalData: snapshot ${s.date} references unknown account "${s.account_id}"`,
+      );
+    }
+  }
+}
+
+function parseStoredTimestamp(value: string | null): Date {
+  if (value) {
+    const d = new Date(value);
+    if (!Number.isNaN(d.getTime())) return d;
+  }
+  return new Date();
+}
+
+const tableCountSchema = z.object({
+  written: z.number(),
+  skipped: z.number(),
+});
+
+const personalImportResponse = z.object({
+  ok: z.literal(true),
+  mode: z.enum(["restore", "merge"]),
+  // Format version of the accepted payload (1 or 2).
+  source_version: z.number(),
+  // Unknown tables present in the payload, skipped (not an error).
+  ignored_tables: z.array(z.string()),
+  tables: z.object({
+    accounts: tableCountSchema,
+    holdings: tableCountSchema,
+    account_balances: tableCountSchema,
+    daily_snapshots: tableCountSchema,
+  }),
+});
+
+type PersonalImportResponse = z.infer<typeof personalImportResponse>;
+
 export const Actions = {
   getPortfolio: defineAction({
     description:
@@ -1577,9 +2431,252 @@ export const Actions = {
     handler: async (ctx): Promise<PortfolioResponse> => loadPortfolio(ctx),
   }),
 
+  exportPersonalData: defineAction({
+    description:
+      "Exports ONLY the user's personal data as a self-describing dataset envelope ({format: \"muse-personal-data\", version: 2, panel: \"portfolio-board\", exported_at, checksum, tables}): tables maps each of accounts, holdings, account_balances and daily_snapshots to {primary_key, rows} — each table declares its own primary key, rows carry all fields (daily snapshot rows keep their embedded fx_rate/spx_price/ndx_price as part of the personal history record). Market-derived caches (quote_snapshots including the extended-hours slots, market_snapshots, fx_snapshots) are never included. Serialization is deterministic — rows sorted by primary key, fixed field order — and `checksum` covers the canonical tables envelope only (exported_at excluded), so two exports of the same state are byte-identical apart from the timestamp. Read-only; knows nothing about any repository or backup pipeline.",
+    request: z.object({}),
+    response: personalExportResponse,
+    handler: async (ctx): Promise<PersonalExportResponse> => {
+      const tables = await buildPersonalTables(ctx);
+      return {
+        format: "muse-personal-data" as const,
+        version: 2 as const,
+        panel: "portfolio-board" as const,
+        exported_at: new Date().toISOString(),
+        checksum: v2Checksum(tables),
+        tables: buildTablesEnvelope(tables),
+      };
+    },
+  }),
+
+  importPersonalData: defineAction({
+    description:
+      "Imports a personal-data payload produced by exportPersonalData back into the four personal tables — and nothing else; the market caches are never touched. Accepts BOTH the v2 envelope (version 2, panel \"portfolio-board\", tables as {primary_key, rows}) and the legacy v1 shape (version 1, board \"portfolio\", tables as bare row arrays, normalized to v2 internally); v1's board identifier and v2's panel identifier name the same panel. Unknown fields are ignored and unknown tables are skipped and reported in `ignored_tables` — neither fails the import. A format mismatch, a version greater than 2, or a payload checksum that does not match the canonical content rejects the whole import with nothing written, as does any validation failure (row shapes, duplicate natural keys, account references). mode \"restore\" replaces all four personal tables with the file's contents (accounts land exactly as the file defines them, overriding any seed/demo accounts) and requires confirm=true. mode \"merge\" upserts by natural key (accounts by id, holdings by (account_id, symbol), balances by account_id, daily_snapshots by (date, account_id)), never deletes rows absent from the file, and never overwrites an existing source=\"manual\" daily snapshot (the same protection recordDailySnapshot applies); restore onto an empty board is not subject to that skip. Returns per-table written/skipped counts plus source_version and ignored_tables.",
+    request: z.object({
+      data: personalDataFile,
+      mode: z.enum(["restore", "merge"]),
+      confirm: z.boolean(),
+    }),
+    response: personalImportResponse,
+    handler: async (ctx, args): Promise<PersonalImportResponse> => {
+      const normalized = normalizePersonalImport(args.data);
+      const t = normalized.tables;
+      // Integrity gate: when the payload carries a checksum it must
+      // match the canonical content (v1 flavor for v1 payloads, v2
+      // envelope flavor for v2) — a mismatch means the file was
+      // corrupted or tampered with; reject before any write.
+      const providedChecksum = args.data.checksum;
+      if (providedChecksum) {
+        const computed =
+          normalized.version === 1 ? v1Checksum(t) : v2Checksum(t);
+        if (computed !== providedChecksum) {
+          throw new Error(
+            "importPersonalData: checksum mismatch — payload content does not match its checksum",
+          );
+        }
+      }
+      validatePersonalTables(t);
+      if (args.mode === "restore" && args.confirm !== true) {
+        throw new Error(
+          "importPersonalData: restore mode requires confirm=true",
+        );
+      }
+      const db = ctx.db<typeof schema>();
+      const accountValues = t.accounts.map((a) => ({
+        id: a.id,
+        name: a.name,
+        sort: a.sort,
+      }));
+      const holdingValues = t.holdings.map((h) => ({
+        accountId: h.account_id,
+        symbol: h.symbol,
+        quoteSymbol: h.quote_symbol,
+        name: h.name,
+        qty: h.qty,
+        costPerShare: h.cost_per_share,
+        kind: h.kind,
+        theme: h.theme,
+      }));
+      const balanceValues = t.account_balances.map((b) => ({
+        accountId: b.account_id,
+        cashUsd: b.cash_usd,
+        snapshotLabel: b.snapshot_label,
+        updatedAt: parseStoredTimestamp(b.updated_at),
+      }));
+      const snapshotValues = t.daily_snapshots.map((s) => ({
+        date: s.date,
+        accountId: s.account_id,
+        accountValueUsd: s.account_value_usd,
+        securitiesValueUsd: s.securities_value_usd,
+        cashUsd: s.cash_usd,
+        totalPnlUsd: s.total_pnl_usd,
+        dayChangeUsd: s.day_change_usd,
+        dayChangePct: s.day_change_pct,
+        fxRate: s.fx_rate,
+        accountValueCny: s.account_value_cny,
+        spxPrice: s.spx_price,
+        ndxPrice: s.ndx_price,
+        source: s.source,
+        createdAt: new Date(),
+      }));
+
+      if (args.mode === "restore") {
+        // Replace the four personal tables wholesale, atomically:
+        // children first on delete, accounts first on insert.
+        const statements: Parameters<typeof db.batch>[0][number][] = [
+          db.delete(schema.holdings),
+          db.delete(schema.accountBalances),
+          db.delete(schema.dailySnapshots),
+          db.delete(schema.accounts),
+        ];
+        if (accountValues.length > 0) {
+          statements.push(db.insert(schema.accounts).values(accountValues));
+        }
+        if (holdingValues.length > 0) {
+          statements.push(db.insert(schema.holdings).values(holdingValues));
+        }
+        if (balanceValues.length > 0) {
+          statements.push(
+            db.insert(schema.accountBalances).values(balanceValues),
+          );
+        }
+        if (snapshotValues.length > 0) {
+          statements.push(
+            db.insert(schema.dailySnapshots).values(snapshotValues),
+          );
+        }
+        await db.batch(
+          statements as unknown as Parameters<typeof db.batch>[0],
+        );
+        ctx.invalidateQueries();
+        return {
+          ok: true as const,
+          mode: args.mode,
+          source_version: normalized.version,
+          ignored_tables: normalized.ignoredTables,
+          tables: {
+            accounts: { written: accountValues.length, skipped: 0 },
+            holdings: { written: holdingValues.length, skipped: 0 },
+            account_balances: { written: balanceValues.length, skipped: 0 },
+            daily_snapshots: { written: snapshotValues.length, skipped: 0 },
+          },
+        };
+      }
+
+      // merge: upsert by natural key; existing rows absent from the
+      // file are kept. Manual-sourced snapshots are protected,
+      // exactly as in recordDailySnapshot.
+      let accountsWritten = 0;
+      for (const v of accountValues) {
+        await db
+          .insert(schema.accounts)
+          .values(v)
+          .onConflictDoUpdate({
+            target: schema.accounts.id,
+            set: { name: v.name, sort: v.sort },
+          });
+        accountsWritten += 1;
+      }
+      let holdingsWritten = 0;
+      for (const v of holdingValues) {
+        await db
+          .insert(schema.holdings)
+          .values(v)
+          .onConflictDoUpdate({
+            target: [schema.holdings.accountId, schema.holdings.symbol],
+            set: {
+              quoteSymbol: v.quoteSymbol,
+              name: v.name,
+              qty: v.qty,
+              costPerShare: v.costPerShare,
+              kind: v.kind,
+              theme: v.theme,
+            },
+          });
+        holdingsWritten += 1;
+      }
+      let balancesWritten = 0;
+      for (const v of balanceValues) {
+        await db
+          .insert(schema.accountBalances)
+          .values(v)
+          .onConflictDoUpdate({
+            target: schema.accountBalances.accountId,
+            set: {
+              cashUsd: v.cashUsd,
+              snapshotLabel: v.snapshotLabel,
+              updatedAt: v.updatedAt,
+            },
+          });
+        balancesWritten += 1;
+      }
+      const existingSnapshots = await db
+        .select({
+          date: schema.dailySnapshots.date,
+          accountId: schema.dailySnapshots.accountId,
+          source: schema.dailySnapshots.source,
+        })
+        .from(schema.dailySnapshots);
+      const protectedKeys = new Set(
+        existingSnapshots
+          .filter((s) => s.source === "manual")
+          .map((s) => `${s.date} ${s.accountId}`),
+      );
+      let snapshotsWritten = 0;
+      let snapshotsSkipped = 0;
+      for (const v of snapshotValues) {
+        if (protectedKeys.has(`${v.date} ${v.accountId}`)) {
+          snapshotsSkipped += 1;
+          continue;
+        }
+        await db
+          .insert(schema.dailySnapshots)
+          .values(v)
+          .onConflictDoUpdate({
+            target: [schema.dailySnapshots.date, schema.dailySnapshots.accountId],
+            set: {
+              accountValueUsd: v.accountValueUsd,
+              securitiesValueUsd: v.securitiesValueUsd,
+              cashUsd: v.cashUsd,
+              totalPnlUsd: v.totalPnlUsd,
+              dayChangeUsd: v.dayChangeUsd,
+              dayChangePct: v.dayChangePct,
+              fxRate: v.fxRate,
+              accountValueCny: v.accountValueCny,
+              spxPrice: v.spxPrice,
+              ndxPrice: v.ndxPrice,
+              source: v.source,
+            },
+          });
+        snapshotsWritten += 1;
+      }
+      if (
+        accountsWritten + holdingsWritten + balancesWritten + snapshotsWritten >
+        0
+      ) {
+        ctx.invalidateQueries();
+      }
+      return {
+        ok: true as const,
+        mode: args.mode,
+        source_version: normalized.version,
+        ignored_tables: normalized.ignoredTables,
+        tables: {
+          accounts: { written: accountsWritten, skipped: 0 },
+          holdings: { written: holdingsWritten, skipped: 0 },
+          account_balances: { written: balancesWritten, skipped: 0 },
+          daily_snapshots: {
+            written: snapshotsWritten,
+            skipped: snapshotsSkipped,
+          },
+        },
+      };
+    },
+  }),
+
   refreshQuotes: defineAction({
     description:
-      "Refreshes regular-session quotes for the union of holding symbols across all accounts (finance channel, Nasdaq API fallback for BE), extended-hours annotations (Nasdaq pre-market feed while the pre session is live/just ended, Nasdaq after-hours feed in the post session; during the overnight session 20:00–04:00 ET the extended price comes from Yahoo Finance chart meta.fulldayPrice with ext_session \"overnight\" and ext_as_of set to the fetch moment — labeled 抓取于 in the UI — falling back per-symbol to the after-hours last trade when Yahoo yields nothing), and the live USD/CNY rate; seeds (once, from long history) and ratchets the all-time highest close (peak_price/peak_date) behind each market benchmark, and maintains the trailing-3-year highest close (peak3y_price/peak3y_date — seeded once from ~3 years of daily closes, ratcheted up, and re-seeded from the source series when the stored peak date slides out of the 3-year window) that the strip's 距高点 figure is computed from; records one daily snapshot per account; returns the refreshed portfolio.",
+      "Refreshes regular-session quotes for the union of holding symbols across all accounts (finance channel primary, Nasdaq API cross-check/fallback — outside the regular session both are fetched and must agree, with Nasdaq winning disagreements because its symbol-addressed endpoint cannot return a wrong instrument the way the finance channel's fuzzy matching once did for MRVL; the Nasdaq read itself uses secondaryData during Pre-Market/After-Hours, where primaryData is the live extended trade rather than the close), extended-hours annotations (Nasdaq pre-market feed while the pre session is live/just ended, Nasdaq after-hours feed in the post session; during the overnight session 20:00–04:00 ET the extended price comes from Yahoo Finance chart meta.fulldayPrice with ext_session \"overnight\" and ext_as_of set to the fetch moment, shown in the detail as a bare numeric time; Nasdaq pre/post stamps are parsed server-side from the feed's page copy into UTC ISO instants before storing, and the detail renders them through the same bare-numeric-time format, falling back per-symbol to the after-hours last trade when Yahoo yields nothing), and the live USD/CNY rate; seeds (once, from long history) and ratchets the all-time highest close (peak_price/peak_date) behind each market benchmark, and maintains the trailing-3-year highest close (peak3y_price/peak3y_date — seeded once from ~3 years of daily closes, ratcheted up, and re-seeded from the source series when the stored peak date slides out of the 3-year window) that the strip's 距高点 figure is computed from; records one daily snapshot per account; returns the refreshed portfolio.",
     request: z.object({}),
     response: refreshResponse,
     handler: async (ctx): Promise<z.infer<typeof refreshResponse>> => {
@@ -1635,15 +2732,18 @@ export const Actions = {
             }
           }
 
-          let regular: RegularQuote | null = null;
-          let source: string | null = null;
+          const prev = existingBySymbol.get(h.quoteSymbol);
+          const cachedPrice =
+            prev && prev.price != null && prev.price > 0 ? prev.price : null;
+
+          let financeQuote: RegularQuote | null = null;
           try {
             const res = await ctx.tool.finance_ticker(h.quoteSymbol);
             const inst = res.content.instrument;
             // Guard against wrong-instrument matches: a non-USD price is
             // not this holding (e.g. a foreign same-name listing).
             if (inst && inst.price != null && inst.currency === "USD") {
-              regular = {
+              financeQuote = {
                 price: inst.price,
                 change: inst.change ?? null,
                 changePercent: inst.change_percent ?? null,
@@ -1655,21 +2755,88 @@ export const Actions = {
                 marketStatus: inst.market_status ?? null,
                 asOf: inst.as_of ?? null,
               };
-              source = "finance";
             }
           } catch {
-            regular = null;
-          }
-          if (!regular) {
-            try {
-              regular = await fetchNasdaqQuote(h.quoteSymbol, h.kind);
-              if (regular) source = "nasdaq";
-            } catch {
-              regular = null;
-            }
+            financeQuote = null;
           }
 
-          const prev = existingBySymbol.get(h.quoteSymbol);
+          // Acceptance. The finance channel fuzzy-matches instruments
+          // and intermittently returns a DIFFERENT security for a
+          // symbol — verified live 2026-11-09 pre-market: a wrong
+          // instrument priced in single digits against a triple-digit
+          // close; stored as the \"close\", it also became the
+          // pre-market % reference and printed an absurd
+          // four-digit percentage. Nasdaq's endpoint is addressed by symbol and
+          // cannot mismatch, so: during the regular session the
+          // finance candidate is plausibility-checked against the
+          // stored close with Nasdaq as fallback; outside the
+          // regular session (where the close is a settled fact) BOTH
+          // sources are fetched and cross-checked — agreement keeps
+          // finance primary, a wild disagreement defers to Nasdaq
+          // (which also heals a previously poisoned stored close),
+          // and a lone implausible finance quote is discarded so
+          // the stored close stands and ext slots still refresh
+          // against it via the !regular path below.
+          let regular: RegularQuote | null = null;
+          let source: string | null = null;
+          if (session.key === "regular") {
+            if (
+              financeQuote &&
+              regularQuotePlausible(financeQuote, cachedPrice, session.key)
+            ) {
+              regular = financeQuote;
+              source = "finance";
+            } else {
+              let nasdaqQuote: RegularQuote | null = null;
+              try {
+                nasdaqQuote = await fetchNasdaqQuote(h.quoteSymbol, h.kind);
+              } catch {
+                nasdaqQuote = null;
+              }
+              if (
+                nasdaqQuote &&
+                regularQuotePlausible(nasdaqQuote, cachedPrice, session.key)
+              ) {
+                regular = nasdaqQuote;
+                source = "nasdaq";
+              } else if (financeQuote && nasdaqQuote) {
+                // Both implausible against the cache yet consistent
+                // with each other: the cache missed a session, not a
+                // wrong instrument.
+                const r = financeQuote.price / nasdaqQuote.price;
+                if (r >= 0.4 && r <= 2.5) {
+                  regular = financeQuote;
+                  source = "finance";
+                }
+              }
+            }
+          } else {
+            let nasdaqQuote: RegularQuote | null = null;
+            try {
+              nasdaqQuote = await fetchNasdaqQuote(h.quoteSymbol, h.kind);
+            } catch {
+              nasdaqQuote = null;
+            }
+            if (financeQuote && nasdaqQuote) {
+              const r = financeQuote.price / nasdaqQuote.price;
+              if (r >= 0.9 && r <= 1.1) {
+                regular = financeQuote;
+                source = "finance";
+              } else {
+                regular = nasdaqQuote;
+                source = "nasdaq";
+              }
+            } else if (nasdaqQuote) {
+              regular = nasdaqQuote;
+              source = "nasdaq";
+            } else if (
+              financeQuote &&
+              regularQuotePlausible(financeQuote, cachedPrice, session.key)
+            ) {
+              regular = financeQuote;
+              source = "finance";
+            }
+          }
           if (!regular) {
             failed.push(h.symbol);
             // Still refresh the extended annotations against the cached
@@ -1680,39 +2847,64 @@ export const Actions = {
             // can be updated too; during the regular session the cached
             // price is intraday and is not a valid reference, so ext
             // stays as stored.
-            if (after && prev && prev.price != null) {
-              await db
-                .update(schema.quoteSnapshots)
-                .set({
-                  afterPrice: after.price,
-                  afterChangePercent:
-                    ((after.price - prev.price) / prev.price) * 100,
-                  afterAsOf: after.asOf,
-                })
-                .where(eq(schema.quoteSnapshots.quoteSymbol, h.quoteSymbol));
-            }
-            if (prev && prev.price != null && session.key !== "regular") {
-              const chosen =
-                session.key === "pre"
-                  ? pre
-                    ? { q: pre, s: "pre" as const }
-                    : after
-                      ? { q: after, s: "post" as const }
-                      : null
-                  : session.key === "overnight" && overnight
-                    ? { q: overnight, s: "overnight" as const }
-                    : after
-                      ? { q: after, s: "post" as const }
-                      : null;
-              if (chosen) {
+            // Per-session slots (plan B): a refresh writes ONLY the
+            // slot of the session it runs in — the post feed fetched
+            // during pre-market is the display fallback, never a
+            // reason to overwrite the post slot, and the after_*
+            // mirror follows the post slot only when the post slot
+            // itself is being written (post/closed sessions).
+            if (prev && prev.price != null && prev.price > 0) {
+              const pctVsCached =
+                (q: ExtendedQuote) =>
+                  ((q.price - (prev.price as number)) / (prev.price as number)) *
+                  100;
+              if (session.key === "pre" && pre) {
                 await db
                   .update(schema.quoteSnapshots)
                   .set({
-                    extPrice: chosen.q.price,
-                    extChangePercent:
-                      ((chosen.q.price - prev.price) / prev.price) * 100,
-                    extAsOf: chosen.q.asOf,
-                    extSession: chosen.s,
+                    prePrice: pre.price,
+                    preChangePercent: pctVsCached(pre),
+                    preAsOf: pre.asOf,
+                    extPrice: pre.price,
+                    extChangePercent: pctVsCached(pre),
+                    extAsOf: pre.asOf,
+                    extSession: "pre",
+                  })
+                  .where(
+                    eq(schema.quoteSnapshots.quoteSymbol, h.quoteSymbol),
+                  );
+              } else if (
+                (session.key === "post" || session.key === "closed") &&
+                after
+              ) {
+                await db
+                  .update(schema.quoteSnapshots)
+                  .set({
+                    postPrice: after.price,
+                    postChangePercent: pctVsCached(after),
+                    postAsOf: after.asOf,
+                    afterPrice: after.price,
+                    afterChangePercent: pctVsCached(after),
+                    afterAsOf: after.asOf,
+                    extPrice: after.price,
+                    extChangePercent: pctVsCached(after),
+                    extAsOf: after.asOf,
+                    extSession: "post",
+                  })
+                  .where(
+                    eq(schema.quoteSnapshots.quoteSymbol, h.quoteSymbol),
+                  );
+              } else if (session.key === "overnight" && overnight) {
+                await db
+                  .update(schema.quoteSnapshots)
+                  .set({
+                    overnightPrice: overnight.price,
+                    overnightChangePercent: pctVsCached(overnight),
+                    overnightAsOf: overnight.asOf,
+                    extPrice: overnight.price,
+                    extChangePercent: pctVsCached(overnight),
+                    extAsOf: overnight.asOf,
+                    extSession: "overnight",
                   })
                   .where(
                     eq(schema.quoteSnapshots.quoteSymbol, h.quoteSymbol),
@@ -1734,52 +2926,77 @@ export const Actions = {
             w52h = null;
             w52l = null;
           }
-          // Session-aware extended quote (annotation + live estimate
-          // only; never enters the official totals). The percent is
+          // Per-session extended slots (plan B; annotation + live
+          // estimate only, never the official totals). The percent is
           // measured against the close its session references: the
           // previous close for pre-market, the same-day close for
-          // after-hours. When the relevant feed has no data this
-          // refresh, the stored snapshot is kept with its timestamp.
+          // after-hours/overnight. A refresh writes ONLY the slot of
+          // the session it runs in; the other two slots keep their
+          // saved values untouched. When the current session's feed
+          // has no data this refresh, that slot keeps its saved value
+          // too (never cleared, never fabricated).
+          const prevClose =
+            regular.change != null ? regular.price - regular.change : null;
+          // Slot values start from the stored saves.
+          let prePrice = prev?.prePrice ?? null;
+          let preChangePercent = prev?.preChangePercent ?? null;
+          let preAsOf = prev?.preAsOf ?? null;
+          let postPrice = prev?.postPrice ?? prev?.afterPrice ?? null;
+          let postChangePercent =
+            prev?.postChangePercent ?? prev?.afterChangePercent ?? null;
+          let postAsOf = prev?.postAsOf ?? prev?.afterAsOf ?? null;
+          let overnightPrice = prev?.overnightPrice ?? null;
+          let overnightChangePercent = prev?.overnightChangePercent ?? null;
+          let overnightAsOf = prev?.overnightAsOf ?? null;
+          // The legacy ext_* mirror follows the slot written now (or
+          // stays as stored when nothing is written).
           let extPrice: number | null = prev?.extPrice ?? null;
           let extChangePercent: number | null = prev?.extChangePercent ?? null;
           let extAsOf: string | null = prev?.extAsOf ?? null;
           let extSession: string | null = prev?.extSession ?? null;
-          const prevClose =
-            regular.change != null ? regular.price - regular.change : null;
-          let chosen: {
-            q: ExtendedQuote;
-            s: "pre" | "post" | "overnight";
-            ref: number;
-          } | null = null;
+          const writeSlot = (
+            q: ExtendedQuote,
+            s: "pre" | "post" | "overnight",
+            ref: number,
+          ) => {
+            if (!(ref > 0)) return;
+            const pct = ((q.price - ref) / ref) * 100;
+            if (s === "pre") {
+              prePrice = q.price;
+              preChangePercent = pct;
+              preAsOf = q.asOf;
+            } else if (s === "post") {
+              postPrice = q.price;
+              postChangePercent = pct;
+              postAsOf = q.asOf;
+            } else {
+              overnightPrice = q.price;
+              overnightChangePercent = pct;
+              overnightAsOf = q.asOf;
+            }
+            extPrice = q.price;
+            extChangePercent = pct;
+            extAsOf = q.asOf;
+            extSession = s;
+          };
           if (session.key === "pre") {
-            if (pre) chosen = { q: pre, s: "pre", ref: regular.price };
-            else if (after) chosen = { q: after, s: "post", ref: regular.price };
+            // Only the pre slot is written; the post feed fetched
+            // alongside is display fallback material, not a write.
+            if (pre) writeSlot(pre, "pre", regular.price);
           } else if (session.key === "regular") {
-            // This morning's pre-market, measured against the previous
-            // close (price − change). No pre data → keep stored ext.
-            if (pre && prevClose != null && prevClose > 0) {
-              chosen = { q: pre, s: "pre", ref: prevClose };
+            // This morning's pre-market belongs to the pre slot,
+            // measured against the previous close (price − change).
+            if (pre && prevClose != null) {
+              writeSlot(pre, "pre", prevClose);
             }
           } else if (session.key === "overnight") {
-            // Overnight: Yahoo fulldayPrice is the live price, measured
-            // against the regular close. When Yahoo yields nothing for
-            // this symbol, fall back to the after-hours last trade
-            // (the previous behavior), timestamped as Nasdaq's own.
-            if (overnight) {
-              chosen = { q: overnight, s: "overnight", ref: regular.price };
-            } else if (after) {
-              chosen = { q: after, s: "post", ref: regular.price };
-            }
+            // Only the overnight slot is written; a Yahoo miss keeps
+            // the saved overnight value and the display falls back
+            // to the post slot (after-hours last trade).
+            if (overnight) writeSlot(overnight, "overnight", regular.price);
           } else {
-            // post / closed: after-hours is the latest extended session.
-            if (after) chosen = { q: after, s: "post", ref: regular.price };
-          }
-          if (chosen && chosen.ref > 0) {
-            extPrice = chosen.q.price;
-            extChangePercent =
-              ((chosen.q.price - chosen.ref) / chosen.ref) * 100;
-            extAsOf = chosen.q.asOf;
-            extSession = chosen.s;
+            // post / closed: only the post slot is written.
+            if (after) writeSlot(after, "post", regular.price);
           }
           const values = {
             quoteSymbol: h.quoteSymbol,
@@ -1793,16 +3010,24 @@ export const Actions = {
             marketCap: regular.marketCap,
             marketStatus: regular.marketStatus,
             asOf: regular.asOf,
-            afterPrice: after?.price ?? null,
-            afterChangePercent:
-              after != null
-                ? ((after.price - regular.price) / regular.price) * 100
-                : null,
-            afterAsOf: after?.asOf ?? null,
+            // after_* mirrors the post slot: it moves only when the
+            // post slot itself was just written (post/closed session).
+            afterPrice: postPrice,
+            afterChangePercent: postChangePercent,
+            afterAsOf: postAsOf,
             extPrice,
             extChangePercent,
             extAsOf,
             extSession,
+            prePrice,
+            preChangePercent,
+            preAsOf,
+            postPrice,
+            postChangePercent,
+            postAsOf,
+            overnightPrice,
+            overnightChangePercent,
+            overnightAsOf,
             source,
             fetchedAt: now,
           };
@@ -2052,7 +3277,7 @@ export const Actions = {
         // keep the last cached gold rows
       }
 
-      // Daily snapshot: seed the demo record once, then
+      // Daily snapshot: seed the verified manual record once, then
       // record/refresh today's trading-day row from the new quotes.
       try {
         await ensureSeedSnapshot(ctx);
@@ -2066,6 +3291,110 @@ export const Actions = {
         updated,
         failed,
         fx_updated: fxUpdated,
+        portfolio: await loadPortfolio(ctx),
+      };
+    },
+  }),
+
+  refreshExtendedQuotes: defineAction({
+    description:
+      "Extended-hours-only refresh for the 30-minute scheduled save (plan B): when the current US session (America/New_York) is pre-market, after-hours, or overnight, it fetches that session's extended prices (Nasdaq pre/post feeds; Yahoo fulldayPrice overnight) and writes ONLY that session's saved slot (pre_*/post_*/overnight_* on quote_snapshots), leaving the other two slots untouched. During the regular session or when the market is closed it writes nothing at all. It never touches the regular-close quote fields, the fetched_at staleness stamp, FX, benchmarks, or the daily snapshots — the official close basis is exclusively refreshQuotes' job. A symbol whose feed yields nothing keeps its slot's saved value.",
+    request: z.object({}),
+    response: extendedRefreshResponse,
+    handler: async (
+      ctx,
+    ): Promise<z.infer<typeof extendedRefreshResponse>> => {
+      const now = new Date();
+      const session = currentUsSession(now);
+      if (
+        session.key !== "pre" &&
+        session.key !== "post" &&
+        session.key !== "overnight"
+      ) {
+        return {
+          updated: 0,
+          skipped: true,
+          session: session.key,
+          portfolio: await loadPortfolio(ctx),
+        };
+      }
+      const db = ctx.db<typeof schema>();
+      const rows = await db.select().from(schema.holdings);
+      const seenSymbols = new Set<string>();
+      const targets: (typeof rows)[number][] = [];
+      for (const h of rows) {
+        if (!seenSymbols.has(h.quoteSymbol)) {
+          seenSymbols.add(h.quoteSymbol);
+          targets.push(h);
+        }
+      }
+      const existing = await db.select().from(schema.quoteSnapshots);
+      const existingBySymbol = new Map(
+        existing.map((s) => [s.quoteSymbol, s]),
+      );
+      let updated = 0;
+      await Promise.all(
+        targets.map(async (h) => {
+          const prev = existingBySymbol.get(h.quoteSymbol);
+          // No stored regular close → no reference to measure the
+          // extended move against; skip rather than fabricate.
+          if (!prev || prev.price == null || !(prev.price > 0)) return;
+          const ref = prev.price;
+          let q: ExtendedQuote | null = null;
+          try {
+            if (session.key === "pre") {
+              q = await fetchNasdaqExtended(h.quoteSymbol, h.kind, "pre");
+            } else if (session.key === "post") {
+              q = await fetchNasdaqExtended(h.quoteSymbol, h.kind, "post");
+            } else {
+              const p = await fetchYahooOvernightPrice(h.quoteSymbol);
+              if (p != null) q = { price: p, asOf: now.toISOString() };
+            }
+          } catch {
+            q = null;
+          }
+          // Feed yielded nothing: the slot keeps its saved value.
+          if (!q) return;
+          const pct = ((q.price - ref) / ref) * 100;
+          const slotSet =
+            session.key === "pre"
+              ? {
+                  prePrice: q.price,
+                  preChangePercent: pct,
+                  preAsOf: q.asOf,
+                }
+              : session.key === "post"
+                ? {
+                    postPrice: q.price,
+                    postChangePercent: pct,
+                    postAsOf: q.asOf,
+                    afterPrice: q.price,
+                    afterChangePercent: pct,
+                    afterAsOf: q.asOf,
+                  }
+                : {
+                    overnightPrice: q.price,
+                    overnightChangePercent: pct,
+                    overnightAsOf: q.asOf,
+                  };
+          await db
+            .update(schema.quoteSnapshots)
+            .set({
+              ...slotSet,
+              extPrice: q.price,
+              extChangePercent: pct,
+              extAsOf: q.asOf,
+              extSession: session.key,
+            })
+            .where(eq(schema.quoteSnapshots.quoteSymbol, h.quoteSymbol));
+          updated += 1;
+        }),
+      );
+      if (updated > 0) ctx.invalidateQueries();
+      return {
+        updated,
+        skipped: false,
+        session: session.key,
         portfolio: await loadPortfolio(ctx),
       };
     },
