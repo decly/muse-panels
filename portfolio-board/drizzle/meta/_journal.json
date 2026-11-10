@@ -64,6 +64,13 @@
       "when": 1794195603718,
       "tag": "0009_add_peak3y_drawdown_fields",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1794221374078,
+      "tag": "0010_per_session_extended_price_slots",
+      "breakpoints": true
     }
   ]
 }

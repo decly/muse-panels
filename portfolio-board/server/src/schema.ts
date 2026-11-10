@@ -1,14 +1,14 @@
 import {
-  integer,
-  primaryKey,
-  real,
-  sqliteTable,
-  text,
-  uniqueIndex,
+integer,
+primaryKey,
+real,
+sqliteTable,
+text,
+uniqueIndex,
 } from "drizzle-orm/sqlite-core";
 
 // Brokerage accounts. Seeded in code with the two built-in accounts
-// (broker-a 券商A, broker-b 券商B); new accounts can be added as rows later
+// (broker-a 券商A, broker-b 券商B）; new accounts can be added as rows later
 // without a schema change.
 export const accounts = sqliteTable("accounts", {
   // Stable machine id, e.g. "broker-a" | "broker-b".
@@ -77,6 +77,27 @@ export const quoteSnapshots = sqliteTable("quote_snapshots", {
   extChangePercent: real("ext_change_percent"),
   extAsOf: text("ext_as_of"),
   extSession: text("ext_session"),
+  // Per-session saved extended prices (plan B, 2026-11-09): each
+  // extended session keeps its OWN last value — price, percent move
+  // versus that session's regular close, and timestamp — in its own
+  // slot, and a refresh writes only the slot of the session it runs
+  // in, so the pre-market refresh never overwrites the after-hours
+  // or overnight saves (and vice versa). getPortfolio derives the
+  // effective ext_* view from the slot matching the current session,
+  // so opening the board shows the last saved price for the current
+  // session immediately, before any new refresh lands. The legacy
+  // ext_* columns above stay as a mirror of the most recent slot
+  // write for backward compatibility; after_* remains the
+  // post-session mirror and seeds the post slot (migration 0010).
+  prePrice: real("pre_price"),
+  preChangePercent: real("pre_change_percent"),
+  preAsOf: text("pre_as_of"),
+  postPrice: real("post_price"),
+  postChangePercent: real("post_change_percent"),
+  postAsOf: text("post_as_of"),
+  overnightPrice: real("overnight_price"),
+  overnightChangePercent: real("overnight_change_percent"),
+  overnightAsOf: text("overnight_as_of"),
   // Which channel supplied the regular quote: "finance" | "nasdaq".
   source: text("source"),
   fetchedAt: integer("fetched_at", { mode: "timestamp_ms" })
