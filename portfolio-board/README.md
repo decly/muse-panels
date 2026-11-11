@@ -20,6 +20,9 @@
   持仓 × 常规收盘价」重算该账户最新快照（截图来源行跳过保护），
   重算失败不回滚持仓修改本身。
 - 刷新按钮下方显示本批报价的抓取时间（北京时间）。
+- 交易流水台账：逐笔记录成交（日期/账户/代码/买卖/数量/成交价，
+  带来源与价格性质标记），纯记录、不影响持仓与快照；按加权平均
+  成本重放计算已实现盈亏；全局视图只读，隐私模式遮罩成交价与金额。
 
 ## 服务端动作
 
@@ -28,14 +31,18 @@
   延长时段价格（三槽保存）。
 - `addHolding` / `updateHolding` / `removeHolding` / `updateCash`：
   持仓与现金维护，成功后触发最新快照自动重算。
+- `getTrades` / `addTrade` / `updateTrade` / `deleteTrade`：
+  交易流水台账读写（getTrades 附已实现盈亏重放汇总）。
 - `seedHoldings` / `seedDailySnapshot`：写入虚构示例种子。
 - `recalcDailySnapshot` / `recalcLatestSnapshots`：按收盘口径重算快照。
 - `exportPersonalData` / `importPersonalData`：个人数据导出/导入
-  （格式 v2，自描述信封 + 校验和）。
+  （格式 v2，自描述信封 + 校验和；共五张表，含交易流水 trades；
+  校验和按文件实际携带的表集合计算，旧四表备份与 v1 文件兼容，
+  文件缺 trades 时导入不动线上台账）。
 
 ## 数据说明
 
-个人数据（账户、持仓、现金余额、每日快照）只存在线上运行时的
+个人数据（账户、持仓、现金余额、每日快照、交易流水）只存在线上运行时的
 app.db，永不入库；由私有库 muse-data 每日 06:50 备份（机制见根
 README）。仓库内种子为虚构示例：示例持仓（AAPL / MSFT / JPM / VOO
 的整数股数与整百成本）、示例账户「券商A / 券商B」。

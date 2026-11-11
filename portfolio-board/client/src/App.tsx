@@ -1,4 +1,11 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Fragment,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type FormEvent,
+} from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { SafeAreaTopScrim } from "@hatch/space-sdk/client";
 import { api, type ApiResponse } from "./api";
@@ -388,6 +395,513 @@ function RowDetail({
       </div>
       )}
     </div>
+  );
+}
+
+type TradesData = ApiResponse<typeof api, "getTrades">;
+type TradeRow = TradesData["trades"][number];
+
+const TRADE_SOURCE_LABELS: Record<TradeRow["source"], string> = {
+  order: "订单截图",
+  snapshot_diff: "快照差分",
+  opening: "期初",
+  manual: "手动",
+};
+
+// Fractional-share quantities render like the holdings table:
+// thousands separators, up to 4 decimals, no forced trailing zeros.
+const fmtQty = (v: number) =>
+  v.toLocaleString("en-US", { maximumFractionDigits: 4 });
+
+// Trade ledger section （交易流水）, always the last section on the
+// page (after 集中度与结构）. Follows the account tabs: the global
+// view merges both accounts and is read-only (rows carry the account
+// name); a single-account view can add / edit / delete entries. The
+// realized-P/L summary at the top follows the same tab scope.
+// Privacy mode masks the user's own execution prices and amounts
+// (they are account records, not public quotes); quantities, symbols,
+// dates and direction stay visible.
+function TradesSection({
+  accountId,
+  readOnly,
+  mask,
+}: {
+  // Null = global (merged, read-only).
+  accountId: string | null;
+  readOnly: boolean;
+  // Privacy masking (execution prices + amounts) rides in via mask.
+  mask: (s: string) => string;
+}) {
+  const queryClient = useQueryClient();
+  const tradesQuery = useQuery({
+    queryKey: ["trades"],
+    queryFn: () => api.getTrades({}),
+  });
+  const invalidate = () =>
+    queryClient.invalidateQueries({ queryKey: ["trades"] });
+  const addTrade = useMutation({
+    mutationFn: (args: Parameters<typeof api.addTrade>[0]) =>
+      api.addTrade(args),
+    onSuccess: invalidate,
+  });
+  const updateTrade = useMutation({
+    mutationFn: (args: Parameters<typeof api.updateTrade>[0]) =>
+      api.updateTrade(args),
+    onSuccess: invalidate,
+  });
+  const deleteTrade = useMutation({
+    mutationFn: (id: number) => api.deleteTrade({ id }),
+    onSuccess: invalidate,
+  });
+
+  const [showForm, setShowForm] = useState(false);
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [fDate, setFDate] = useState("");
+  const [fSymbol, setFSymbol] = useState("");
+  const [fSide, setFSide] = useState<"buy" | "sell">("buy");
+  const [fQty, setFQty] = useState("");
+  const [fPrice, setFPrice] = useState("");
+  const [fPriceKind, setFPriceKind] = useState<
+    "actual" | "estimated" | "none"
+  >("actual");
+  const [fSource, setFSource] = useState<TradeRow["source"]>("manual");
+  const [fNote, setFNote] = useState("");
+  const [formError, setFormError] = useState<string | null>(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(
+    null,
+  );
+
+  const data = tradesQuery.data;
+  const rows = (data?.trades ?? []).filter(
+    (t) => !accountId || t.account_id === accountId,
+  );
+  const summary = data
+    ? accountId
+      ? (data.realized.accounts.find((a) => a.account_id === accountId) ??
+        data.realized.global)
+      : data.realized.global
+    : null;
+
+  // Group the (already date-desc) rows by trade date.
+  const groups: { date: string; rows: TradeRow[] }[] = [];
+  for (const t of rows) {
+    const last = groups[groups.length - 1];
+    if (last && last.date === t.date) last.rows.push(t);
+    else groups.push({ date: t.date, rows: [t] });
+  }
+
+  const resetForm = () => {
+    setEditingId(null);
+    setFDate("");
+    setFSymbol("");
+    setFSide("buy");
+    setFQty("");
+    setFPrice("");
+    setFPriceKind("actual");
+    setFSource("manual");
+    setFNote("");
+    setFormError(null);
+  };
+  const startEdit = (t: TradeRow) => {
+    setEditingId(t.id);
+    setFDate(t.date);
+    setFSymbol(t.symbol);
+    setFSide(t.side);
+    setFQty(String(t.qty));
+    setFPrice(t.price != null ? String(t.price) : "");
+    setFPriceKind(t.price_kind);
+    setFSource(t.source);
+    setFNote(t.note ?? "");
+    setFormError(null);
+    setShowForm(true);
+  };
+  const submitForm = (e: FormEvent) => {
+    e.preventDefault();
+    const qty = Number(fQty);
+    const priceText = fPrice.trim();
+    const price = priceText === "" ? null : Number(priceText);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(fDate)) {
+      setFormError("请选择成交日期");
+      return;
+    }
+    if (!fSymbol.trim()) {
+      setFormError("请填写代码");
+      return;
+    }
+    if (!Number.isFinite(qty) || qty <= 0) {
+      setFormError("数量必须是正数");
+      return;
+    }
+    if (price != null && (!Number.isFinite(price) || price <= 0)) {
+      setFormError("成交价必须是正数，或留空表示未知");
+      return;
+    }
+    // Price and its kind must agree: empty price ⇔ kind "none".
+    const kind: "actual" | "estimated" | "none" =
+      price == null ? "none" : fPriceKind === "none" ? "actual" : fPriceKind;
+    const payload = {
+      date: fDate,
+      symbol: fSymbol.trim(),
+      side: fSide,
+      qty,
+      price,
+      price_kind: kind,
+      source: fSource,
+      note: fNote.trim() ? fNote.trim() : null,
+    };
+    const onDone = () => {
+      setShowForm(false);
+      resetForm();
+    };
+    const onErr = (err: unknown) =>
+      setFormError(err instanceof Error ? err.message : "保存失败，请重试");
+    if (editingId != null) {
+      updateTrade.mutate(
+        { id: editingId, ...payload },
+        { onSuccess: onDone, onError: onErr },
+      );
+    } else if (accountId) {
+      addTrade.mutate(
+        { account_id: accountId, ...payload },
+        { onSuccess: onDone, onError: onErr },
+      );
+    }
+  };
+  const saving = addTrade.isPending || updateTrade.isPending;
+
+  const inputCls =
+    "num mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--surface-2)] px-2 py-1.5 text-base text-[var(--text)]";
+  const textInputCls =
+    "mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--surface-2)] px-2 py-1.5 text-base text-[var(--text)]";
+
+  return (
+    <section className="mt-3 rounded-[var(--radius)] bg-[var(--surface)] p-4">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="text-lg font-semibold">交易流水</h2>
+        {!readOnly && (
+          <button
+            type="button"
+            onClick={() => {
+              if (showForm) {
+                setShowForm(false);
+                resetForm();
+              } else {
+                resetForm();
+                setShowForm(true);
+              }
+            }}
+            className="rounded-md border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1.5 text-sm"
+          >
+            {showForm ? "收起" : "＋ 记录一笔"}
+          </button>
+        )}
+      </div>
+
+      {summary && (
+        <div className="mt-2">
+          <div className="flex flex-wrap items-baseline gap-x-2.5 gap-y-1">
+            <span className="text-sm text-[var(--dim)]">已实现盈亏</span>
+            {summary.total_usd == null ? (
+              <span className="num text-base font-semibold">—</span>
+            ) : (
+              <span
+                className="num text-base font-semibold"
+                style={{
+                  color:
+                    summary.total_usd >= 0 ? "var(--up)" : "var(--down)",
+                }}
+              >
+                {mask(signedMoney(summary.total_usd))}
+              </span>
+            )}
+            {summary.has_estimated && (
+              <span className="text-xs text-[var(--dim)]">含估算</span>
+            )}
+            {summary.has_unknown && (
+              <span className="text-xs text-[var(--dim)]">部分未知</span>
+            )}
+          </div>
+          {summary.by_symbol.length > 0 && (
+            <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-sm text-[var(--dim)]">
+              {summary.by_symbol.map((s) => (
+                <span key={s.symbol} className="num whitespace-nowrap">
+                  {s.symbol}{" "}
+                  {s.realized_usd == null ? (
+                    "—"
+                  ) : (
+                    <span
+                      style={{
+                        color:
+                          s.realized_usd >= 0 ? "var(--up)" : "var(--down)",
+                      }}
+                    >
+                      {mask(signedMoney(s.realized_usd))}
+                    </span>
+                  )}
+                  {s.has_estimated ? " · 估" : ""}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {showForm && !readOnly && (
+        <form
+          className="mt-3 rounded-md border border-[var(--border)] p-3"
+          onSubmit={submitForm}
+        >
+          <div className="grid grid-cols-2 gap-2">
+            <label className="text-sm text-[var(--dim)]">
+              成交日期
+              <input
+                aria-label="成交日期"
+                type="date"
+                className={inputCls}
+                value={fDate}
+                onChange={(e) => setFDate(e.target.value)}
+              />
+            </label>
+            <label className="text-sm text-[var(--dim)]">
+              代码
+              <input
+                aria-label="交易代码"
+                className={inputCls}
+                value={fSymbol}
+                onChange={(e) => setFSymbol(e.target.value)}
+                placeholder="如 NVDA"
+              />
+            </label>
+            <label className="text-sm text-[var(--dim)]">
+              方向
+              <select
+                aria-label="买卖方向"
+                className={textInputCls}
+                value={fSide}
+                onChange={(e) => setFSide(e.target.value as "buy" | "sell")}
+              >
+                <option value="buy">买入</option>
+                <option value="sell">卖出</option>
+              </select>
+            </label>
+            <label className="text-sm text-[var(--dim)]">
+              数量（股）
+              <input
+                aria-label="交易数量"
+                className={inputCls}
+                inputMode="decimal"
+                value={fQty}
+                onChange={(e) => setFQty(e.target.value)}
+              />
+            </label>
+            <label className="text-sm text-[var(--dim)]">
+              成交价 $（可留空）
+              <input
+                aria-label="成交价"
+                className={inputCls}
+                inputMode="decimal"
+                value={fPrice}
+                onChange={(e) => setFPrice(e.target.value)}
+                placeholder="留空 = 价未知"
+              />
+            </label>
+            <label className="text-sm text-[var(--dim)]">
+              价格类型
+              <select
+                aria-label="价格类型"
+                className={textInputCls}
+                value={fPriceKind}
+                onChange={(e) =>
+                  setFPriceKind(
+                    e.target.value as "actual" | "estimated" | "none",
+                  )
+                }
+              >
+                <option value="actual">实际成交价</option>
+                <option value="estimated">估算价</option>
+                <option value="none">价格未知</option>
+              </select>
+            </label>
+            <label className="text-sm text-[var(--dim)]">
+              来源
+              <select
+                aria-label="记录来源"
+                className={textInputCls}
+                value={fSource}
+                onChange={(e) =>
+                  setFSource(e.target.value as TradeRow["source"])
+                }
+              >
+                <option value="order">订单截图</option>
+                <option value="snapshot_diff">快照差分</option>
+                <option value="opening">期初</option>
+                <option value="manual">手动</option>
+              </select>
+            </label>
+            <label className="text-sm text-[var(--dim)]">
+              备注（可空）
+              <input
+                aria-label="交易备注"
+                className={textInputCls}
+                value={fNote}
+                onChange={(e) => setFNote(e.target.value)}
+              />
+            </label>
+          </div>
+          {formError && (
+            <p className="mt-2 text-sm text-[var(--danger)]">{formError}</p>
+          )}
+          <button
+            type="submit"
+            disabled={saving}
+            className="mt-3 w-full rounded-md bg-[var(--accent)] px-3 py-2 text-base font-medium text-black disabled:opacity-50"
+          >
+            {editingId != null ? "保存修改" : "记录这笔交易"}
+          </button>
+        </form>
+      )}
+
+      {tradesQuery.isPending ? (
+        <p className="mt-4 text-sm text-[var(--dim)]">正在加载交易流水…</p>
+      ) : tradesQuery.error ? (
+        <div className="mt-4">
+          <p className="text-sm text-[var(--danger)]">交易流水加载失败。</p>
+          <button
+            type="button"
+            onClick={() => tradesQuery.refetch()}
+            className="mt-2 rounded-md border border-[var(--border)] px-3 py-1.5 text-sm"
+          >
+            重新加载
+          </button>
+        </div>
+      ) : rows.length === 0 ? (
+        <p className="mt-4 text-sm text-[var(--dim)]">
+          暂无交易记录。
+          {readOnly
+            ? ""
+            : "点上方「＋ 记录一笔」添加，或发来订单截图 / 整户持仓后由记录补入。"}
+        </p>
+      ) : (
+        <div className="mt-2">
+          {groups.map((g) => (
+            <div key={g.date} className="mt-3">
+              <p className="num text-sm font-medium text-[var(--dim)]">
+                {g.date}
+              </p>
+              <ul className="mt-1 divide-y divide-[color-mix(in_srgb,var(--border)_55%,transparent)]">
+                {g.rows.map((t) => {
+                  const amount =
+                    t.price != null ? t.qty * t.price : null;
+                  return (
+                    <li key={t.id} className="py-2">
+                      <div className="flex items-baseline gap-2">
+                        <span
+                          className="shrink-0 rounded px-1.5 py-0.5 text-xs font-semibold"
+                          style={{
+                            color:
+                              t.side === "buy"
+                                ? "var(--up)"
+                                : "var(--down)",
+                            background:
+                              t.side === "buy"
+                                ? "color-mix(in srgb, var(--up) 10%, transparent)"
+                                : "color-mix(in srgb, var(--down) 10%, transparent)",
+                          }}
+                        >
+                          {t.side === "buy" ? "买入" : "卖出"}
+                        </span>
+                        <span className="num min-w-0 truncate text-base font-medium">
+                          {t.symbol}
+                        </span>
+                        {readOnly && (
+                          <span className="shrink-0 rounded bg-[var(--surface-2)] px-1.5 py-0.5 text-xs text-[var(--dim)]">
+                            {t.account_name}
+                          </span>
+                        )}
+                        <span className="ml-auto shrink-0 text-sm">
+                          {amount == null ? (
+                            <span className="text-[var(--dim)]">—</span>
+                          ) : (
+                            <span className="num">
+                              {mask(`$${money(amount)}`)}
+                            </span>
+                          )}
+                        </span>
+                      </div>
+                      <div className="num mt-0.5 text-sm text-[var(--dim)]">
+                        {fmtQty(t.qty)} 股 @{" "}
+                        {t.price == null ? (
+                          "价未知"
+                        ) : (
+                          <>
+                            {mask(`$${money(t.price)}`)}
+                            {t.price_kind === "estimated" ? "（估）" : ""}
+                          </>
+                        )}
+                        <span className="ml-2 rounded bg-[var(--surface-2)] px-1.5 py-0.5 text-xs">
+                          {TRADE_SOURCE_LABELS[t.source]}
+                        </span>
+                      </div>
+                      {t.note && (
+                        <p className="mt-0.5 text-sm text-[var(--dim)]">
+                          {t.note}
+                        </p>
+                      )}
+                      {!readOnly && (
+                        <div className="mt-1 flex gap-2 text-sm">
+                          <button
+                            type="button"
+                            aria-label={`编辑 ${t.symbol} 交易记录`}
+                            onClick={() => startEdit(t)}
+                            className="rounded border border-[var(--border)] px-2 py-0.5"
+                          >
+                            编辑
+                          </button>
+                          {confirmDeleteId === t.id ? (
+                            <>
+                              <button
+                                type="button"
+                                aria-label={`确认删除 ${t.symbol} 交易记录`}
+                                disabled={deleteTrade.isPending}
+                                onClick={() =>
+                                  deleteTrade.mutate(t.id, {
+                                    onSuccess: () =>
+                                      setConfirmDeleteId(null),
+                                  })
+                                }
+                                className="rounded border border-[var(--danger)] px-2 py-0.5 text-[var(--danger)] disabled:opacity-50"
+                              >
+                                确认删除
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setConfirmDeleteId(null)}
+                                className="rounded border border-[var(--border)] px-2 py-0.5"
+                              >
+                                取消
+                              </button>
+                            </>
+                          ) : (
+                            <button
+                              type="button"
+                              aria-label={`删除 ${t.symbol} 交易记录`}
+                              onClick={() => setConfirmDeleteId(t.id)}
+                              className="rounded border border-[var(--border)] px-2 py-0.5"
+                            >
+                              删除
+                            </button>
+                          )}
+                        </div>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -2292,6 +2806,17 @@ export function App() {
               </div>
             </section>
             )}
+
+            {/* Trade ledger: always the last section (user-confirmed
+                placement 2026-11-11, after 集中度与结构）. Follows the
+                account tabs; keyed by view so switching tabs resets
+                its form state. */}
+            <TradesSection
+              key={view.key}
+              accountId={view.key === "global" ? null : view.key}
+              readOnly={view.readOnly}
+              mask={mask}
+            />
 
           </>
         )}
