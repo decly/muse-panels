@@ -7,10 +7,12 @@ type Board = ApiResponse<typeof api, "getBoard">;
 type Item = Board["needsDecision"][number];
 type ActArgs = Parameters<typeof api.actOnItem>[0];
 
-/** Days between two YYYY-MM-DD dates (b - a), parsed as local calendar days. */
+/** Days between two dates (b - a), parsed as local calendar days. Inputs
+ *  may be "YYYY-MM-DD" or "YYYY-MM-DD HH:MM" — only the date part counts,
+ *  so day-based labels （已等 X 天） are unaffected by the time component. */
 function daysBetween(a: string, b: string): number {
-  const pa = a.split("-").map(Number);
-  const pb = b.split("-").map(Number);
+  const pa = a.slice(0, 10).split("-").map(Number);
+  const pb = b.slice(0, 10).split("-").map(Number);
   const da = new Date(pa[0] ?? 1970, (pa[1] ?? 1) - 1, pa[2] ?? 1);
   const db = new Date(pb[0] ?? 1970, (pb[1] ?? 1) - 1, pb[2] ?? 1);
   return Math.round((db.getTime() - da.getTime()) / 86_400_000);
@@ -380,7 +382,7 @@ function DecisionItem({
       ) : null}
       <MetaLine>
         {item.source ? <span>来源：{item.source} · </span> : null}
-        <span>{fmtDate(item.createdAt)}提出</span>
+        <span>{fmtDateTime(item.createdAt)}提出</span>
         {item.dueDate ? <span> · 希望 {fmtDate(item.dueDate)} 前定</span> : null}
       </MetaLine>
 
@@ -557,9 +559,9 @@ function ProgressItem({
       ) : null}
       <MetaLine>
         {item.source ? <span>来源：{item.source} · </span> : null}
-        <span>{fmtDate(item.createdAt)}开始</span>
+        <span>{fmtDateTime(item.createdAt)}开始</span>
         {snoozed && item.snoozedAt ? (
-          <span> · {fmtDate(item.snoozedAt)}暂缓</span>
+          <span> · {fmtDateTime(item.snoozedAt)}暂缓</span>
         ) : null}
       </MetaLine>
 
@@ -643,7 +645,7 @@ function DoneItem({
           <p className="mt-1 text-[12px] leading-[17px] text-[var(--dim)]">
             {item.source ? <span>来源：{item.source} · </span> : null}
             {item.completedAt ? (
-              <span>{fmtDate(item.completedAt)}办完</span>
+              <span>{fmtDateTime(item.completedAt)}办完</span>
             ) : null}
           </p>
           <div className="mt-2">
