@@ -2,7 +2,10 @@
 //
 // digest_sections: assistant-pushed digest content, one row per section key
 // ("overview" | "accounts" | "movers" | "other_assets" | "tech_line"),
-// value is a JSON string, updated_at is the push instant.
+// value is a JSON string, updated_at is the push instant. An extra
+// "issue_date" row stores { date: "YYYY-MM-DD" } — the Beijing date of the
+// most recent content write (pushDigest or refreshToday) — which the page
+// header renders as the report's own date.
 // events: the assistant-maintained event list (earnings, macro releases,
 // ex-dividend dates), date/time_text are Beijing wall-clock strings.
 // market_cache: market data this page pulls itself on refresh

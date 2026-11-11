@@ -67,21 +67,37 @@ type IndexPoint = z.infer<typeof indexPoint>;
 
 // ---------- helpers ----------
 
-function beijingToday(): { date: string; weekday: string } {
-  const now = new Date();
+// Beijing (Asia/Shanghai) calendar date of an instant, YYYY-MM-DD.
+function beijingDateString(d: Date): string {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: "Asia/Shanghai",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
-  }).formatToParts(now);
+  }).formatToParts(d);
   const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
-  const date = `${get("year")}-${get("month")}-${get("day")}`;
-  const weekday = new Intl.DateTimeFormat("zh-CN", {
-    timeZone: "Asia/Shanghai",
-    weekday: "long",
-  }).format(now);
-  return { date, weekday };
+  return `${get("year")}-${get("month")}-${get("day")}`;
+}
+
+const WEEKDAY_NAMES = [
+  "星期日",
+  "星期一",
+  "星期二",
+  "星期三",
+  "星期四",
+  "星期五",
+  "星期六",
+] as const;
+
+// Weekday label derived from a stored YYYY-MM-DD calendar date — never
+// from the read instant.
+function weekdayOfDate(dateStr: string): string {
+  const [y = 1970, m = 1, d = 1] = dateStr.split("-").map(Number);
+  return WEEKDAY_NAMES[new Date(Date.UTC(y, m - 1, d)).getUTCDay()] ?? "";
+}
+
+function beijingToday(): { date: string } {
+  return { date: beijingDateString(new Date()) };
 }
 
 function addDays(dateStr: string, days: number): string {
@@ -120,6 +136,14 @@ async function setSection(ctx: Ctx, key: string, value: unknown): Promise<void> 
       target: schema.digestSections.key,
       set: { value: serialized, updatedAt: now },
     });
+}
+
+// 期号日期 (issue date): the Beijing calendar date of the most recent
+// content write — pushDigest sections or a refreshToday market pull.
+// Persisted as the "issue_date" digest section so the page header always
+// shows the date of the report it is displaying, not the read date.
+async function touchIssueDate(ctx: Ctx): Promise<void> {
+  await setSection(ctx, "issue_date", { date: beijingDateString(new Date()) });
 }
 
 async function getCache(
@@ -294,12 +318,14 @@ const refreshResponse = z.object({
 export const Actions = {
   getToday: defineAction({
     description:
-      "Returns everything the 今日页 renders: Beijing date, the assistant-pushed overview line, per-account totals （全局/券商A/券商B， close-basis), the full pushed movers set (the page itself selects the top-5 gainers, top-5 losers and every |change| ≥ 5% stock for display), the cached benchmark index closes and gold prices (spot XAU/USD + SGE Au99.99), upcoming events, and the optional other-assets and tech-brief lines (null when never pushed, so the page hides those blocks).",
+      "Returns everything the 今日页 renders: the report's issue date (date_beijing/weekday_beijing — the Beijing date of the most recent content write, persisted by pushDigest/refreshToday, NOT the read-time date), the assistant-pushed overview line, per-account totals （全局/券商A/券商B， close-basis), the full pushed movers set (the page itself selects the top-5 gainers, top-5 losers and every |change| ≥ 5% stock for display), the cached benchmark index closes and gold prices (spot XAU/USD + SGE Au99.99), upcoming events, and the optional other-assets and tech-brief lines (null when never pushed, so the page hides those blocks).",
     request: z.object({}),
     response: todayResponse,
     async handler(ctx): Promise<z.infer<typeof todayResponse>> {
       const db = ctx.db<typeof schema>();
-      const { date, weekday } = beijingToday();
+      // `date` (read-time Beijing date) still anchors the events window
+      // below; the header date comes from the stored issue date instead.
+      const { date } = beijingToday();
 
       const overviewS = await getSection(ctx, "overview");
       const accountsS = await getSection(ctx, "accounts");
@@ -341,9 +367,29 @@ export const Actions = {
         .filter((d): d is Date => d instanceof Date)
         .sort((a, b) => b.getTime() - a.getTime());
 
+      // Header date = the stored 期号日期. When it has never been written
+      // (pre-fix content), derive the initial value from the content's own
+      // timestamps: overview first, then accounts, then the market
+      // refresh — never from the read instant.
+      const issueS = await getSection(ctx, "issue_date");
+      const issueVal = issueS?.value as { date?: string } | null;
+      let issueDate: string | null =
+        typeof issueVal?.date === "string" &&
+        /^\d{4}-\d{2}-\d{2}$/.test(issueVal.date)
+          ? issueVal.date
+          : null;
+      if (issueDate == null) {
+        const fallbackAt =
+          overviewS?.updatedAt ??
+          accountsS?.updatedAt ??
+          refreshedCandidates[0] ??
+          null;
+        issueDate = fallbackAt ? beijingDateString(fallbackAt) : date;
+      }
+
       return {
-        date_beijing: date,
-        weekday_beijing: weekday,
+        date_beijing: issueDate,
+        weekday_beijing: weekdayOfDate(issueDate),
         overview: overviewVal?.text ?? null,
         overview_updated_at: overviewS?.updatedAt.toISOString() ?? null,
         accounts: accountsVal?.accounts ?? [],
@@ -470,7 +516,11 @@ export const Actions = {
         updated.push("tech_line");
       }
 
-      if (updated.length > 0) ctx.invalidateQueries();
+      if (updated.length > 0) {
+        // Any content write starts a new issue: stamp its Beijing date.
+        await touchIssueDate(ctx);
+        ctx.invalidateQueries();
+      }
       return { ok: true as const, updated };
     },
   }),
@@ -573,6 +623,9 @@ export const Actions = {
         indicesOk = true;
       }
 
+      // The morning generation also stamps the issue date (same Beijing
+      // date as the 06:30 pushDigest, so the two never conflict).
+      await touchIssueDate(ctx);
       ctx.invalidateQueries();
       return {
         ok: true as const,
