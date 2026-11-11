@@ -47,3 +47,15 @@ export const stripSnapshots = sqliteTable("strip_snapshots", {
     .notNull()
     .$defaultFn(() => new Date()),
 });
+
+export const upcomingNodes = sqliteTable("upcoming_nodes", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  // Event date, "YYYY-MM-DD" (Beijing calendar day).
+  date: text("date").notNull(),
+  // Beijing time "HH:MM", null when the event has no fixed time.
+  time: text("time"),
+  // Event description, e.g. "示例甲 财报（盘后）".
+  event: text("event").notNull(),
+  // JSON array of holding tickers involved, e.g. ["DEMO"].
+  tickers: text("tickers").notNull().default("[]"),
+});

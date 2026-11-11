@@ -8,7 +8,7 @@
 // - Events older than 7 days are pruned on every write/read path.
 
 import { defineAction, z, type ActionsModule, type Ctx } from "@hatch/space-sdk";
-import { desc, eq, inArray, lt } from "drizzle-orm";
+import { asc, desc, eq, inArray, lt } from "drizzle-orm";
 import * as schema from "./schema";
 
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
@@ -50,9 +50,22 @@ const eventUpdateResponse = z.object({
   id: z.number(),
 });
 
+const node = z.object({
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "date must be YYYY-MM-DD"),
+  time: z
+    .string()
+    .regex(/^\d{2}:\d{2}$/, "time must be HH:MM")
+    .nullable()
+    .optional(),
+  event: z.string().min(1).max(200),
+  tickers: z.array(z.string().min(1).max(10)).max(20).optional().default([]),
+});
+type UpcomingNode = z.infer<typeof node>;
+
 const streamResponse = z.object({
   strip: z.array(stripItem),
   stripFetchedAt: z.string().nullable(),
+  nodes: z.array(node),
   events: z.array(eventOut),
 });
 type StreamResponse = z.infer<typeof streamResponse>;
@@ -226,9 +239,19 @@ async function loadStream(ctx: Ctx): Promise<StreamResponse> {
     .from(schema.events)
     .orderBy(desc(schema.events.eventTime), desc(schema.events.id))
     .limit(300);
+  const nodeRows = await db
+    .select()
+    .from(schema.upcomingNodes)
+    .orderBy(asc(schema.upcomingNodes.date), asc(schema.upcomingNodes.time), asc(schema.upcomingNodes.id));
   return {
     strip: parseItems(snapshot.items),
     stripFetchedAt: snapshot.fetchedAt.toISOString(),
+    nodes: nodeRows.map((row) => ({
+      date: row.date,
+      time: row.time,
+      event: row.event,
+      tickers: parseTickers(row.tickers),
+    })),
     events: rows.map((row) => ({
       id: row.id,
       category: row.category,
@@ -245,7 +268,7 @@ async function loadStream(ctx: Ctx): Promise<StreamResponse> {
 
 export const Actions = {
   getStream: defineAction({
-    description: "Returns the current quote strip and the event stream (newest first, last 7 days) so the agent can verify what the board shows.",
+    description: "Returns the current quote strip, the upcoming-nodes list (date ascending), and the event stream (newest first, last 7 days) so the agent can verify what the board shows.",
     request: z.object({}),
     response: streamResponse,
     async handler(ctx): Promise<StreamResponse> {
@@ -274,7 +297,7 @@ export const Actions = {
       category: z.enum(schema.CATEGORIES),
       title: z.string().min(1).max(200),
       keyNumbers: z.string().max(200).nullable().optional(),
-      note: z.string().min(1).max(500),
+      note: z.string().min(1).max(1000),
       impact: z.string().max(120).nullable().optional(),
       tickers: z.array(z.string().min(1).max(10)).max(20).default([]),
       movers: z.array(mover).max(30).default([]),
@@ -313,7 +336,7 @@ export const Actions = {
       id: z.number().int().positive(),
       title: z.string().min(1).max(200).optional(),
       keyNumbers: z.string().max(200).nullable().optional(),
-      note: z.string().min(1).max(500).optional(),
+      note: z.string().min(1).max(1000).optional(),
       impact: z.string().max(120).nullable().optional(),
       tickers: z.array(z.string().min(1).max(10)).max(20).optional(),
       movers: z.array(mover).max(30).optional(),
@@ -366,6 +389,31 @@ export const Actions = {
       await pruneOld(db);
       ctx.invalidateQueries();
       return { ok: true as const, updated: result.length > 0, id: args.id };
+    },
+  }),
+
+  setUpcomingNodes: defineAction({
+    description: "Replaces the full upcoming-nodes list shown at the top of the board (earnings dates, macro releases and other known schedule points). The passed array is the complete current list; an empty array clears it. Returns how many nodes were written.",
+    request: z.object({
+      nodes: z.array(node).max(100),
+    }),
+    response: z.object({ written: z.number() }),
+    async handler(ctx, args) {
+      const db = ctx.db<typeof schema>();
+      const rows: Array<typeof schema.upcomingNodes.$inferInsert> = args.nodes.map((n) => ({
+        date: n.date,
+        time: n.time?.trim() ? n.time.trim() : null,
+        event: n.event.trim(),
+        tickers: JSON.stringify(
+          n.tickers.map((t) => t.trim().toUpperCase()).filter((t) => t.length > 0),
+        ),
+      }));
+      await db.delete(schema.upcomingNodes);
+      if (rows.length > 0) {
+        await db.insert(schema.upcomingNodes).values(rows);
+      }
+      ctx.invalidateQueries();
+      return { written: rows.length };
     },
   }),
 } satisfies ActionsModule;

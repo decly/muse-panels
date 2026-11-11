@@ -82,6 +82,18 @@ function todayKey(): string {
   return bjDate.format(new Date());
 }
 
+// Upcoming-node dates are plain "YYYY-MM-DD" strings; format them in the
+// Beijing calendar without timezone shifting (parse as local noon).
+const nodeDayLabel = new Intl.DateTimeFormat("zh-CN", {
+  month: "numeric",
+  day: "numeric",
+  weekday: "short",
+});
+
+function nodeDateLabel(date: string): string {
+  return nodeDayLabel.format(new Date(`${date}T12:00:00+08:00`));
+}
+
 function fmtPrice(key: string, price: number): string {
   // Display-only rounding: futures and spot gold show as integers; Brent crude
   // and the dollar index keep two decimals. Stored data keeps full precision.
@@ -212,6 +224,17 @@ export function App() {
     return out;
   }, [events]);
 
+  // Group upcoming nodes by date, preserving the server's ascending order.
+  const nodeGroups = useMemo(() => {
+    const out: Array<{ date: string; label: string; items: Stream["nodes"] }> = [];
+    for (const n of data?.nodes ?? []) {
+      const last = out[out.length - 1];
+      if (last && last.date === n.date) last.items.push(n);
+      else out.push({ date: n.date, label: nodeDateLabel(n.date), items: [n] });
+    }
+    return out;
+  }, [data]);
+
   return (
     <div className="min-h-screen bg-[var(--bg)] text-[var(--text)]">
       <SafeAreaTopScrim backgroundColor="var(--bg)" />
@@ -263,6 +286,44 @@ export function App() {
       </header>
 
       <main className="mx-auto max-w-3xl px-3 pb-10">
+        {/* Upcoming nodes */}
+        {nodeGroups.length > 0 ? (
+          <section aria-label="近期节点" className="pt-3">
+            <h2 className="pb-1 text-[13px] font-semibold tracking-wide text-[var(--dim)]">近期节点</h2>
+            <div className="divide-y divide-[var(--border)] border-y border-[var(--border)] bg-[var(--surface)] px-3 py-1">
+              {nodeGroups.map((group) => (
+                <div key={group.date} className="flex items-baseline gap-2.5 py-1.5">
+                  <span className="w-[92px] shrink-0 whitespace-nowrap text-[13px] font-medium tabular-nums text-[var(--dim)]">
+                    {group.label}
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    {group.items.map((n, i) => (
+                      <p key={i} className="break-words text-[14px] leading-6">
+                        {n.time ? (
+                          <span className="mr-2 font-medium tabular-nums">{n.time}</span>
+                        ) : null}
+                        {richText(n.event, n.tickers)}
+                        {n.tickers.length > 0 ? (
+                          <span className="ml-2">
+                            {n.tickers.map((t) => (
+                              <span
+                                key={t}
+                                className="mr-2 font-semibold underline decoration-[var(--accent)] decoration-2 underline-offset-2"
+                              >
+                                {t}
+                              </span>
+                            ))}
+                          </span>
+                        ) : null}
+                      </p>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+        ) : null}
+
         {/* Category filter */}
         <nav aria-label="事件类别筛选" className="flex flex-wrap gap-1.5 pt-3">
           <button

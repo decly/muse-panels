@@ -1,0 +1,7 @@
+CREATE TABLE upcoming_nodes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  date TEXT NOT NULL,
+  time TEXT,
+  event TEXT NOT NULL,
+  tickers TEXT NOT NULL DEFAULT '[]'
+);
