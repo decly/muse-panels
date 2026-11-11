@@ -108,6 +108,12 @@ function errorText(code: string | null): string {
       return `这条不在已办区，列表已刷新。${raw}`;
     case "missing_choice_or_text":
       return `没有读到你的选择，请再点一次。${raw}`;
+    case "request_timeout":
+      return `请求超时：已经自动重试了一次，仍没能确认保存结果，这次操作按未保存处理。${raw}`;
+    case "network_failed":
+      return `网络连接失败：已经自动重试了一次，仍没能确认保存结果，这次操作按未保存处理。${raw}`;
+    case "verify_failed":
+      return `服务器有回应，但回读确认时没看到这次操作的结果，按未保存处理。${raw}`;
     default:
       return code
         ? `操作没成功${raw}，可以点重试再试一次。`
@@ -115,8 +121,10 @@ function errorText(code: string | null): string {
   }
 }
 
-/** Visible failure feedback: the concrete reason plus an in-place retry
- *  that re-sends the exact same action. */
+/** Visible failure feedback: a prominent, persistent alert box — it never
+ *  auto-dismisses and is only cleared by a later successful save. It names
+ *  the failure plainly and keeps an in-place retry that re-sends the exact
+ *  same action. */
 function ActionError({
   message,
   onRetry,
@@ -127,20 +135,202 @@ function ActionError({
   busy: boolean;
 }) {
   return (
-    <div role="alert" className="mt-2 flex flex-wrap items-center gap-2">
-      <p className="text-[12.5px] leading-[18px] text-[var(--accent)]">
+    <div
+      role="alert"
+      className="mt-3 rounded-lg border-2 border-[var(--accent)] bg-[var(--surface)] px-3 py-2.5 shadow-md"
+    >
+      <p className="text-[13.5px] font-bold leading-5 text-[var(--accent)]">
+        未保存成功，请重试
+      </p>
+      <p className="mt-0.5 text-[12.5px] leading-[18px] text-[var(--text)]">
         {message}
       </p>
       <button
         type="button"
         disabled={busy}
         onClick={onRetry}
-        className="min-h-8 cursor-pointer touch-manipulation rounded-full border border-[var(--accent)] bg-[var(--surface)] px-3 py-1 text-[12.5px] font-semibold leading-[18px] text-[var(--accent)] active:bg-[var(--accent-soft)] disabled:opacity-50"
+        className="mt-2 min-h-9 cursor-pointer touch-manipulation rounded-full bg-[var(--accent)] px-4 py-1.5 text-[13px] font-semibold leading-[18px] text-white active:opacity-80 disabled:opacity-50"
       >
-        重试
+        {busy ? "正在重试…" : "重试保存"}
       </button>
     </div>
   );
+}
+
+/* ------------------------------------------------------------------ */
+/* 请求硬化层：写操作（actOnItem / requestExecution）统一走这里。       */
+/* 单次请求 8 秒超时；超时或网络失败时，先回读确认是否其实已落库，     */
+/* 没落库才自动重试一次；请求成功返回后也要再回读一次看板，校验结果   */
+/* 真的落库（拍板类校验 userDecision 与待执行数），校验不过按失败处理。*/
+/* 业务性拒绝（ok:false 的错误码）不重试，直接按原样上报。             */
+/* ------------------------------------------------------------------ */
+
+const REQUEST_TIMEOUT_MS = 8000;
+
+class RequestTimeoutError extends Error {
+  constructor() {
+    super("request_timeout");
+    this.name = "RequestTimeoutError";
+  }
+}
+
+/** Race a promise against a timeout; a hung request in the webview (the
+ *  intermittent "tap did nothing" failure) rejects instead of hanging
+ *  forever, so the retry / error path actually gets to run. */
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = window.setTimeout(
+      () => reject(new RequestTimeoutError()),
+      ms,
+    );
+    promise.then(
+      (value) => {
+        window.clearTimeout(timer);
+        resolve(value);
+      },
+      (err: unknown) => {
+        window.clearTimeout(timer);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      },
+    );
+  });
+}
+
+function findItem(board: Board, itemId: number): Item | undefined {
+  return [
+    ...board.needsDecision,
+    ...board.inProgress,
+    ...board.done,
+  ].find((i) => i.id === itemId);
+}
+
+/** Post-condition check on a freshly read board: did this action's effect
+ *  actually land? For decide that means the item is in progress with the
+ *  exact decision recorded and counted as pending execution. */
+function actLanded(board: Board, args: ActArgs): boolean {
+  const item = findItem(board, args.itemId);
+  switch (args.action) {
+    case "decide": {
+      if (!item || item.status !== "in_progress" || !item.userDecision) {
+        return false;
+      }
+      const picked = (args.choice ?? args.text ?? "").trim();
+      const recorded =
+        item.userDecision.choice ?? item.userDecision.text ?? "";
+      if (picked && recorded !== picked) return false;
+      return board.pendingExecution >= 1 || item.executedAt !== null;
+    }
+    case "cancel_decision":
+      return Boolean(
+        item &&
+          item.status === "needs_decision" &&
+          !item.userDecision &&
+          item.cancelledDecision,
+      );
+    case "prioritize":
+      return Boolean(
+        item && item.status === "in_progress" && item.prioritizedAt,
+      );
+    case "snooze":
+      return Boolean(item && item.status === "in_progress" && item.snoozedAt);
+    case "cancel":
+      // Cancelled items are archived server-side and never returned.
+      return !item;
+    case "reopen":
+      return Boolean(item && item.status === "in_progress");
+    default:
+      return false;
+  }
+}
+
+/** Independent read-back of the board (own 8s timeout). Null when the
+ *  read itself could not be completed. */
+async function readBackBoard(): Promise<Board | null> {
+  try {
+    return await withTimeout(api.getBoard({}), REQUEST_TIMEOUT_MS);
+  } catch {
+    return null;
+  }
+}
+
+type ActResult = ApiResponse<typeof api, "actOnItem">;
+
+async function hardenedActOnItem(args: ActArgs): Promise<ActResult> {
+  let lastTransport: "request_timeout" | "network_failed" = "network_failed";
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let res: ActResult;
+    try {
+      res = await withTimeout(api.actOnItem(args), REQUEST_TIMEOUT_MS);
+    } catch (err) {
+      // Timeout / transport failure: the reply may simply be lost while
+      // the write actually landed — check before retrying blindly.
+      lastTransport =
+        err instanceof RequestTimeoutError
+          ? "request_timeout"
+          : "network_failed";
+      const fresh = await readBackBoard();
+      if (fresh && actLanded(fresh, args)) {
+        return { ok: true, error: null, board: fresh };
+      }
+      continue; // automatic single retry
+    }
+    if (!res.ok || !res.board) {
+      // A business rejection can also be the echo of a first attempt that
+      // timed out but landed (e.g. decide → not_needs_decision): confirm
+      // against a fresh read before reporting failure.
+      const fresh = await readBackBoard();
+      if (fresh && actLanded(fresh, args)) {
+        return { ok: true, error: null, board: fresh };
+      }
+      return res;
+    }
+    // Response received: verify with an independent read-back.
+    const fresh = await readBackBoard();
+    if (fresh) {
+      return actLanded(fresh, args)
+        ? { ok: true, error: null, board: fresh }
+        : { ok: false, error: "verify_failed", board: null };
+    }
+    // Read-back itself unreachable: fall back to the board the write
+    // response already carried (it is loaded after the write server-side).
+    return actLanded(res.board, args)
+      ? res
+      : { ok: false, error: "verify_failed", board: null };
+  }
+  return { ok: false, error: lastTransport, board: null };
+}
+
+type DispatchResult = ApiResponse<typeof api, "requestExecution">;
+
+async function hardenedRequestExecution(): Promise<DispatchResult> {
+  let lastTransport: "request_timeout" | "network_failed" = "network_failed";
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let res: DispatchResult;
+    try {
+      res = await withTimeout(api.requestExecution({}), REQUEST_TIMEOUT_MS);
+    } catch (err) {
+      lastTransport =
+        err instanceof RequestTimeoutError
+          ? "request_timeout"
+          : "network_failed";
+      const fresh = await readBackBoard();
+      if (fresh && fresh.requestedAt) {
+        return { ok: true, error: null, board: fresh };
+      }
+      continue; // automatic single retry
+    }
+    if (!res.ok || !res.board) return res;
+    const fresh = await readBackBoard();
+    if (fresh) {
+      return fresh.requestedAt
+        ? { ok: true, error: null, board: fresh }
+        : { ok: false, error: "verify_failed", board: null };
+    }
+    return res.board.requestedAt
+      ? res
+      : { ok: false, error: "verify_failed", board: null };
+  }
+  return { ok: false, error: lastTransport, board: null };
 }
 
 type ActFn = (args: ActArgs) => void;
@@ -250,7 +440,7 @@ function DecisionItem({
         </form>
         {busy ? (
           <p className="mt-2 text-[12.5px] leading-[18px] text-[var(--dim)]">
-            正在记下…
+            正在记下…（网络慢时会自动重试一次，请稍候）
           </p>
         ) : null}
         {error ? (
@@ -405,7 +595,7 @@ function ProgressItem({
       </div>
       {busy ? (
         <p className="mt-2 text-[12.5px] leading-[18px] text-[var(--dim)]">
-          正在记下…
+          正在记下…（网络慢时会自动重试一次，请稍候）
         </p>
       ) : null}
       {error ? (
@@ -614,7 +804,10 @@ export function App() {
   }, [notice]);
 
   const actMutation = useMutation({
-    mutationFn: async (args: ActArgs) => await api.actOnItem(args),
+    // All page writes go through the hardened layer: 8s timeout, one
+    // automatic retry on timeout / network failure, and a read-back
+    // verification that the effect really landed before reporting success.
+    mutationFn: async (args: ActArgs) => await hardenedActOnItem(args),
     onSuccess: (res, args) => {
       // actOnItem returns the refreshed board: swap it in in place —
       // no navigation, no refetch flicker.
@@ -636,18 +829,19 @@ export function App() {
       }
     },
     onError: (_err, args) => {
-      // Transport-level failure: the request never landed (or its reply
-      // was lost). Say so plainly; the server-side action log confirms
-      // whether anything was recorded.
+      // Unexpected failure outside the hardened layer's handled paths
+      // (it converts timeout / network / verify failures into ok:false
+      // results itself). Say so plainly and keep the in-place retry.
       setActFailure({
         itemId: args.itemId,
-        message: "网络或服务异常，这次操作没有保存下来。可以点重试再试一次。",
+        message:
+          "网络或服务异常（已自动重试一次），这次操作没有保存下来。可以点重试再试一次。",
         args,
       });
     },
   });
   const dispatchMutation = useMutation({
-    mutationFn: async () => await api.requestExecution({}),
+    mutationFn: async () => await hardenedRequestExecution(),
     onSuccess: (res) => {
       if (res.ok && res.board) {
         queryClient.setQueryData(["board"], res.board);
@@ -658,7 +852,9 @@ export function App() {
       }
     },
     onError: () => {
-      setDispatchError("网络或服务异常，发令没有保存下来。再点一次发令即可重试。");
+      setDispatchError(
+        "网络或服务异常（已自动重试一次），发令没有确认保存下来。用下方按钮重试发令。",
+      );
     },
   });
   const act: ActFn = (args) => actMutation.mutate(args);
@@ -918,12 +1114,25 @@ export function App() {
               </button>
             )}
             {dispatchError ? (
-              <p
+              <div
                 role="alert"
-                className="mt-2 text-center text-[12.5px] leading-[18px] text-[var(--accent)]"
+                className="mt-2 rounded-lg border-2 border-[var(--accent)] bg-[var(--surface)] px-3 py-2.5 shadow-md"
               >
-                {dispatchError}
-              </p>
+                <p className="text-[13.5px] font-bold leading-5 text-[var(--accent)]">
+                  发令未确认成功
+                </p>
+                <p className="mt-0.5 text-[12.5px] leading-[18px] text-[var(--text)]">
+                  {dispatchError}
+                </p>
+                <button
+                  type="button"
+                  disabled={dispatchMutation.isPending}
+                  onClick={() => dispatchMutation.mutate()}
+                  className="mt-2 min-h-9 w-full cursor-pointer touch-manipulation rounded-full bg-[var(--accent)] px-4 py-1.5 text-[13px] font-semibold leading-[18px] text-white active:opacity-80 disabled:opacity-50"
+                >
+                  {dispatchMutation.isPending ? "正在重试…" : "重试发令"}
+                </button>
+              </div>
             ) : null}
           </div>
         </div>
