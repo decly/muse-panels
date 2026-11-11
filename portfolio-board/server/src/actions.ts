@@ -252,27 +252,127 @@ function slotOf(
   };
 }
 
+// ---------- Extended-slot staleness gate (2026-11-12) ----------
+//
+// A saved extended slot belongs to the extended cycle that follows
+// ONE specific regular close — the close its percent was measured
+// against. Once a newer regular close lands in the stored quote,
+// every slot saved at or before that close is stale: its price and
+// its percent both reference the previous close, and pairing it with
+// the new close corrupts the live estimate (2026-11-12 incident: at
+// the start of the Nov 11 post session the board still held Nov 10's
+// post slots — post_as_of 2026-11-11T00:49Z against the Nov 11 close
+// — and priced the estimate $1,087.25 / −2.23% below the official
+// total while actual after-hours prices sat at the close). A slot
+// therefore counts only when its as_of is LATER than the close
+// instant of the regular quote it would be paired with; at or
+// before that instant it is treated as absent, per holding, so the
+// holding falls back to its close price with no extended badge or
+// detail line — the same degradation as a missing slot. The gate
+// lives here, in the one place loadPortfolio assembles the effective
+// ext_* view, so the estimate, the row badges and the detail line
+// all share it; the overnight chain inherits it too, because its
+// after-hours fallback is the post slot checked the same way.
+
+// Parse a stored timestamp to epoch ms. Stored stamps are UTC ISO
+// strings, except Nasdaq-sourced regular quotes whose as_of is the
+// feed's prose stamp ("Closed at Nov 11, 2026 4:00 PM ET") — that
+// shape goes through parseNasdaqStamp (ET wall clock → UTC) first,
+// because Date.parse would read it in the server's local zone.
+function parseStampMs(value: string | null): number | null {
+  if (!value) return null;
+  const nasdaq = parseNasdaqStamp(value);
+  if (nasdaq) {
+    const t = Date.parse(nasdaq);
+    return Number.isNaN(t) ? null : t;
+  }
+  const t = Date.parse(value);
+  return Number.isNaN(t) ? null : t;
+}
+
+function etDateOf(ms: number): { y: number; m: number; d: number } {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date(ms));
+  const g = (t: string) => Number(parts.find((p) => p.type === t)?.value ?? 0);
+  return { y: g("year"), m: g("month"), d: g("day") };
+}
+
+// The close instant (16:00 ET) of the regular quote a slot would be
+// paired with, or null when the stored quote carries no parseable
+// timestamp (no boundary can be established; slots then behave as
+// before rather than being discarded on a guess). Normally that is
+// the close of the stored quote's own ET date — using the 16:00
+// close itself, not the raw as_of, because the finance channel
+// stamps a settled close a few minutes after 16:00 and an early
+// extended trade must not be judged against that lag. During the
+// regular session the stored quote is an intraday print of that
+// same ET date, so the latest SETTLED close is the previous
+// weekday's — without this exception the gate would discard this
+// morning's pre-market slot (saved before the open, measured
+// against that previous close) as soon as the first intraday print
+// landed.
+function extCloseBoundaryMs(
+  s: typeof schema.quoteSnapshots.$inferSelect,
+  sessionKey: string,
+): number | null {
+  const regMs = parseStampMs(s.asOf);
+  if (regMs == null) return null;
+  let { y, m, d } = etDateOf(regMs);
+  if (sessionKey === "regular") {
+    const today = etDateOf(Date.now());
+    if (y === today.y && m === today.m && d === today.d) {
+      // Step back to the most recent weekday (Mon–Fri).
+      do {
+        const prev = new Date(Date.UTC(y, m - 1, d - 1));
+        y = prev.getUTCFullYear();
+        m = prev.getUTCMonth() + 1;
+        d = prev.getUTCDate();
+      } while ([0, 6].includes(new Date(Date.UTC(y, m - 1, d)).getUTCDay()));
+    }
+  }
+  return etWallClockToInstant(y, m, d, 16, 0).getTime();
+}
+
+// A slot (or one of the legacy mirrors) is usable unless it is
+// PROVEN stale: no boundary, or no parseable slot stamp, leaves it
+// as-is; a parseable stamp must be strictly later than the close
+// boundary (a stamp exactly at the close belongs to the close, not
+// to the extended cycle after it).
+function extFresh(asOf: string | null, boundaryMs: number | null): boolean {
+  if (boundaryMs == null) return true;
+  const t = parseStampMs(asOf);
+  if (t == null) return true;
+  return t > boundaryMs;
+}
+
 // The effective extended quote for display: the saved slot of the
 // session the board is opened in (plan B — only that session's saved
 // price shows; the regular session keeps the status quo, where the
 // inline rows are hidden client-side and the detail/estimate keep
-// this morning's pre-market slot). Cross-slot fallbacks mirror the
-// pre-plan-B behavior: pre-market with no pre data yet shows the
-// after-hours last trade, overnight with no Yahoo price shows the
-// after-hours last trade (labeled 夜盘最近可得价 in the detail), and
-// a row whose slots are all empty falls back to the legacy stored
-// ext_* mirror.
+// this morning's pre-market slot). Every candidate — the session
+// slots, their cross-slot fallbacks, and the legacy ext_*/after_*
+// mirrors — passes the staleness gate above, so a slot left over
+// from before the latest regular close never surfaces. Cross-slot
+// fallbacks mirror the pre-plan-B behavior: pre-market with no pre
+// data yet shows the after-hours last trade, overnight with no
+// Yahoo price shows the after-hours last trade (labeled
+// 夜盘最近可得价 in the detail) — in both cases only when that
+// after-hours save is itself fresh against the latest close.
 function effectiveExt(
   s: typeof schema.quoteSnapshots.$inferSelect,
   sessionKey: string,
 ): { price: number; pct: number | null; asOf: string | null; session: ExtSlotName } | null {
+  const boundary = extCloseBoundaryMs(s, sessionKey);
   const pick = (
     slot: ExtSlotName,
   ): { price: number; pct: number | null; asOf: string | null; session: ExtSlotName } | null => {
     const v = slotOf(s, slot);
-    return v.price != null
-      ? { price: v.price, pct: v.pct, asOf: v.asOf, session: slot }
-      : null;
+    if (v.price == null || !extFresh(v.asOf, boundary)) return null;
+    return { price: v.price, pct: v.pct, asOf: v.asOf, session: slot };
   };
   let eff: ReturnType<typeof pick> = null;
   if (sessionKey === "pre") {
@@ -286,7 +386,7 @@ function effectiveExt(
     eff = pick("post") ?? pick("pre");
   }
   if (eff) return eff;
-  if (s.extPrice != null) {
+  if (s.extPrice != null && extFresh(s.extAsOf, boundary)) {
     const sess =
       s.extSession === "pre" || s.extSession === "overnight"
         ? s.extSession
@@ -298,7 +398,7 @@ function effectiveExt(
       session: sess as ExtSlotName,
     };
   }
-  if (s.afterPrice != null) {
+  if (s.afterPrice != null && extFresh(s.afterAsOf, boundary)) {
     return {
       price: s.afterPrice,
       pct: s.afterChangePercent,
@@ -316,6 +416,14 @@ function toHoldingOut(
 ): HoldingOut {
   const s = bySymbol.get(h.quoteSymbol);
   const eff = s ? effectiveExt(s, sessionKey) : null;
+  // The after_* mirror emitted below is the post slot's legacy twin;
+  // it passes the same staleness gate, because the client falls back
+  // to it when ext_* is null — an ungated mirror would resurrect
+  // exactly the stale post price the gate just removed.
+  const afterOk =
+    s != null &&
+    s.afterPrice != null &&
+    extFresh(s.afterAsOf, extCloseBoundaryMs(s, sessionKey));
   return {
     id: h.id,
     account_id: h.accountId,
@@ -338,9 +446,9 @@ function toHoldingOut(
           market_cap: s.marketCap,
           market_status: s.marketStatus,
           as_of: s.asOf,
-          after_price: s.afterPrice,
-          after_change_percent: s.afterChangePercent,
-          after_as_of: s.afterAsOf,
+          after_price: afterOk ? s.afterPrice : null,
+          after_change_percent: afterOk ? s.afterChangePercent : null,
+          after_as_of: afterOk ? s.afterAsOf : null,
           ext_price: eff?.price ?? null,
           ext_change_percent: eff?.pct ?? null,
           ext_as_of: eff?.asOf ?? null,
