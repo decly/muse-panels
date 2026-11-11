@@ -1942,6 +1942,214 @@ async function recordDailySnapshot(
   }
 }
 
+// ---------- Snapshot recalculation after backfilled trades ----------
+//
+// A daily snapshot row is computed once, at the refresh that first
+// records that trading day. When the user afterwards backfills a
+// trade for that day (addHolding / updateHolding / removeHolding /
+// updateCash), the stored row would otherwise stay at its pre-trade
+// values — and the history board's daily sync, which treats this
+// board's snapshots as authoritative, would propagate the stale row
+// over the corrected one. Recalculation closes that gap: it rebuilds
+// one account's snapshot row for one trading day from the CURRENT
+// holdings and cash, priced at that day's regular-session close.
+//
+// Price basis (red line, unchanged): only quote_snapshots.price —
+// the stored regular-session close — is ever used. Extended-hours
+// prices (pre_* / post_* / overnight_* slots, ext_* view, after_*)
+// never enter a snapshot. quote_snapshots holds only the latest
+// close per symbol, so a recalculation is exact while the stored
+// close still belongs to the target day — which is precisely the
+// trigger scope below (the account's LATEST snapshot day, edited
+// shortly after that session). Recalculating an older day after
+// quotes have rolled to a newer close is out of scope by design.
+//
+// Fallback for a missing close: if any current holding has no stored
+// regular price, the recalculation FAILS without writing — the
+// existing snapshot row stays as the fallback record rather than a
+// partial or extended-price figure being invented for the missing
+// symbol. The caller's holdings/cash edit still stands (see
+// tryRecalcLatestSnapshot).
+//
+// Field口径:
+//  - securities = Σ qty × regular close; total P/L = securities −
+//    Σ qty × cost (current costs).
+//  - cash = the account's CURRENT stored cash balance (so a
+//    backfilled trade's updateCash lands in the snapshot); when the
+//    account has no cash row, the snapshot row's own cash is kept.
+//  - account value = securities + cash; CNY = value × the row's
+//    stored fx_rate (kept, never re-fetched here).
+//  - day change = account value − the PREVIOUS trading day's
+//    snapshot total for the same account (and its %); the first
+//    recorded day has no previous row, so its stored day change
+//    (the seed口径) is preserved.
+//  - spx/ndx closes and the row's source label are preserved as
+//    stored: a recalculated "refresh" row stays "refresh", and
+//    source="manual" rows are NEVER recalculated (same
+//    protection as recordDailySnapshot / the history board).
+
+const snapshotRecalcSchema = z.object({
+  status: z.enum([
+    "updated",
+    "skipped_no_snapshot",
+    "skipped_protected",
+    "failed",
+  ]),
+  date: z.string().nullable(),
+  reason: z.string().nullable(),
+  account_value_usd: z.number().nullable(),
+  securities_value_usd: z.number().nullable(),
+  cash_usd: z.number().nullable(),
+  total_pnl_usd: z.number().nullable(),
+  day_change_usd: z.number().nullable(),
+  day_change_pct: z.number().nullable(),
+});
+
+type SnapshotRecalc = z.infer<typeof snapshotRecalcSchema>;
+
+function recalcMiss(
+  status: SnapshotRecalc["status"],
+  date: string | null,
+  reason: string | null,
+): SnapshotRecalc {
+  return {
+    status,
+    date,
+    reason,
+    account_value_usd: null,
+    securities_value_usd: null,
+    cash_usd: null,
+    total_pnl_usd: null,
+    day_change_usd: null,
+    day_change_pct: null,
+  };
+}
+
+async function recalcSnapshotRow(
+  ctx: Ctx,
+  accountId: string,
+  targetDate?: string,
+): Promise<SnapshotRecalc> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db
+    .select()
+    .from(schema.dailySnapshots)
+    .where(eq(schema.dailySnapshots.accountId, accountId));
+  const target = targetDate
+    ? rows.find((r) => r.date === targetDate)
+    : rows
+        .slice()
+        .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0))[0];
+  if (!target) {
+    return recalcMiss(
+      "skipped_no_snapshot",
+      targetDate ?? null,
+      "account has no snapshot row to recalculate",
+    );
+  }
+  if (target.source === "manual") {
+    return recalcMiss(
+      "skipped_protected",
+      target.date,
+      "manual-sourced snapshot rows are never recalculated",
+    );
+  }
+  const holdingRows = await db
+    .select()
+    .from(schema.holdings)
+    .where(eq(schema.holdings.accountId, accountId));
+  const quoteRows = await db.select().from(schema.quoteSnapshots);
+  const bySymbol = new Map(quoteRows.map((q) => [q.quoteSymbol, q]));
+  const missing: string[] = [];
+  let totalMv = 0;
+  let totalCost = 0;
+  for (const h of holdingRows) {
+    const price = bySymbol.get(h.quoteSymbol)?.price ?? null;
+    if (price == null || !(price > 0)) {
+      missing.push(h.symbol);
+      continue;
+    }
+    totalMv += price * h.qty;
+    totalCost += h.costPerShare * h.qty;
+  }
+  if (missing.length > 0) {
+    return recalcMiss(
+      "failed",
+      target.date,
+      `missing_regular_quote:${missing.join(",")}`,
+    );
+  }
+  const cashRows = await db
+    .select()
+    .from(schema.accountBalances)
+    .where(eq(schema.accountBalances.accountId, accountId));
+  const cashUsd = cashRows[0]?.cashUsd ?? target.cashUsd;
+  const accountValue = totalMv + cashUsd;
+  const totalPnl = totalMv - totalCost;
+  const prev = rows
+    .filter((r) => r.date < target.date)
+    .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0))[0];
+  const dayChangeUsd = prev
+    ? accountValue - prev.accountValueUsd
+    : target.dayChangeUsd;
+  const dayChangePct =
+    prev && prev.accountValueUsd > 0 && dayChangeUsd != null
+      ? (dayChangeUsd / prev.accountValueUsd) * 100
+      : prev
+        ? null
+        : target.dayChangePct;
+  const fxRate = target.fxRate;
+  await db
+    .update(schema.dailySnapshots)
+    .set({
+      accountValueUsd: accountValue,
+      securitiesValueUsd: totalMv,
+      cashUsd,
+      totalPnlUsd: totalPnl,
+      dayChangeUsd,
+      dayChangePct,
+      accountValueCny: fxRate != null ? accountValue * fxRate : target.accountValueCny,
+    })
+    .where(
+      and(
+        eq(schema.dailySnapshots.date, target.date),
+        eq(schema.dailySnapshots.accountId, accountId),
+      ),
+    );
+  return {
+    status: "updated",
+    date: target.date,
+    reason: null,
+    account_value_usd: accountValue,
+    securities_value_usd: totalMv,
+    cash_usd: cashUsd,
+    total_pnl_usd: totalPnl,
+    day_change_usd: dayChangeUsd,
+    day_change_pct: dayChangePct,
+  };
+}
+
+// Trigger-path wrapper: a failed recalculation must never roll back
+// or mask the holdings/cash edit that triggered it, so every error
+// is folded into the returned status instead of throwing.
+async function tryRecalcSnapshot(
+  ctx: Ctx,
+  accountId: string,
+  targetDate?: string,
+): Promise<SnapshotRecalc> {
+  try {
+    const result = await recalcSnapshotRow(ctx, accountId, targetDate);
+    if (result.status === "updated") ctx.invalidateQueries();
+    return result;
+  } catch (e) {
+    return recalcMiss(
+      "failed",
+      targetDate ?? null,
+      (e instanceof Error ? e.message : String(e)).slice(0, 200),
+    );
+  }
+}
+
 // ---------- Actions ----------
 
 const refreshResponse = z.object({
@@ -3434,33 +3642,54 @@ export const Actions = {
   }),
 
   updateHolding: defineAction({
-    description: "Updates the quantity and/or cost per share of one holding.",
+    description:
+      "Updates the quantity and/or cost per share of one holding, then recalculates that account's latest daily snapshot from the current holdings at the stored regular close (backfilled-trade convergence; manual-sourced rows are protected and skipped). The edit itself always stands: the recalculation outcome rides along as snapshot_recalc (updated / skipped_no_snapshot / skipped_protected / failed) instead of failing the edit.",
     request: z.object({
       id: z.number().int().positive(),
       qty: z.number().nonnegative(),
       cost_per_share: z.number().nonnegative(),
     }),
-    response: z.object({ ok: z.literal(true) }),
-    handler: async (ctx, args): Promise<{ ok: true }> => {
+    response: z.object({
+      ok: z.literal(true),
+      snapshot_recalc: snapshotRecalcSchema,
+    }),
+    handler: async (
+      ctx,
+      args,
+    ): Promise<{ ok: true; snapshot_recalc: SnapshotRecalc }> => {
       const db = ctx.db<typeof schema>();
+      const before = await db
+        .select({ accountId: schema.holdings.accountId })
+        .from(schema.holdings)
+        .where(eq(schema.holdings.id, args.id));
+      const accountId = before[0]?.accountId;
       await db
         .update(schema.holdings)
         .set({ qty: args.qty, costPerShare: args.cost_per_share })
         .where(eq(schema.holdings.id, args.id));
       ctx.invalidateQueries();
-      return { ok: true as const };
+      const snapshot_recalc = accountId
+        ? await tryRecalcSnapshot(ctx, accountId)
+        : recalcMiss("failed", null, "holding_not_found");
+      return { ok: true as const, snapshot_recalc };
     },
   }),
 
   updateCash: defineAction({
     description:
-      "Updates one account's stored cash balance (USD) from a newer user-provided figure; that account's total value, the global total and its CNY conversion follow from it.",
+      "Updates one account's stored cash balance (USD) from a newer user-provided figure; that account's total value, the global total and its CNY conversion follow from it. Afterwards the account's latest daily snapshot is recalculated so a backfilled trade's cash leg lands in that day's stored row; the outcome rides along as snapshot_recalc and never fails the cash update itself.",
     request: z.object({
       account_id: z.string().min(1).max(40),
       cash_usd: z.number().nonnegative(),
     }),
-    response: z.object({ ok: z.literal(true) }),
-    handler: async (ctx, args): Promise<{ ok: true }> => {
+    response: z.object({
+      ok: z.literal(true),
+      snapshot_recalc: snapshotRecalcSchema,
+    }),
+    handler: async (
+      ctx,
+      args,
+    ): Promise<{ ok: true; snapshot_recalc: SnapshotRecalc }> => {
       const db = ctx.db<typeof schema>();
       await ensureAccounts(ctx);
       const known = await db
@@ -3484,13 +3713,14 @@ export const Actions = {
           set: values,
         });
       ctx.invalidateQueries();
-      return { ok: true as const };
+      const snapshot_recalc = await tryRecalcSnapshot(ctx, args.account_id);
+      return { ok: true as const, snapshot_recalc };
     },
   }),
 
   addHolding: defineAction({
     description:
-      "Adds a new holding row to one account (account_id, symbol, quantity, cost per share, theme). If the symbol already exists in that account, its quantity is added and the cost is re-averaged instead of creating a duplicate row.",
+      "Adds a new holding row to one account (account_id, symbol, quantity, cost per share, theme). If the symbol already exists in that account, its quantity is added and the cost is re-averaged instead of creating a duplicate row. Afterwards the account's latest daily snapshot is recalculated from the updated holdings at the stored regular close (backfilled-trade convergence); the outcome rides along as snapshot_recalc and never fails the add itself (a brand-new symbol with no stored close yet reports failed/missing_regular_quote and the snapshot keeps its prior values until a quote refresh lands).",
     request: z.object({
       account_id: z.string().min(1).max(40),
       symbol: z.string().min(1).max(12),
@@ -3500,8 +3730,14 @@ export const Actions = {
       kind: z.enum(["stock", "etf"]),
       theme: z.string().min(1).max(20),
     }),
-    response: z.object({ id: z.number() }),
-    handler: async (ctx, args): Promise<{ id: number }> => {
+    response: z.object({
+      id: z.number(),
+      snapshot_recalc: snapshotRecalcSchema,
+    }),
+    handler: async (
+      ctx,
+      args,
+    ): Promise<{ id: number; snapshot_recalc: SnapshotRecalc }> => {
       const db = ctx.db<typeof schema>();
       await ensureAccounts(ctx);
       const known = await db
@@ -3536,7 +3772,11 @@ export const Actions = {
           .set({ qty: totalQty, costPerShare: mergedCost })
           .where(eq(schema.holdings.id, existingRow.id));
         ctx.invalidateQueries();
-        return { id: existingRow.id };
+        const snapshot_recalc = await tryRecalcSnapshot(
+          ctx,
+          args.account_id,
+        );
+        return { id: existingRow.id, snapshot_recalc };
       }
       const result = await db
         .insert(schema.holdings)
@@ -3554,19 +3794,84 @@ export const Actions = {
       const inserted = result[0];
       if (!inserted) throw new Error("addHolding: insert returned no rows");
       ctx.invalidateQueries();
-      return { id: inserted.id };
+      const snapshot_recalc = await tryRecalcSnapshot(ctx, args.account_id);
+      return { id: inserted.id, snapshot_recalc };
     },
   }),
 
   removeHolding: defineAction({
-    description: "Removes one holding row by id.",
+    description:
+      "Removes one holding row by id, then recalculates that account's latest daily snapshot from the remaining holdings at the stored regular close (a backfilled full exit lands in that day's stored row). The removal always stands; the recalculation outcome rides along as snapshot_recalc.",
     request: z.object({ id: z.number().int().positive() }),
-    response: z.object({ ok: z.literal(true) }),
-    handler: async (ctx, args): Promise<{ ok: true }> => {
+    response: z.object({
+      ok: z.literal(true),
+      snapshot_recalc: snapshotRecalcSchema,
+    }),
+    handler: async (
+      ctx,
+      args,
+    ): Promise<{ ok: true; snapshot_recalc: SnapshotRecalc }> => {
       const db = ctx.db<typeof schema>();
+      const before = await db
+        .select({ accountId: schema.holdings.accountId })
+        .from(schema.holdings)
+        .where(eq(schema.holdings.id, args.id));
+      const accountId = before[0]?.accountId;
       await db.delete(schema.holdings).where(eq(schema.holdings.id, args.id));
       ctx.invalidateQueries();
-      return { ok: true as const };
+      const snapshot_recalc = accountId
+        ? await tryRecalcSnapshot(ctx, accountId)
+        : recalcMiss("failed", null, "holding_not_found");
+      return { ok: true as const, snapshot_recalc };
+    },
+  }),
+
+  recalcDailySnapshot: defineAction({
+    description:
+      "Recalculates one account's daily snapshot row from the current holdings and cash at the stored regular-session close (quote_snapshots.price only — extended-hours prices never enter a snapshot). With a date, that trading day's row is the target; without one, the account's latest snapshot row. Screenshot-sourced rows are never overwritten (skipped_protected), an account with no snapshot row reports skipped_no_snapshot, and a holding without a stored regular close reports failed and leaves the row untouched.",
+    request: z.object({
+      account_id: z.string().min(1).max(40),
+      date: z
+        .string()
+        .regex(/^\d{4}-\d{2}-\d{2}$/)
+        .optional(),
+    }),
+    response: snapshotRecalcSchema,
+    handler: async (ctx, args): Promise<SnapshotRecalc> => {
+      return await tryRecalcSnapshot(ctx, args.account_id, args.date);
+    },
+  }),
+
+  recalcLatestSnapshots: defineAction({
+    description:
+      "Recalculates the latest daily snapshot row of every account from its current holdings and cash at the stored regular close — the one-time convergence for backfilled trades recorded after a snapshot was first written (manual rows stay protected). Returns one recalculation result per account; a failed account never blocks the others.",
+    request: z.object({}),
+    response: z.object({
+      results: z.array(
+        z.object({
+          account_id: z.string(),
+          recalc: snapshotRecalcSchema,
+        }),
+      ),
+    }),
+    handler: async (
+      ctx,
+    ): Promise<{
+      results: { account_id: string; recalc: SnapshotRecalc }[];
+    }> => {
+      await ensureAccounts(ctx);
+      const db = ctx.db<typeof schema>();
+      const accountRows = (await db.select().from(schema.accounts)).sort(
+        (a, b) => a.sort - b.sort,
+      );
+      const results: { account_id: string; recalc: SnapshotRecalc }[] = [];
+      for (const a of accountRows) {
+        results.push({
+          account_id: a.id,
+          recalc: await tryRecalcSnapshot(ctx, a.id),
+        });
+      }
+      return { results };
     },
   }),
 } satisfies ActionsModule;
