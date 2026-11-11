@@ -934,6 +934,13 @@ export function App() {
     },
   });
 
+  const refreshExt = useMutation({
+    mutationFn: () => api.refreshExtendedQuotes({}),
+    onSuccess: (res) => {
+      queryClient.setQueryData(["portfolio"], res.portfolio);
+    },
+  });
+
   // Fetch-on-open: refresh when there is no cache or it is stale. The
   // staleness window tightens to 2 minutes while an extended session
   // is live （盘前/盘后/夜盘）, so the realtime extended prices and the
@@ -952,6 +959,35 @@ export function App() {
     if (stale && portfolio.data.holdings.length > 0) {
       autoRefreshed.current = true;
       refresh.mutate();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [portfolio.data]);
+
+  // One-shot extended-slot fill on open (2026-11-12): at the start of
+  // an extended session the saved slot for that session can still be
+  // the previous session's — the server now gates such stale slots
+  // out of the effective ext_* view, so the board would sit on
+  // close-price fallback until the 30-minute background save lands.
+  // When the board opens in an extended session and any priced
+  // holding's effective extended quote is not labeled with the
+  // current session (its slot is missing or was gated out as stale),
+  // pull that session's prices once via refreshExtendedQuotes. Once
+  // per page load — a symbol whose feed yields nothing keeps its
+  // fallback instead of retriggering. Regular/closed sessions never
+  // trigger: there is no current extended slot to fill.
+  const extFillDone = useRef(false);
+  useEffect(() => {
+    if (extFillDone.current || !portfolio.data) return;
+    const sk = portfolio.data.session.key;
+    if (sk !== "pre" && sk !== "post" && sk !== "overnight") return;
+    const needsFill = portfolio.data.holdings.some((h) => {
+      const q = h.quote;
+      if (!q || q.price == null) return false;
+      return q.ext_session !== sk;
+    });
+    if (needsFill) {
+      extFillDone.current = true;
+      refreshExt.mutate();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [portfolio.data]);
