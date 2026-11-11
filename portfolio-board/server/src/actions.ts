@@ -607,7 +607,6 @@ function currentUsSession(at: Date = new Date()): UsSession {
     hh: number,
     mm: number,
   ) => etWallClockToInstant(date.y, date.m, date.d, hh, mm);
-  const today = { y: year, m: month, d: day };
 
   // Resolve the session key and its ET wall-clock window
   // ([startDayOffset, startHh, startMm] → [endDayOffset, endHh, endMm]).
@@ -2168,10 +2167,326 @@ const extendedRefreshResponse = z.object({
   portfolio: portfolioResponse,
 });
 
+// ---------- Trade ledger （交易流水台账） ----------
+//
+// Pure record of the user's trades, per account. The ledger never
+// feeds holdings, quotes, totals or daily snapshots — it exists so
+// backfilled trades can be replayed exactly and realized P/L on sells
+// can be computed. Entries arrive from order fill records (source
+// "order"), whole-account snapshot diffs (source "snapshot_diff"),
+// the opening initialization (source "opening": side "buy" at the
+// broker cost price first recorded) or manual entry ("manual").
+
+const tradeSide = z.enum(["buy", "sell"]);
+const tradePriceKind = z.enum(["actual", "estimated", "none"]);
+const tradeSource = z.enum(["order", "snapshot_diff", "opening", "manual"]);
+
+const tradeRowResponse = z.object({
+  id: z.number(),
+  account_id: z.string(),
+  account_name: z.string(),
+  // Trade date, YYYY-MM-DD.
+  date: z.string(),
+  symbol: z.string(),
+  side: tradeSide,
+  qty: z.number(),
+  price: z.number().nullable(),
+  price_kind: tradePriceKind,
+  source: tradeSource,
+  note: z.string().nullable(),
+  created_at: z.string(),
+  updated_at: z.string(),
+});
+
+type TradeRowResponse = z.infer<typeof tradeRowResponse>;
+
+const realizedSymbolSchema = z.object({
+  symbol: z.string(),
+  // Null when the symbol's realized P/L is unknown (a sell price was
+  // unknown, or the cost basis at that point was unknown) — unknown
+  // is reported as unknown, never as 0.
+  realized_usd: z.number().nullable(),
+  // True when at least one valued sell used an estimated price.
+  has_estimated: z.boolean(),
+});
+
+const realizedSummarySchema = z.object({
+  // Sum over the valued symbols. Null when any symbol's realized
+  // P/L is unknown (has_unknown); with no sells at all it is 0.
+  total_usd: z.number().nullable(),
+  has_estimated: z.boolean(),
+  has_unknown: z.boolean(),
+  by_symbol: z.array(realizedSymbolSchema),
+});
+
+const realizedAccountSchema = realizedSummarySchema.extend({
+  account_id: z.string(),
+});
+
+type RealizedSummary = z.infer<typeof realizedSummarySchema>;
+
+const tradesResponse = z.object({
+  trades: z.array(tradeRowResponse),
+  realized: z.object({
+    global: realizedSummarySchema,
+    accounts: z.array(realizedAccountSchema),
+  }),
+});
+
+type TradesResponse = z.infer<typeof tradesResponse>;
+
+const tradeOkResponse = z.object({ ok: z.literal(true) });
+
+// price / price_kind consistency: an empty price is only consistent
+// with price_kind "none"; a present price must be "actual" or
+// "estimated" (defaulting to "actual" when the caller omits it).
+function normalizeTradePrice(
+  action: string,
+  price: number | null | undefined,
+  priceKind: "actual" | "estimated" | "none" | undefined,
+): { price: number | null; priceKind: "actual" | "estimated" | "none" } {
+  if (price == null) {
+    if (priceKind != null && priceKind !== "none") {
+      throw new Error(
+        `${action}: price_kind must be "none" when price is empty`,
+      );
+    }
+    return { price: null, priceKind: "none" };
+  }
+  const kind = priceKind ?? "actual";
+  if (kind === "none") {
+    throw new Error(
+      `${action}: price_kind "none" requires an empty price`,
+    );
+  }
+  return { price, priceKind: kind };
+}
+
+function assertTradeDate(action: string, date: string): void {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(date);
+  if (!m) {
+    throw new Error(`${action}: date must be YYYY-MM-DD, got "${date}"`);
+  }
+  const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+  if (
+    d.getUTCFullYear() !== Number(m[1]) ||
+    d.getUTCMonth() !== Number(m[2]) - 1 ||
+    d.getUTCDate() !== Number(m[3])
+  ) {
+    throw new Error(`${action}: date "${date}" is not a real calendar date`);
+  }
+}
+
+async function requireTradeAccount(ctx: Ctx, accountId: string): Promise<void> {
+  await ensureAccounts(ctx);
+  const db = ctx.db<typeof schema>();
+  const known = await db
+    .select({ id: schema.accounts.id })
+    .from(schema.accounts)
+    .where(eq(schema.accounts.id, accountId));
+  if (known.length === 0) {
+    throw new Error(`unknown account "${accountId}"`);
+  }
+}
+
+function toTradeRow(
+  t: typeof schema.trades.$inferSelect,
+  accountName: string,
+): TradeRowResponse {
+  return {
+    id: t.id,
+    account_id: t.accountId,
+    account_name: accountName,
+    date: t.date,
+    symbol: t.symbol,
+    side: t.side,
+    qty: t.qty,
+    price: t.price,
+    price_kind: t.priceKind,
+    source: t.source,
+    note: t.note,
+    created_at: t.createdAt.toISOString(),
+    updated_at: t.updatedAt.toISOString(),
+  };
+}
+
+// Realized P/L replay for one (account, symbol) position, entries in
+// ascending date order: buys/opening entries fold into a weighted
+// average cost; a sell realizes qty × (sell price − average cost at
+// that moment). A sell whose price is unknown (price_kind "none") or
+// whose cost basis is unknown at that point (an earlier buy carried
+// no price, or the sell exceeds the recorded position) makes the
+// symbol's realized P/L unknown (null) rather than 0; a sell valued
+// with an estimated price counts but flags has_estimated.
+type RealizedAcc = {
+  qty: number;
+  costSum: number;
+  costKnown: boolean;
+  realized: number;
+  unknown: boolean;
+  hasEstimated: boolean;
+  hasSell: boolean;
+};
+
+function replayRealized(
+  entries: (typeof schema.trades.$inferSelect)[],
+): RealizedAcc {
+  const acc: RealizedAcc = {
+    qty: 0,
+    costSum: 0,
+    costKnown: true,
+    realized: 0,
+    unknown: false,
+    hasEstimated: false,
+    hasSell: false,
+  };
+  const EPS = 1e-9;
+  for (const t of entries) {
+    if (t.side === "buy") {
+      if (t.price == null) {
+        // Shares acquired at an unknown price: any existing known
+        // cost can no longer describe the blended position.
+        if (acc.qty + t.qty > EPS) acc.costKnown = false;
+      } else if (acc.costKnown) {
+        acc.costSum += t.qty * t.price;
+      } else if (acc.qty <= EPS) {
+        acc.costSum = t.qty * t.price;
+        acc.costKnown = true;
+      }
+      // (cost unknown + shares held + priced buy: stays unknown)
+      acc.qty += t.qty;
+      continue;
+    }
+    // sell
+    acc.hasSell = true;
+    const covered = Math.min(t.qty, Math.max(acc.qty, 0));
+    if (t.price == null || !acc.costKnown || covered < t.qty - EPS) {
+      acc.unknown = true;
+    } else if (covered > EPS) {
+      const avgCost = acc.costSum / acc.qty;
+      acc.realized += covered * (t.price - avgCost);
+      if (t.priceKind === "estimated") acc.hasEstimated = true;
+    }
+    if (acc.qty > EPS && covered > 0) {
+      const avgCost = acc.costSum / acc.qty;
+      acc.costSum -= avgCost * covered;
+      acc.qty -= covered;
+      if (acc.qty <= EPS) {
+        acc.qty = 0;
+        acc.costSum = 0;
+        acc.costKnown = true;
+      }
+    } else if (covered > 0) {
+      acc.qty = Math.max(0, acc.qty - covered);
+    }
+  }
+  return acc;
+}
+
+function summarizeRealized(
+  accs: Map<string, RealizedAcc>,
+): RealizedSummary {
+  const by_symbol: RealizedSummary["by_symbol"] = [];
+  let total = 0;
+  let hasUnknown = false;
+  let hasEstimated = false;
+  for (const symbol of [...accs.keys()].sort(cmpStr)) {
+    const acc = accs.get(symbol);
+    if (!acc || !acc.hasSell) continue;
+    by_symbol.push({
+      symbol,
+      realized_usd: acc.unknown ? null : acc.realized,
+      has_estimated: acc.hasEstimated,
+    });
+    if (acc.unknown) hasUnknown = true;
+    else total += acc.realized;
+    if (acc.hasEstimated) hasEstimated = true;
+  }
+  return {
+    total_usd: hasUnknown ? null : total,
+    has_estimated: hasEstimated,
+    has_unknown: hasUnknown,
+    by_symbol,
+  };
+}
+
+// Loads every trade, returns the list (newest first, optionally
+// filtered to one account) plus realized-P/L summaries computed by
+// replaying each (account, symbol) position in date order — one
+// summary per account and one merged global summary.
+async function loadTrades(
+  ctx: Ctx,
+  accountId?: string,
+): Promise<TradesResponse> {
+  const db = ctx.db<typeof schema>();
+  await ensureAccounts(ctx);
+  const [rows, accountRows] = await Promise.all([
+    db.select().from(schema.trades),
+    db.select().from(schema.accounts),
+  ]);
+  const nameById = new Map(accountRows.map((a) => [a.id, a.name]));
+  const ascending = [...rows].sort(
+    (x, y) => cmpStr(x.date, y.date) || x.id - y.id,
+  );
+  // Replay per (account, symbol).
+  const perAccount = new Map<string, Map<string, RealizedAcc>>();
+  const grouped = new Map<string, (typeof rows)[number][]>();
+  for (const t of ascending) {
+    const key = `${t.accountId} ${t.symbol}`;
+    const list = grouped.get(key);
+    if (list) list.push(t);
+    else grouped.set(key, [t]);
+  }
+  for (const [key, entries] of grouped) {
+    const sep = key.indexOf(" ");
+    const accId = key.slice(0, sep);
+    const symbol = key.slice(sep + 1);
+    let bySymbol = perAccount.get(accId);
+    if (!bySymbol) {
+      bySymbol = new Map();
+      perAccount.set(accId, bySymbol);
+    }
+    bySymbol.set(symbol, replayRealized(entries));
+  }
+  // Global summary merges the per-account accumulators by symbol.
+  const globalAccs = new Map<string, RealizedAcc>();
+  for (const bySymbol of perAccount.values()) {
+    for (const [symbol, acc] of bySymbol) {
+      const g = globalAccs.get(symbol);
+      if (!g) {
+        globalAccs.set(symbol, { ...acc });
+      } else {
+        g.hasSell = g.hasSell || acc.hasSell;
+        g.realized += acc.realized;
+        g.unknown = g.unknown || acc.unknown;
+        g.hasEstimated = g.hasEstimated || acc.hasEstimated;
+      }
+    }
+  }
+  const accountsSummary = accountRows
+    .map((a) => a.id)
+    .sort(cmpStr)
+    .map((id) => ({
+      account_id: id,
+      ...summarizeRealized(perAccount.get(id) ?? new Map()),
+    }));
+  const list = rows
+    .filter((t) => !accountId || t.accountId === accountId)
+    .sort((x, y) => cmpStr(y.date, x.date) || y.id - x.id)
+    .map((t) => toTradeRow(t, nameById.get(t.accountId) ?? t.accountId));
+  return {
+    trades: list,
+    realized: {
+      global: summarizeRealized(globalAccs),
+      accounts: accountsSummary,
+    },
+  };
+}
+
 // ---------- Personal-data export / import (stateless data actions) ----------
 //
-// The user's own data is exactly four tables: accounts, holdings,
-// account_balances, daily_snapshots. The three market caches
+// The user's own data is exactly five tables: accounts, holdings,
+// account_balances, daily_snapshots, trades. The three market caches
 // (quote_snapshots, market_snapshots, fx_snapshots) are NEVER part of
 // an export — every value in them can be re-fetched from market
 // sources. The fx_rate / spx_price / ndx_price values stored INSIDE a
@@ -2183,7 +2498,10 @@ const extendedRefreshResponse = z.object({
 // Format history: v1 was {board: "portfolio", tables: name -> rows[]}.
 // v2 (current export) is a self-describing dataset envelope:
 // {panel: "portfolio-board", tables: name -> {primary_key, rows}}.
-// Import accepts both; see the v2 notes below.
+// Import accepts both; see the v2 notes below. The trades table
+// joined the personal set in 2026-11; backups written before that
+// (v1 files, and v2 files whose tables carry only the original four)
+// must keep importing — see the checksum note at v2Checksum.
 
 const personalAccountRow = z.object({
   id: z.string(),
@@ -2226,6 +2544,23 @@ const personalSnapshotRow = z.object({
   source: z.string(),
 });
 
+const personalTradeRow = z.object({
+  id: z.number(),
+  account_id: z.string(),
+  date: z.string(),
+  symbol: z.string(),
+  side: tradeSide,
+  qty: z.number(),
+  price: z.number().nullable(),
+  price_kind: tradePriceKind,
+  source: tradeSource,
+  note: z.string().nullable(),
+  // ISO timestamps of the stored row, mirroring the account_balances
+  // updated_at precedent.
+  created_at: z.string(),
+  updated_at: z.string(),
+});
+
 const personalTables = z.object({
   accounts: z.array(personalAccountRow),
   holdings: z.array(personalHoldingRow),
@@ -2233,7 +2568,16 @@ const personalTables = z.object({
   daily_snapshots: z.array(personalSnapshotRow),
 });
 
-type PersonalTables = z.infer<typeof personalTables>;
+// The four original tables are always present; `trades` is present
+// only when the payload (or a fresh export) carries the trades table.
+// Pre-ledger backups (v1 files, and v2 files with only the four
+// tables) normalize to trades === undefined, which keeps their
+// canonical form — and therefore their checksum — byte-identical to
+// what the pre-ledger exporter produced, and tells the importer to
+// leave the live trades table completely untouched.
+type PersonalTables = z.infer<typeof personalTables> & {
+  trades?: z.infer<typeof personalTradeRow>[];
+};
 
 // --- v2 self-describing dataset envelope (industry-standard shape) ---
 // Each table carries its own primary_key declaration alongside its
@@ -2249,9 +2593,23 @@ const TABLE_PRIMARY_KEYS = {
   holdings: ["account_id", "symbol"],
   account_balances: ["account_id"],
   daily_snapshots: ["date", "account_id"],
+  trades: ["id"],
 } as const;
 
+// Tables a v2 payload may carry. "trades" is known but OPTIONAL: a
+// v2 file written before the trade ledger existed carries only the
+// original four and is still a valid, importable backup.
 const KNOWN_TABLE_NAMES: readonly string[] = [
+  "accounts",
+  "holdings",
+  "account_balances",
+  "daily_snapshots",
+  "trades",
+];
+
+// In a v1 payload the trades table does not exist as a concept; a
+// stray "trades" key there counts as an unknown table.
+const KNOWN_TABLE_NAMES_V1: readonly string[] = [
   "accounts",
   "holdings",
   "account_balances",
@@ -2265,14 +2623,29 @@ function tableEnvelope<Row extends z.ZodType>(row: Row) {
   });
 }
 
+// Export envelope: always carries all five tables (trades included,
+// possibly empty).
 const personalTablesV2 = z.looseObject({
   accounts: tableEnvelope(personalAccountRow),
   holdings: tableEnvelope(personalHoldingRow),
   account_balances: tableEnvelope(personalBalanceRow),
   daily_snapshots: tableEnvelope(personalSnapshotRow),
+  trades: tableEnvelope(personalTradeRow),
 });
 
 type PersonalTablesV2 = z.infer<typeof personalTablesV2>;
+
+// Import envelope: identical, except trades is optional so pre-ledger
+// v2 backups still validate.
+const personalTablesV2Import = z.looseObject({
+  accounts: tableEnvelope(personalAccountRow),
+  holdings: tableEnvelope(personalHoldingRow),
+  account_balances: tableEnvelope(personalBalanceRow),
+  daily_snapshots: tableEnvelope(personalSnapshotRow),
+  trades: tableEnvelope(personalTradeRow).optional(),
+});
+
+type PersonalTablesV2Import = z.infer<typeof personalTablesV2Import>;
 
 // v1 file shape: tables map table name -> bare row array, panel
 // identified by `board: "portfolio"`. Still accepted on import and
@@ -2299,7 +2672,7 @@ const personalDataFileV2 = z.looseObject({
   panel: z.literal("portfolio-board"),
   exported_at: z.string().optional(),
   checksum: z.string().optional(),
-  tables: personalTablesV2,
+  tables: personalTablesV2Import,
 });
 
 // Union of every format version this importer understands. A version
@@ -2355,17 +2728,19 @@ function contentChecksum(text: string): string {
 const cmpStr = (a: string, b: string): number =>
   a < b ? -1 : a > b ? 1 : 0;
 
-// Reads the four personal tables and serializes them canonically:
+// Reads the five personal tables and serializes them canonically:
 // rows sorted by natural key, fields in a fixed order, so the same
 // database state always produces the same payload (and checksum).
+// Exports always carry trades (possibly an empty array).
 async function buildPersonalTables(ctx: Ctx): Promise<PersonalTables> {
   const db = ctx.db<typeof schema>();
-  const [accountRows, holdingRows, balanceRows, snapshotRows] =
+  const [accountRows, holdingRows, balanceRows, snapshotRows, tradeRows] =
     await Promise.all([
       db.select().from(schema.accounts),
       db.select().from(schema.holdings),
       db.select().from(schema.accountBalances),
       db.select().from(schema.dailySnapshots),
+      db.select().from(schema.trades),
     ]);
   const accounts = accountRows
     .map((a) => ({ id: a.id, name: a.name, sort: a.sort }))
@@ -2412,7 +2787,23 @@ async function buildPersonalTables(ctx: Ctx): Promise<PersonalTables> {
     .sort(
       (x, y) => cmpStr(x.date, y.date) || cmpStr(x.account_id, y.account_id),
     );
-  return { accounts, holdings, account_balances, daily_snapshots };
+  const trades = tradeRows
+    .map((t) => ({
+      id: t.id,
+      account_id: t.accountId,
+      date: t.date,
+      symbol: t.symbol,
+      side: t.side,
+      qty: t.qty,
+      price: t.price,
+      price_kind: t.priceKind,
+      source: t.source,
+      note: t.note,
+      created_at: t.createdAt.toISOString(),
+      updated_at: t.updatedAt.toISOString(),
+    }))
+    .sort((x, y) => x.id - y.id);
+  return { accounts, holdings, account_balances, daily_snapshots, trades };
 }
 
 // Canonical form of a tables payload: rows rebuilt with the fixed
@@ -2420,9 +2811,12 @@ async function buildPersonalTables(ctx: Ctx): Promise<PersonalTables> {
 // flavors are computed over canonical forms, so key order / row order
 // differences in a hand-carried file never cause a false mismatch,
 // and unknown fields/tables (already stripped or ignored before this
-// point) never enter the checksum.
+// point) never enter the checksum. The trades key is carried ONLY
+// when the payload carries the trades table: a pre-ledger payload
+// canonicalizes to exactly its historical four-table form, so its
+// checksum still verifies (see v2Checksum).
 function canonicalizeTables(t: PersonalTables): PersonalTables {
-  return {
+  const base: PersonalTables = {
     accounts: t.accounts
       .map((a) => ({ id: a.id, name: a.name, sort: a.sort }))
       .sort((x, y) => x.sort - y.sort || cmpStr(x.id, y.id)),
@@ -2469,11 +2863,59 @@ function canonicalizeTables(t: PersonalTables): PersonalTables {
         (x, y) => cmpStr(x.date, y.date) || cmpStr(x.account_id, y.account_id),
       ),
   };
+  if (t.trades) {
+    base.trades = t.trades
+      .map((r) => ({
+        id: r.id,
+        account_id: r.account_id,
+        date: r.date,
+        symbol: r.symbol,
+        side: r.side,
+        qty: r.qty,
+        price: r.price,
+        price_kind: r.price_kind,
+        source: r.source,
+        note: r.note,
+        created_at: r.created_at,
+        updated_at: r.updated_at,
+      }))
+      .sort((x, y) => x.id - y.id);
+  }
+  return base;
 }
 
 // Wraps canonical tables in the v2 envelope: every table declares its
-// own primary_key next to its rows.
+// own primary_key next to its rows. Exports always include trades.
 function buildTablesEnvelope(t: PersonalTables): PersonalTablesV2 {
+  const c = canonicalizeTables(t);
+  return {
+    accounts: {
+      primary_key: [...TABLE_PRIMARY_KEYS.accounts],
+      rows: c.accounts,
+    },
+    holdings: {
+      primary_key: [...TABLE_PRIMARY_KEYS.holdings],
+      rows: c.holdings,
+    },
+    account_balances: {
+      primary_key: [...TABLE_PRIMARY_KEYS.account_balances],
+      rows: c.account_balances,
+    },
+    daily_snapshots: {
+      primary_key: [...TABLE_PRIMARY_KEYS.daily_snapshots],
+      rows: c.daily_snapshots,
+    },
+    trades: {
+      primary_key: [...TABLE_PRIMARY_KEYS.trades],
+      rows: c.trades ?? [],
+    },
+  };
+}
+
+// The pre-ledger four-table envelope, byte-identical to what the
+// exporter produced before trades existed. Used ONLY to verify (and
+// conceptually reproduce) the checksums of old v2 backups.
+function buildLegacyTablesEnvelope(t: PersonalTables) {
   const c = canonicalizeTables(t);
   return {
     accounts: {
@@ -2499,8 +2941,17 @@ function v1Checksum(t: PersonalTables): string {
   return contentChecksum(JSON.stringify(canonicalizeTables(t)));
 }
 
+// The checksum follows the table set the payload actually carries:
+// a payload WITH trades checks against the five-table canonical
+// envelope; a pre-ledger payload (no trades) checks against the
+// legacy four-table envelope, so backups written before the trade
+// ledger existed still verify and import.
 function v2Checksum(t: PersonalTables): string {
-  return contentChecksum(JSON.stringify(buildTablesEnvelope(t)));
+  return contentChecksum(
+    JSON.stringify(
+      t.trades ? buildTablesEnvelope(t) : buildLegacyTablesEnvelope(t),
+    ),
+  );
 }
 
 // Normalizes an accepted v1 or v2 payload to the internal tables
@@ -2514,10 +2965,14 @@ function normalizePersonalImport(data: z.infer<typeof personalDataFile>): {
   version: 1 | 2;
 } {
   const rawTables = data.tables as unknown as Record<string, unknown>;
+  const knownNames =
+    data.version === 1 ? KNOWN_TABLE_NAMES_V1 : KNOWN_TABLE_NAMES;
   const ignoredTables = Object.keys(rawTables)
-    .filter((k) => !KNOWN_TABLE_NAMES.includes(k))
+    .filter((k) => !knownNames.includes(k))
     .sort(cmpStr);
   if (data.version === 1) {
+    // v1 predates the trade ledger: trades is "missing" by definition
+    // and the live trades table is left untouched by the import.
     const t = data.tables as unknown as PersonalTables;
     return {
       tables: {
@@ -2530,14 +2985,21 @@ function normalizePersonalImport(data: z.infer<typeof personalDataFile>): {
       version: 1,
     };
   }
-  const t = data.tables as unknown as PersonalTablesV2;
+  const t = data.tables as unknown as PersonalTablesV2Import;
+  const tables: PersonalTables = {
+    accounts: t.accounts.rows,
+    holdings: t.holdings.rows,
+    account_balances: t.account_balances.rows,
+    daily_snapshots: t.daily_snapshots.rows,
+  };
+  // A pre-ledger v2 file has no trades key at all: keep trades
+  // undefined (missing) so its checksum verifies against the legacy
+  // four-table form and the import never touches the live trades.
+  if (t.trades) {
+    tables.trades = t.trades.rows;
+  }
   return {
-    tables: {
-      accounts: t.accounts.rows,
-      holdings: t.holdings.rows,
-      account_balances: t.account_balances.rows,
-      daily_snapshots: t.daily_snapshots.rows,
-    },
+    tables,
     ignoredTables,
     version: 2,
   };
@@ -2598,6 +3060,20 @@ function validatePersonalTables(t: PersonalTables): void {
       );
     }
   }
+  if (t.trades) {
+    const tradeIds = new Set<number>();
+    for (const r of t.trades) {
+      if (tradeIds.has(r.id)) {
+        throw new Error(`importPersonalData: duplicate trade id ${r.id}`);
+      }
+      tradeIds.add(r.id);
+      if (!accountIds.has(r.account_id)) {
+        throw new Error(
+          `importPersonalData: trade ${r.id} references unknown account "${r.account_id}"`,
+        );
+      }
+    }
+  }
 }
 
 function parseStoredTimestamp(value: string | null): Date {
@@ -2625,6 +3101,7 @@ const personalImportResponse = z.object({
     holdings: tableCountSchema,
     account_balances: tableCountSchema,
     daily_snapshots: tableCountSchema,
+    trades: tableCountSchema,
   }),
 });
 
@@ -2639,9 +3116,159 @@ export const Actions = {
     handler: async (ctx): Promise<PortfolioResponse> => loadPortfolio(ctx),
   }),
 
+  getTrades: defineAction({
+    description:
+      "Returns the trade ledger （交易流水）: every recorded trade (optionally filtered to one account_id), newest first (date desc, id desc), each row carrying its account name. Also returns realized-P/L summaries computed by replaying each (account, symbol) position in date order — buys/opening entries fold into a weighted-average cost, a sell realizes qty × (sell price − average cost at that moment); a sell valued with an estimated price counts but flags has_estimated, and a sell with an unknown price or an unknown cost basis makes that symbol's realized P/L null (unknown, never 0) and the containing total null with has_unknown set. Summaries are provided globally and per account. The ledger is a pure record: nothing here touches holdings, quotes, totals or daily snapshots.",
+    request: z.object({
+      account_id: z.string().min(1).max(40).optional(),
+    }),
+    response: tradesResponse,
+    handler: async (ctx, args): Promise<TradesResponse> =>
+      loadTrades(ctx, args.account_id),
+  }),
+
+  addTrade: defineAction({
+    description:
+      "Adds one entry to the trade ledger for an account: trade date (YYYY-MM-DD), symbol, side (buy/sell), quantity (positive, fractional shares allowed), execution price (nullable — when empty, price_kind must be \"none\"; when present, price_kind is \"actual\" or \"estimated\", defaulting to \"actual\"), source (order = order fill record, snapshot_diff = whole-account snapshot diff, opening = opening initialization at the broker cost price, manual), and an optional note. Pure record: it never changes holdings, cash, quotes or snapshots.",
+    request: z.object({
+      account_id: z.string().min(1).max(40),
+      date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+      symbol: z.string().min(1).max(12),
+      side: tradeSide,
+      qty: z.number().positive(),
+      price: z.number().positive().nullable().optional(),
+      price_kind: tradePriceKind.optional(),
+      source: tradeSource,
+      note: z.string().max(500).nullable().optional(),
+    }),
+    response: tradeRowResponse,
+    handler: async (ctx, args): Promise<TradeRowResponse> => {
+      await requireTradeAccount(ctx, args.account_id);
+      assertTradeDate("addTrade", args.date);
+      const { price, priceKind } = normalizeTradePrice(
+        "addTrade",
+        args.price,
+        args.price_kind,
+      );
+      const db = ctx.db<typeof schema>();
+      const now = new Date();
+      const inserted = await db
+        .insert(schema.trades)
+        .values({
+          accountId: args.account_id,
+          date: args.date,
+          symbol: args.symbol.trim().toUpperCase(),
+          side: args.side,
+          qty: args.qty,
+          price,
+          priceKind,
+          source: args.source,
+          note: args.note?.trim() ? args.note.trim() : null,
+          createdAt: now,
+          updatedAt: now,
+        })
+        .returning();
+      const row = inserted[0];
+      if (!row) throw new Error("addTrade: insert returned no rows");
+      ctx.invalidateQueries();
+      const accounts = await db
+        .select({ name: schema.accounts.name })
+        .from(schema.accounts)
+        .where(eq(schema.accounts.id, args.account_id));
+      return toTradeRow(row, accounts[0]?.name ?? args.account_id);
+    },
+  }),
+
+  updateTrade: defineAction({
+    description:
+      "Partially updates one trade-ledger entry by id (any subset of date, symbol, side, qty, price, price_kind, source, note; price may be set to null to mark the execution price unknown). The merged entry must keep price and price_kind consistent (empty price ⇔ price_kind \"none\"). Pure record: holdings, cash, quotes and snapshots are never touched.",
+    request: z.object({
+      id: z.number().int().positive(),
+      date: z
+        .string()
+        .regex(/^\d{4}-\d{2}-\d{2}$/)
+        .optional(),
+      symbol: z.string().min(1).max(12).optional(),
+      side: tradeSide.optional(),
+      qty: z.number().positive().optional(),
+      price: z.number().positive().nullable().optional(),
+      price_kind: tradePriceKind.optional(),
+      source: tradeSource.optional(),
+      note: z.string().max(500).nullable().optional(),
+    }),
+    response: tradeRowResponse,
+    handler: async (ctx, args): Promise<TradeRowResponse> => {
+      const db = ctx.db<typeof schema>();
+      const existing = await db
+        .select()
+        .from(schema.trades)
+        .where(eq(schema.trades.id, args.id));
+      const row = existing[0];
+      if (!row) throw new Error(`updateTrade: no trade with id ${args.id}`);
+      if (args.date !== undefined) assertTradeDate("updateTrade", args.date);
+      // Consistency is judged on the merged entry: e.g. setting only
+      // price_kind "none" while a price stands is rejected, as is
+      // clearing the price while a priced kind stands.
+      const mergedPrice =
+        args.price !== undefined ? args.price : row.price;
+      const mergedKind =
+        args.price_kind !== undefined ? args.price_kind : row.priceKind;
+      const { price, priceKind } = normalizeTradePrice(
+        "updateTrade",
+        mergedPrice,
+        mergedKind,
+      );
+      const updated = await db
+        .update(schema.trades)
+        .set({
+          date: args.date ?? row.date,
+          symbol: args.symbol
+            ? args.symbol.trim().toUpperCase()
+            : row.symbol,
+          side: args.side ?? row.side,
+          qty: args.qty ?? row.qty,
+          price,
+          priceKind,
+          source: args.source ?? row.source,
+          note:
+            args.note !== undefined
+              ? args.note?.trim()
+                ? args.note.trim()
+                : null
+              : row.note,
+          updatedAt: new Date(),
+        })
+        .where(eq(schema.trades.id, args.id))
+        .returning();
+      const out = updated[0];
+      if (!out) throw new Error(`updateTrade: no trade with id ${args.id}`);
+      ctx.invalidateQueries();
+      const accounts = await db
+        .select({ name: schema.accounts.name })
+        .from(schema.accounts)
+        .where(eq(schema.accounts.id, out.accountId));
+      return toTradeRow(out, accounts[0]?.name ?? out.accountId);
+    },
+  }),
+
+  deleteTrade: defineAction({
+    description:
+      "Deletes one trade-ledger entry by id. Pure record removal: holdings, cash, quotes and snapshots are never touched.",
+    request: z.object({ id: z.number().int().positive() }),
+    response: tradeOkResponse,
+    handler: async (ctx, args): Promise<z.infer<typeof tradeOkResponse>> => {
+      const db = ctx.db<typeof schema>();
+      await db
+        .delete(schema.trades)
+        .where(eq(schema.trades.id, args.id));
+      ctx.invalidateQueries();
+      return { ok: true as const };
+    },
+  }),
+
   exportPersonalData: defineAction({
     description:
-      "Exports ONLY the user's personal data as a self-describing dataset envelope ({format: \"muse-personal-data\", version: 2, panel: \"portfolio-board\", exported_at, checksum, tables}): tables maps each of accounts, holdings, account_balances and daily_snapshots to {primary_key, rows} — each table declares its own primary key, rows carry all fields (daily snapshot rows keep their embedded fx_rate/spx_price/ndx_price as part of the personal history record). Market-derived caches (quote_snapshots including the extended-hours slots, market_snapshots, fx_snapshots) are never included. Serialization is deterministic — rows sorted by primary key, fixed field order — and `checksum` covers the canonical tables envelope only (exported_at excluded), so two exports of the same state are byte-identical apart from the timestamp. Read-only; knows nothing about any repository or backup pipeline.",
+      "Exports ONLY the user's personal data as a self-describing dataset envelope ({format: \"muse-personal-data\", version: 2, panel: \"portfolio-board\", exported_at, checksum, tables}): tables maps each of accounts, holdings, account_balances, daily_snapshots and trades to {primary_key, rows} — each table declares its own primary key, rows carry all fields (daily snapshot rows keep their embedded fx_rate/spx_price/ndx_price as part of the personal history record; trade rows carry their created_at/updated_at as ISO strings). The trades table is always present, possibly empty. Market-derived caches (quote_snapshots including the extended-hours slots, market_snapshots, fx_snapshots) are never included. Serialization is deterministic — rows sorted by primary key, fixed field order — and `checksum` covers the canonical tables envelope only (exported_at excluded), so two exports of the same state are byte-identical apart from the timestamp. Read-only; knows nothing about any repository or backup pipeline.",
     request: z.object({}),
     response: personalExportResponse,
     handler: async (ctx): Promise<PersonalExportResponse> => {
@@ -2659,7 +3286,7 @@ export const Actions = {
 
   importPersonalData: defineAction({
     description:
-      "Imports a personal-data payload produced by exportPersonalData back into the four personal tables — and nothing else; the market caches are never touched. Accepts BOTH the v2 envelope (version 2, panel \"portfolio-board\", tables as {primary_key, rows}) and the legacy v1 shape (version 1, board \"portfolio\", tables as bare row arrays, normalized to v2 internally); v1's board identifier and v2's panel identifier name the same panel. Unknown fields are ignored and unknown tables are skipped and reported in `ignored_tables` — neither fails the import. A format mismatch, a version greater than 2, or a payload checksum that does not match the canonical content rejects the whole import with nothing written, as does any validation failure (row shapes, duplicate natural keys, account references). mode \"restore\" replaces all four personal tables with the file's contents (accounts land exactly as the file defines them, overriding any seed/demo accounts) and requires confirm=true. mode \"merge\" upserts by natural key (accounts by id, holdings by (account_id, symbol), balances by account_id, daily_snapshots by (date, account_id)), never deletes rows absent from the file, and never overwrites an existing source=\"manual\" daily snapshot (the same protection recordDailySnapshot applies); restore onto an empty board is not subject to that skip. Returns per-table written/skipped counts plus source_version and ignored_tables.",
+      "Imports a personal-data payload produced by exportPersonalData back into the five personal tables — and nothing else; the market caches are never touched. Accepts BOTH the v2 envelope (version 2, panel \"portfolio-board\", tables as {primary_key, rows}) and the legacy v1 shape (version 1, board \"portfolio\", tables as bare row arrays, normalized to v2 internally); v1's board identifier and v2's panel identifier name the same panel. Backward compatibility is strict: a payload whose tables carry no trades entry — every v1 file, and v2 backups written before the trade ledger existed (whose checksum follows the legacy four-table canonical form) — imports exactly as before and leaves the live trades table completely untouched in BOTH modes (its count reports written 0 / skipped 0 and it never appears in ignored_tables); a payload WITH trades has that table restored wholesale (restore) or upserted by id (merge). Unknown fields are ignored and unknown tables are skipped and reported in `ignored_tables` — neither fails the import. A format mismatch, a version greater than 2, or a payload checksum that does not match the canonical content (computed over the table set the file actually carries) rejects the whole import with nothing written, as does any validation failure (row shapes, duplicate natural keys — including duplicate trade ids, account references). mode \"restore\" replaces the tables the file actually carries with the file's contents (accounts land exactly as the file defines them, overriding any seed/demo accounts) and requires confirm=true. mode \"merge\" upserts by natural key (accounts by id, holdings by (account_id, symbol), balances by account_id, daily_snapshots by (date, account_id), trades by id), never deletes rows absent from the file, and never overwrites an existing source=\"manual\" daily snapshot (the same protection recordDailySnapshot applies); restore onto an empty board is not subject to that skip. Returns per-table written/skipped counts (all five tables) plus source_version and ignored_tables.",
     request: z.object({
       data: personalDataFile,
       mode: z.enum(["restore", "merge"]),
@@ -2727,16 +3354,40 @@ export const Actions = {
         source: s.source,
         createdAt: new Date(),
       }));
+      // Null when the file carries no trades table (v1 files and
+      // pre-ledger v2 backups): both modes then leave the live
+      // trades table completely untouched.
+      const tradeValues = t.trades
+        ? t.trades.map((r) => ({
+            id: r.id,
+            accountId: r.account_id,
+            date: r.date,
+            symbol: r.symbol,
+            side: r.side,
+            qty: r.qty,
+            price: r.price,
+            priceKind: r.price_kind,
+            source: r.source,
+            note: r.note,
+            createdAt: parseStoredTimestamp(r.created_at),
+            updatedAt: parseStoredTimestamp(r.updated_at),
+          }))
+        : null;
 
       if (args.mode === "restore") {
-        // Replace the four personal tables wholesale, atomically:
-        // children first on delete, accounts first on insert.
+        // Replace the personal tables the file actually carries,
+        // atomically: children first on delete, accounts first on
+        // insert. A file without a trades table does not delete or
+        // replace the live trades.
         const statements: Parameters<typeof db.batch>[0][number][] = [
           db.delete(schema.holdings),
           db.delete(schema.accountBalances),
           db.delete(schema.dailySnapshots),
-          db.delete(schema.accounts),
         ];
+        if (tradeValues) {
+          statements.push(db.delete(schema.trades));
+        }
+        statements.push(db.delete(schema.accounts));
         if (accountValues.length > 0) {
           statements.push(db.insert(schema.accounts).values(accountValues));
         }
@@ -2753,6 +3404,9 @@ export const Actions = {
             db.insert(schema.dailySnapshots).values(snapshotValues),
           );
         }
+        if (tradeValues && tradeValues.length > 0) {
+          statements.push(db.insert(schema.trades).values(tradeValues));
+        }
         await db.batch(
           statements as unknown as Parameters<typeof db.batch>[0],
         );
@@ -2767,12 +3421,13 @@ export const Actions = {
             holdings: { written: holdingValues.length, skipped: 0 },
             account_balances: { written: balanceValues.length, skipped: 0 },
             daily_snapshots: { written: snapshotValues.length, skipped: 0 },
+            trades: { written: tradeValues?.length ?? 0, skipped: 0 },
           },
         };
       }
 
       // merge: upsert by natural key; existing rows absent from the
-      // file are kept. Manual-sourced snapshots are protected,
+      // file are kept. Screenshot-sourced snapshots are protected,
       // exactly as in recordDailySnapshot.
       let accountsWritten = 0;
       for (const v of accountValues) {
@@ -2858,8 +3513,37 @@ export const Actions = {
           });
         snapshotsWritten += 1;
       }
+      let tradesWritten = 0;
+      if (tradeValues) {
+        for (const v of tradeValues) {
+          await db
+            .insert(schema.trades)
+            .values(v)
+            .onConflictDoUpdate({
+              target: schema.trades.id,
+              set: {
+                accountId: v.accountId,
+                date: v.date,
+                symbol: v.symbol,
+                side: v.side,
+                qty: v.qty,
+                price: v.price,
+                priceKind: v.priceKind,
+                source: v.source,
+                note: v.note,
+                createdAt: v.createdAt,
+                updatedAt: v.updatedAt,
+              },
+            });
+          tradesWritten += 1;
+        }
+      }
       if (
-        accountsWritten + holdingsWritten + balancesWritten + snapshotsWritten >
+        accountsWritten +
+          holdingsWritten +
+          balancesWritten +
+          snapshotsWritten +
+          tradesWritten >
         0
       ) {
         ctx.invalidateQueries();
@@ -2877,6 +3561,7 @@ export const Actions = {
             written: snapshotsWritten,
             skipped: snapshotsSkipped,
           },
+          trades: { written: tradesWritten, skipped: 0 },
         },
       };
     },

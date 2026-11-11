@@ -71,6 +71,13 @@
       "when": 1794221374078,
       "tag": "0010_per_session_extended_price_slots",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1794396559602,
+      "tag": "0011_add_trades_ledger",
+      "breakpoints": true
     }
   ]
 }

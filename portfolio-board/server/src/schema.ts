@@ -190,3 +190,39 @@ export const accountBalances = sqliteTable("account_balances", {
     .notNull()
     .$defaultFn(() => new Date()),
 });
+
+// Trade ledger (交易流水台账, added 2026-11-11): one row per recorded
+// trade, per account. The ledger is a pure record — it never feeds
+// holdings, quotes, totals or daily snapshots. Entries come from order
+// fill records (source "order", price_kind "actual"), from whole-account
+// snapshot diffs (source "snapshot_diff", price often "estimated"),
+// from the opening initialization (source "opening": side "buy" at the
+// broker cost price first recorded, price_kind "actual", so replaying
+// every entry from an empty position reproduces the current holdings
+// and weighted-average costs), or manual entry (source "manual").
+// price is nullable: price_kind "none" means the execution price is
+// unknown (price must then be null; a non-null price requires kind
+// "actual" or "estimated"). qty is a positive real — fractional shares
+// are supported. date is the trade date, YYYY-MM-DD text.
+export const trades = sqliteTable("trades", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  accountId: text("account_id").notNull().default("broker-a"),
+  date: text("date").notNull(),
+  symbol: text("symbol").notNull(),
+  side: text("side", { enum: ["buy", "sell"] }).notNull(),
+  qty: real("qty").notNull(),
+  price: real("price"),
+  priceKind: text("price_kind", {
+    enum: ["actual", "estimated", "none"],
+  }).notNull(),
+  source: text("source", {
+    enum: ["order", "snapshot_diff", "opening", "manual"],
+  }).notNull(),
+  note: text("note"),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+  updatedAt: integer("updated_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
