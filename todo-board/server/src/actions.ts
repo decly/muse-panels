@@ -13,20 +13,38 @@
 // pending-execution count is zero, so a finished batch's dispatch time
 // never leaks into the next batch.
 //
-// Dates are YYYY-MM-DD strings in Asia/Shanghai (the user's timezone);
-// decision timestamps are "YYYY-MM-DD HH:mm" in the same timezone.
-// Sorting:
-//  - needs_decision: created_at ascending — waiting longest first
-//  - in_progress:    due_date ascending, items without a date last
-//  - done:           completed_at descending — newest first
+// Timestamps are Asia/Shanghai (the user's timezone): created_at /
+// completed_at carry "YYYY-MM-DD HH:MM" (to the minute) when the server
+// stamps them, but plain "YYYY-MM-DD" values are equally valid — legacy
+// rows and date-only backfills from external callers are accepted as-is
+// and treated as 00:00 that day when parsed for sorting. due_date stays
+// a pure node date (YYYY-MM-DD).
+// Sorting (newest first everywhere):
+//  - needs_decision: created_at descending, id descending as tiebreak
+//  - in_progress:    "entered in-progress" time descending — the decision
+//                    timestamp (user_decision.decidedAt) when the user has
+//                    decided, else created_at; id descending as tiebreak.
+//                    due_date no longer participates in ordering.
+//  - done:           completed_at descending — most recently finished first
 
 import { defineAction, z, type ActionsModule, type Ctx } from "@hatch/space-sdk";
-import { and, asc, desc, eq, lt, sql } from "drizzle-orm";
+import { and, desc, eq, lt, sql } from "drizzle-orm";
 import * as schema from "./schema";
 
 const dateString = z
   .string()
   .regex(/^\d{4}-\d{2}-\d{2}$/, "expected YYYY-MM-DD");
+
+/** A date, optionally with a Beijing time to the minute. Both shapes are
+ *  accepted for createdAt / completedAt / cancelledAt / prioritizedAt /
+ *  snoozedAt so legacy date-only rows and external date-only backfills
+ *  keep working; a date-only value reads as 00:00 that day. */
+const dateOrDateTimeString = z
+  .string()
+  .regex(
+    /^\d{4}-\d{2}-\d{2}( \d{2}:\d{2})?$/,
+    "expected YYYY-MM-DD or YYYY-MM-DD HH:MM",
+  );
 
 const statusEnum = z.enum([
   "needs_decision",
@@ -187,6 +205,12 @@ async function readRequestedAt(ctx: Ctx): Promise<string | null> {
   return rows[0]?.value ?? null;
 }
 
+/** Comparable sort key for a "YYYY-MM-DD" or "YYYY-MM-DD HH:MM" value:
+ *  a date-only value counts as 00:00 that day. */
+function datetimeKey(value: string): string {
+  return value.length === 10 ? `${value} 00:00` : value;
+}
+
 /** Today (or today + offsetDays) as YYYY-MM-DD in Asia/Shanghai. */
 function beijingDate(offsetDays = 0): string {
   const now = new Date(Date.now() + offsetDays * 86_400_000);
@@ -277,29 +301,45 @@ async function loadBoard(
       ),
     );
 
-  const decisionRows = await db
+  const decisionRowsRaw = await db
     .select()
     .from(schema.items)
-    .where(eq(schema.items.status, "needs_decision"))
-    .orderBy(asc(schema.items.createdAt), asc(schema.items.id));
+    .where(eq(schema.items.status, "needs_decision"));
+  // Newest first: created_at descending (date-only counts as 00:00),
+  // id descending as the tiebreak.
+  const decisionRows = [...decisionRowsRaw].sort(
+    (a, b) =>
+      datetimeKey(b.createdAt).localeCompare(datetimeKey(a.createdAt)) ||
+      b.id - a.id,
+  );
 
   const progressRows = await db
     .select()
     .from(schema.items)
     .where(eq(schema.items.status, "in_progress"));
-  // Sort in memory: due_date ascending, items without a date last.
-  const inProgress = [...progressRows].sort((a, b) => {
-    if (a.dueDate && b.dueDate) return a.dueDate.localeCompare(b.dueDate);
-    if (a.dueDate) return -1;
-    if (b.dueDate) return 1;
-    return a.createdAt.localeCompare(b.createdAt) || a.id - b.id;
-  });
+  // Newest first by "entered in-progress" time: a decided item entered
+  // when the user decided (user_decision.decidedAt), anything else when
+  // it was created. due_date no longer participates in ordering.
+  const enteredAt = (row: ItemRow): string =>
+    parseDecision(row.userDecision)?.decidedAt ?? row.createdAt;
+  const inProgress = [...progressRows].sort(
+    (a, b) =>
+      datetimeKey(enteredAt(b)).localeCompare(datetimeKey(enteredAt(a))) ||
+      b.id - a.id,
+  );
 
-  const doneRows = await db
+  const doneRowsRaw = await db
     .select()
     .from(schema.items)
-    .where(eq(schema.items.status, "done"))
-    .orderBy(desc(schema.items.completedAt), desc(schema.items.id));
+    .where(eq(schema.items.status, "done"));
+  // Most recently finished first: completed_at descending (date-only
+  // counts as 00:00), id descending as the tiebreak.
+  const doneRows = [...doneRowsRaw].sort(
+    (a, b) =>
+      datetimeKey(b.completedAt ?? "").localeCompare(
+        datetimeKey(a.completedAt ?? ""),
+      ) || b.id - a.id,
+  );
 
   const pendingExecution =
     decisionRows.filter(awaitsExecution).length +
@@ -534,15 +574,15 @@ export const Actions = {
 
   addItem: defineAction({
     description:
-      "新增一条事项到待办总览看板：status 分组（needs_decision 待拍板 / in_progress 进行中 / done 已办）、标题、说明、来源，可选创建日期与拍板选项 options（字符串数组）。写入纪律：status=in_progress 必须带 dueDate（真节点日期或检查日期均可），缺失直接拒绝并返回 due_date_required_for_in_progress。",
+      "新增一条事项到待办总览看板：status 分组（needs_decision 待拍板 / in_progress 进行中 / done 已办）、标题、说明、来源，可选创建时间 createdAt（YYYY-MM-DD 或 YYYY-MM-DD HH:MM，未传时服务端按当前北京时间打戳到分钟）与拍板选项 options（字符串数组）。写入纪律：status=in_progress 必须带 dueDate（真节点日期或检查日期均可），缺失直接拒绝并返回 due_date_required_for_in_progress。",
     request: z.object({
       status: statusEnum,
       title: z.string().min(1).max(200),
       note: z.string().max(500).default(""),
       source: z.string().max(100).default(""),
       dueDate: dateString.nullable().optional(),
-      createdAt: dateString.optional(),
-      completedAt: dateString.nullable().optional(),
+      createdAt: dateOrDateTimeString.optional(),
+      completedAt: dateOrDateTimeString.nullable().optional(),
       options: z.array(z.string().min(1).max(100)).max(6).optional(),
     }),
     response: z.object({
@@ -562,6 +602,10 @@ export const Actions = {
       }
       const db = ctx.db<typeof schema>();
       const today = beijingDate();
+      // Unstamped times are stamped server-side to the minute (Beijing);
+      // an explicitly passed createdAt / completedAt is kept verbatim,
+      // date-only included.
+      const nowMinute = beijingNow();
       const result = await db
         .insert(schema.items)
         .values({
@@ -570,10 +614,10 @@ export const Actions = {
           note: args.note,
           source: args.source,
           dueDate: args.dueDate ?? null,
-          createdAt: args.createdAt ?? today,
+          createdAt: args.createdAt ?? nowMinute,
           completedAt:
             args.status === "done"
-              ? (args.completedAt ?? today)
+              ? (args.completedAt ?? nowMinute)
               : (args.completedAt ?? null),
           options: JSON.stringify(args.options ?? []),
           cancelledAt: args.status === "cancelled" ? today : null,
@@ -779,7 +823,7 @@ export const Actions = {
 
   updateItem: defineAction({
     description:
-      "按 id 修改一条事项的任意字段（含拍板选项 options、用户操作记录 userDecision / prioritizedAt / snoozedAt / cancelledAt、已取消拍板留痕 cancelledDecision（{choice, text, decidedAt, cancelledAt}，可写可清）与执行留痕 executedAt（北京时间 YYYY-MM-DD HH:mm）/ executionResult（一句结果，≤200 字））；可改 status 在分组间移动（转已办时自动记完成日期，转出已办时清除完成日期）。写入纪律：修改后 status=in_progress 时 dueDate 必须非空（真节点日期或检查日期均可），否则拒绝并返回 due_date_required_for_in_progress。",
+      "按 id 修改一条事项的任意字段（含拍板选项 options、用户操作记录 userDecision / prioritizedAt / snoozedAt / cancelledAt、已取消拍板留痕 cancelledDecision（{choice, text, decidedAt, cancelledAt}，可写可清）与执行留痕 executedAt（北京时间 YYYY-MM-DD HH:mm）/ executionResult（一句结果，≤200 字））；可改 status 在分组间移动（转已办时自动记完成时间到分钟，转出已办时清除）。时间类字段（createdAt / completedAt / cancelledAt / prioritizedAt / snoozedAt）接受 YYYY-MM-DD 或 YYYY-MM-DD HH:MM 两种形状。写入纪律：修改后 status=in_progress 时 dueDate 必须非空（真节点日期或检查日期均可），否则拒绝并返回 due_date_required_for_in_progress。",
     request: z.object({
       id: z.number().int().positive(),
       status: statusEnum.optional(),
@@ -787,13 +831,13 @@ export const Actions = {
       note: z.string().max(500).optional(),
       source: z.string().max(100).optional(),
       dueDate: dateString.nullable().optional(),
-      createdAt: dateString.optional(),
-      completedAt: dateString.nullable().optional(),
+      createdAt: dateOrDateTimeString.optional(),
+      completedAt: dateOrDateTimeString.nullable().optional(),
       options: z.array(z.string().min(1).max(100)).max(6).optional(),
       userDecision: userDecisionSchema.nullable().optional(),
-      prioritizedAt: dateString.nullable().optional(),
-      snoozedAt: dateString.nullable().optional(),
-      cancelledAt: dateString.nullable().optional(),
+      prioritizedAt: dateOrDateTimeString.nullable().optional(),
+      snoozedAt: dateOrDateTimeString.nullable().optional(),
+      cancelledAt: dateOrDateTimeString.nullable().optional(),
       executedAt: z
         .string()
         .regex(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/, "expected YYYY-MM-DD HH:mm")
@@ -839,7 +883,8 @@ export const Actions = {
       if (args.completedAt !== undefined) {
         completedAt = args.completedAt;
       } else if (nextStatus === "done") {
-        completedAt = row.completedAt ?? beijingDate();
+        // Moving into done stamps the completion time to the minute.
+        completedAt = row.completedAt ?? beijingNow();
       } else {
         completedAt = null;
       }

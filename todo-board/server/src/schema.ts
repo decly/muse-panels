@@ -4,8 +4,11 @@
 // assistant through the addItem / updateItem actions. `status` groups the
 // board: needs_decision（待你拍板）/ in_progress（进行中）/ done（已办）/
 // cancelled（用户取消，归档，默认不返回）.
-// Dates are stored as plain YYYY-MM-DD strings (event dates, no time
-// component); completed_at is set when an item moves into done.
+// Dates are stored as plain strings: due_date is a pure node date
+// (YYYY-MM-DD), while created_at / completed_at (and the user-action
+// date fields) may be either "YYYY-MM-DD" (legacy rows, date-only
+// backfills) or "YYYY-MM-DD HH:MM" (server-stamped, Beijing, to the
+// minute). completed_at is set when an item moves into done.
 //
 // User-action fields (written by actOnItem from the page):
 //  - options: JSON array of decision choices for a needs_decision item,
