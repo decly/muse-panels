@@ -702,10 +702,11 @@ export function App() {
           </div>
         ) : (
           <>
-            {/* 计数小结：点击滚动到对应分组 */}
+            {/* 计数小结：点击滚动到对应分组；sticky 吸顶固定，
+                内容滚动时这行不跟着走 */}
             <nav
               aria-label="跳转到分组"
-              className="mt-4 flex items-stretch gap-1 rounded-xl bg-[var(--surface)] px-2 py-1.5"
+              className="sticky top-2 z-10 mt-4 flex items-stretch gap-1 rounded-xl bg-[var(--surface)] px-2 py-1.5 shadow-md"
             >
               <button
                 type="button"
