@@ -63,6 +63,8 @@ const extLabel = (session: string) =>
   session === "pre" ? "盘前" : session === "overnight" ? "夜盘" : "盘后";
 // Table mode (replaces the old two-line compact list): columns in the
 // user-confirmed order. Clicking a header sorts by that column.
+// 成本 (total position cost = qty × cost per share) sits right after
+// 市值 (user request 2026-11-12).
 type SortKey =
   | "symbol"
   | "dayPct"
@@ -71,6 +73,7 @@ type SortKey =
   | "pnlPct"
   | "pnl"
   | "mv"
+  | "costBasis"
   | "qty"
   | "weight";
 const TABLE_COLS: { key: SortKey; label: string }[] = [
@@ -81,6 +84,7 @@ const TABLE_COLS: { key: SortKey; label: string }[] = [
   { key: "pnlPct", label: "浮盈亏%" },
   { key: "pnl", label: "浮盈亏" },
   { key: "mv", label: "市值" },
+  { key: "costBasis", label: "成本" },
   { key: "qty", label: "股数" },
   { key: "weight", label: "占比" },
 ];
@@ -1416,6 +1420,8 @@ export function App() {
           return r.pnl;
         case "mv":
           return r.mv;
+        case "costBasis":
+          return r.costBasis;
         case "qty":
           return r.h.qty;
         case "weight":
@@ -2382,6 +2388,13 @@ export function App() {
                                 {r.mv != null
                                   ? mask(`$${money(r.mv)}`)
                                   : "—"}
+                              </td>
+                              <td className={`${cell} text-right`}>
+                                {/* Total position cost (qty × cost per
+                                    share); a per-holding amount, so
+                                    privacy mode masks it like 市值 —
+                                    unlike the per-share 成本价 column. */}
+                                {mask(`$${money(r.costBasis)}`)}
                               </td>
                               <td className={`${cell} text-right`}>
                                 {mask(
