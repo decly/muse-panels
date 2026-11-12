@@ -428,7 +428,7 @@ const fmtQty = (v: number) =>
 //
 // Display window (user request 2026-11-12; dropdown redesign the
 // same day): the section itself folds away (choice persisted), and
-// the flat list shows only trades from the last N days — 近三天
+// the flat list shows only trades from the last N days — 近3天
 // (3 days) by default, picked from a dropdown (1 / 3 / 7 / 30 / 90 /
 // 全部） — with a 「显示更多」 button at the bottom that widens the
 // window 7 days per click. Clicking 更多 past a stretch with no
@@ -437,27 +437,34 @@ const fmtQty = (v: number) =>
 // skipped — the list never just grows by an empty stretch. The
 // window only filters the list; the realized-P/L summary always
 // covers the whole ledger.
+//
+// 近1天 fallback (user request 2026-11-12): the ledger dates trades
+// by the US (Eastern) trading day, so fills from last night's
+// extended / overnight session carry yesterday's ET date while
+// Beijing is already on the next calendar day — a strict 1-day
+// window then holds nothing even though trades just happened.
+// When 近1天 is picked and Beijing-today has no trades, the list
+// falls back to the most recent date that does have trades (that
+// one day only) and says so. All other presets keep the plain
+// window; 「显示更多」 widens from the window in force.
 const TRADE_WINDOW_PRESETS: { days: number | null; label: string }[] = [
-  { days: 1, label: "近一天" },
-  { days: 3, label: "近三天" },
+  { days: 1, label: "近1天" },
+  { days: 3, label: "近3天" },
   { days: 7, label: "近7天" },
   { days: 30, label: "近30天" },
   { days: 90, label: "近90天" },
   { days: null, label: "全部" },
 ];
-// Oldest date (YYYY-MM-DD, string-comparable with trade dates)
-// inside a window of `days` calendar days ending today, inclusive.
-// "Today" is the Asia/Shanghai calendar day, NOT the viewing
-// device's local day: the board's dates and rhythms are Beijing
-// based (same convention as fmtFetchedAt above), and anchoring to
-// the viewer's local clock made the window depend on the device's
-// timezone — a client whose local date runs ahead of Beijing
-// (another timezone, a mis-set clock) pushed a short window past
-// the newest trades and the list rendered empty even though the
-// ledger held trades from the last Beijing days (the reported
-// 近3天-has-no-data defect, 2026-11-12). The day arithmetic itself
-// runs on UTC date fields so no local timezone can skew it.
-function tradeWindowCutoff(days: number): string {
+// "Today" as an Asia/Shanghai calendar day (YYYY-MM-DD), NOT the
+// viewing device's local day: the board's dates and rhythms are
+// Beijing based (same convention as fmtFetchedAt above), and
+// anchoring to the viewer's local clock made the window depend on
+// the device's timezone — a client whose local date runs ahead of
+// Beijing (another timezone, a mis-set clock) pushed a short window
+// past the newest trades and the list rendered empty even though
+// the ledger held trades from the last Beijing days (the reported
+// 近3天-has-no-data defect, 2026-11-12).
+function beijingToday(): string {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone: "Asia/Shanghai",
     year: "numeric",
@@ -465,12 +472,38 @@ function tradeWindowCutoff(days: number): string {
     day: "2-digit",
   }).formatToParts(new Date());
   const get = (t: string) =>
-    Number(parts.find((p) => p.type === t)?.value ?? "0");
-  const d = new Date(Date.UTC(get("year"), get("month") - 1, get("day")));
-  d.setUTCDate(d.getUTCDate() - (days - 1));
-  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const dd = String(d.getUTCDate()).padStart(2, "0");
-  return `${d.getUTCFullYear()}-${mm}-${dd}`;
+    parts.find((p) => p.type === t)?.value ?? "00";
+  return `${get("year")}-${get("month")}-${get("day")}`;
+}
+
+// Shift a YYYY-MM-DD date by whole days. The arithmetic runs on UTC
+// date fields so no local timezone can skew it.
+function shiftDate(dateStr: string, deltaDays: number): string {
+  const [y = 1970, m = 1, d = 1] = dateStr.split("-").map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + deltaDays);
+  const mm = String(dt.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(dt.getUTCDate()).padStart(2, "0");
+  return `${dt.getUTCFullYear()}-${mm}-${dd}`;
+}
+
+// Oldest date (YYYY-MM-DD, string-comparable with trade dates)
+// inside a window of `days` calendar days ending today, inclusive.
+function tradeWindowCutoff(days: number): string {
+  return shiftDate(beijingToday(), -(days - 1));
+}
+
+// Display-only cleanup for stored trade notes: notes recorded from
+// order screenshots embed the broker account's masked tail
+// fragment (e.g. "（券商A ••••0000）"); the board shows the account
+// as 券商A / 券商B only, never a tail number. Strips a " ••••1234"
+// style tail (bullets or asterisks) plus an empty pair of parens
+// left behind. The stored ledger text is never modified.
+function stripAccountTail(note: string): string {
+  return note
+    .replace(/\s*[•*]{2,}\s*\d{2,}/g, "")
+    .replace(/（\s*）/g, "")
+    .replace(/\(\s*\)/g, "");
 }
 
 function TradesSection({
@@ -558,10 +591,26 @@ function TradesSection({
       : data.realized.global
     : null;
 
+  // 近1天 fallback: with the 1-day window picked and no trade dated
+  // Beijing-today (ledger dates follow the US trading day, so last
+  // night's extended-session fills are dated yesterday ET), show
+  // the most recent date that has trades — that day only — and
+  // label it in the UI. Every other window is the plain cutoff.
+  const fallbackDate =
+    windowDays === 1 &&
+    rows.length > 0 &&
+    !rows.some((t) => t.date >= beijingToday())
+      ? rows.reduce(
+          (max, t) => (t.date > max ? t.date : max),
+          rows[0]?.date ?? "",
+        )
+      : null;
   const visibleRows =
     windowDays == null
       ? rows
-      : rows.filter((t) => t.date >= tradeWindowCutoff(windowDays));
+      : fallbackDate != null
+        ? rows.filter((t) => t.date === fallbackDate)
+        : rows.filter((t) => t.date >= tradeWindowCutoff(windowDays));
   const hiddenCount = rows.length - visibleRows.length;
 
   // 「显示更多」: widen the window 7 days per click; if the newly
@@ -737,14 +786,24 @@ function TradesSection({
         <>
 
       {summary && (
-        <div className="mt-2">
+        <div className="mt-3">
+          {/* Realized P/L (redesigned 2026-11-12): the total leads,
+              large and 红涨绿跌； below it each symbol gets a bar
+              scaled to the largest absolute realized value, growing
+              right of the zero line for gains and left for losses,
+              so winners / losers and their magnitudes read at a
+              glance. Always the whole ledger — the display window
+              never narrows it. An unknown symbol shows 未知， never
+              a fabricated 0. */}
           <div className="flex flex-wrap items-baseline gap-x-2.5 gap-y-1">
             <span className="text-sm text-[var(--dim)]">已实现盈亏</span>
             {summary.total_usd == null ? (
-              <span className="num text-base font-semibold">—</span>
+              <span className="text-2xl font-bold text-[var(--dim)]">
+                未知
+              </span>
             ) : (
               <span
-                className="num text-base font-semibold"
+                className="num text-2xl font-bold"
                 style={{
                   color:
                     summary.total_usd >= 0 ? "var(--up)" : "var(--down)",
@@ -760,28 +819,109 @@ function TradesSection({
               <span className="text-xs text-[var(--dim)]">部分未知</span>
             )}
           </div>
-          {summary.by_symbol.length > 0 && (
-            <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-sm text-[var(--dim)]">
-              {summary.by_symbol.map((s) => (
-                <span key={s.symbol} className="num whitespace-nowrap">
-                  {s.symbol}{" "}
-                  {s.realized_usd == null ? (
-                    "—"
-                  ) : (
-                    <span
-                      style={{
-                        color:
-                          s.realized_usd >= 0 ? "var(--up)" : "var(--down)",
-                      }}
-                    >
-                      {mask(signedMoney(s.realized_usd))}
+          {accountId == null &&
+            data != null &&
+            (() => {
+              const nameByAccount = new Map(
+                data.trades.map((t) => [t.account_id, t.account_name]),
+              );
+              const subs = data.realized.accounts.filter(
+                (a) => a.by_symbol.length > 0,
+              );
+              if (subs.length === 0) return null;
+              return (
+                <div className="mt-1 flex flex-wrap gap-x-3.5 gap-y-0.5 text-sm text-[var(--dim)]">
+                  {subs.map((a) => (
+                    <span key={a.account_id} className="whitespace-nowrap">
+                      {nameByAccount.get(a.account_id) ?? a.account_id}{" "}
+                      {a.total_usd == null ? (
+                        "未知"
+                      ) : (
+                        <span
+                          className="num font-medium"
+                          style={{
+                            color:
+                              a.total_usd >= 0
+                                ? "var(--up)"
+                                : "var(--down)",
+                          }}
+                        >
+                          {mask(signedMoney(a.total_usd))}
+                        </span>
+                      )}
+                      {a.has_estimated ? " · 含估算" : ""}
                     </span>
-                  )}
-                  {s.has_estimated ? " · 估" : ""}
-                </span>
-              ))}
-            </div>
-          )}
+                  ))}
+                </div>
+              );
+            })()}
+          {summary.by_symbol.length > 0 &&
+            (() => {
+              const maxAbs = Math.max(
+                0,
+                ...summary.by_symbol.map((s) =>
+                  s.realized_usd == null ? 0 : Math.abs(s.realized_usd),
+                ),
+              );
+              const ordered = [...summary.by_symbol].sort((a, b) => {
+                const av = a.realized_usd == null ? -1 : Math.abs(a.realized_usd);
+                const bv = b.realized_usd == null ? -1 : Math.abs(b.realized_usd);
+                return bv - av;
+              });
+              return (
+                <ul className="mt-2.5 space-y-1.5">
+                  {ordered.map((s) => {
+                    const v = s.realized_usd;
+                    const pct =
+                      v != null && maxAbs > 0
+                        ? (Math.abs(v) / maxAbs) * 50
+                        : 0;
+                    return (
+                      <li key={s.symbol} className="flex items-center gap-2">
+                        <span className="num w-14 shrink-0 truncate text-sm font-medium">
+                          {s.symbol}
+                        </span>
+                        <div
+                          aria-hidden
+                          className="relative h-2.5 min-w-0 flex-1 rounded bg-[var(--surface-2)]"
+                        >
+                          <div className="absolute left-1/2 top-0 h-full w-px bg-[var(--border)]" />
+                          {v != null && v !== 0 && (
+                            <div
+                              className="absolute top-0 h-full rounded-sm"
+                              style={{
+                                left: v >= 0 ? "50%" : `${50 - pct}%`,
+                                width: `${pct}%`,
+                                background:
+                                  v >= 0 ? "var(--up)" : "var(--down)",
+                              }}
+                            />
+                          )}
+                        </div>
+                        <span
+                          className="num w-24 shrink-0 text-right text-sm font-semibold"
+                          style={
+                            v == null
+                              ? { color: "var(--dim)" }
+                              : {
+                                  color:
+                                    v >= 0 ? "var(--up)" : "var(--down)",
+                                }
+                          }
+                        >
+                          {v == null ? "未知" : mask(signedMoney(v))}
+                        </span>
+                        {s.has_estimated && (
+                          <span className="shrink-0 text-xs text-[var(--dim)]">
+                            含估算
+                          </span>
+                        )}
+                      </li>
+                    );
+                  })}
+                </ul>
+              );
+            })()}
         </div>
       )}
 
@@ -953,7 +1093,9 @@ function TradesSection({
                   </option>
                 ))}
                 {windowIsCustom && (
-                  <option value={String(windowDays)}>近 {windowDays} 天</option>
+                  <option value={String(windowDays)}>
+                    近{windowDays}天
+                  </option>
                 )}
               </select>
               <span
@@ -969,9 +1111,16 @@ function TradesSection({
               </span>
             )}
           </div>
+          {fallbackDate != null && (
+            <p className="mt-2 text-sm text-[var(--dim)]">
+              近1天（北京时间今天）暂无交易，已回退显示最近的交易日{" "}
+              <span className="num">{fallbackDate}</span> 的记录，共{" "}
+              {visibleRows.length} 笔。
+            </p>
+          )}
           {visibleRows.length === 0 && (
             <p className="mt-4 text-sm text-[var(--dim)]">
-              近 {windowDays} 天内没有交易记录 —
+              近{windowDays}天内没有交易记录 —
               点下方「显示更多」往前查看更早的交易。
             </p>
           )}
@@ -1021,12 +1170,22 @@ function TradesSection({
                         </span>
                       </div>
                       <div className="num mt-0.5 text-sm text-[var(--dim)]">
-                        {fmtQty(t.qty)} 股 @{" "}
+                        {/* Quantity and execution price are the two
+                            figures scanned for in the detail line, so
+                            they carry the highlight (bold + accent);
+                            the masked placeholder keeps the same
+                            styling under privacy mode. */}
+                        <span className="font-bold text-[var(--accent)]">
+                          {fmtQty(t.qty)} 股
+                        </span>{" "}
+                        @{" "}
                         {t.price == null ? (
                           "价未知"
                         ) : (
                           <>
-                            {mask(`$${money(t.price)}`)}
+                            <span className="font-bold text-[var(--accent)]">
+                              {mask(`$${money(t.price)}`)}
+                            </span>
                             {t.price_kind === "estimated" ? "（估）" : ""}
                           </>
                         )}
@@ -1036,7 +1195,7 @@ function TradesSection({
                       </div>
                       {t.note && (
                         <p className="mt-0.5 text-sm text-[var(--dim)]">
-                          {t.note}
+                          {stripAccountTail(t.note)}
                         </p>
                       )}
                       {!readOnly && (
@@ -1095,7 +1254,11 @@ function TradesSection({
             <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
               <p className="num text-sm text-[var(--dim)]">
                 已显示 {visibleRows.length} 笔（共 {rows.length} 笔）
-                {windowDays != null ? ` · 近 ${windowDays} 天` : " · 全部"}
+                {windowDays != null
+                  ? fallbackDate != null
+                    ? ` · 实际显示 ${fallbackDate}`
+                    : ` · 近${windowDays}天`
+                  : " · 全部"}
               </p>
               {hiddenCount === 0 && (
                 <p className="text-sm text-[var(--dim)]">已显示全部交易</p>
