@@ -425,6 +425,54 @@ const fmtQty = (v: number) =>
 // Privacy mode masks the user's own execution prices and amounts
 // (they are account records, not public quotes); quantities, symbols,
 // dates and direction stay visible.
+//
+// Display window (user request 2026-11-12; dropdown redesign the
+// same day): the section itself folds away (choice persisted), and
+// the flat list shows only trades from the last N days — 近三天
+// (3 days) by default, picked from a dropdown (1 / 3 / 7 / 30 / 90 /
+// 全部） — with a 「显示更多」 button at the bottom that widens the
+// window 7 days per click. Clicking 更多 past a stretch with no
+// trades keeps widening in 7-day steps until an older trade appears
+// (or everything is shown), and says how many tradeless days were
+// skipped — the list never just grows by an empty stretch. The
+// window only filters the list; the realized-P/L summary always
+// covers the whole ledger.
+const TRADE_WINDOW_PRESETS: { days: number | null; label: string }[] = [
+  { days: 1, label: "近一天" },
+  { days: 3, label: "近三天" },
+  { days: 7, label: "近7天" },
+  { days: 30, label: "近30天" },
+  { days: 90, label: "近90天" },
+  { days: null, label: "全部" },
+];
+// Oldest date (YYYY-MM-DD, string-comparable with trade dates)
+// inside a window of `days` calendar days ending today, inclusive.
+// "Today" is the Asia/Shanghai calendar day, NOT the viewing
+// device's local day: the board's dates and rhythms are Beijing
+// based (same convention as fmtFetchedAt above), and anchoring to
+// the viewer's local clock made the window depend on the device's
+// timezone — a client whose local date runs ahead of Beijing
+// (another timezone, a mis-set clock) pushed a short window past
+// the newest trades and the list rendered empty even though the
+// ledger held trades from the last Beijing days (the reported
+// 近3天-has-no-data defect, 2026-11-12). The day arithmetic itself
+// runs on UTC date fields so no local timezone can skew it.
+function tradeWindowCutoff(days: number): string {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+  const get = (t: string) =>
+    Number(parts.find((p) => p.type === t)?.value ?? "0");
+  const d = new Date(Date.UTC(get("year"), get("month") - 1, get("day")));
+  d.setUTCDate(d.getUTCDate() - (days - 1));
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${mm}-${dd}`;
+}
+
 function TradesSection({
   accountId,
   readOnly,
@@ -474,6 +522,30 @@ function TradesSection({
   const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(
     null,
   );
+  // Section fold: persisted like the market strip's; default expanded.
+  const [collapsed, setCollapsed] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("portfolio-board-trades-collapsed") === "1";
+    } catch {
+      return false;
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        "portfolio-board-trades-collapsed",
+        collapsed ? "1" : "0",
+      );
+    } catch {
+      /* storage unavailable */
+    }
+  }, [collapsed]);
+  // Flat-list window in days; null = 全部. Default 近三天 (3 days);
+  // the section is keyed by account view, so switching tabs remounts
+  // it and the window falls back to this default.
+  const [windowDays, setWindowDays] = useState<number | null>(3);
+  // Set by 「显示更多」 when it auto-skipped tradeless days.
+  const [skipNote, setSkipNote] = useState<string | null>(null);
 
   const data = tradesQuery.data;
   const rows = (data?.trades ?? []).filter(
@@ -486,9 +558,51 @@ function TradesSection({
       : data.realized.global
     : null;
 
-  // Group the (already date-desc) rows by trade date.
+  const visibleRows =
+    windowDays == null
+      ? rows
+      : rows.filter((t) => t.date >= tradeWindowCutoff(windowDays));
+  const hiddenCount = rows.length - visibleRows.length;
+
+  // 「显示更多」: widen the window 7 days per click; if the newly
+  // covered stretch holds no trades, keep widening in 7-day steps
+  // until an older trade shows up (or nothing is left hidden), and
+  // note the skipped tradeless span.
+  const loadMore = () => {
+    if (windowDays == null) return;
+    const shownBefore = visibleRows.length;
+    let w = windowDays + 7;
+    let skipped = 0;
+    for (;;) {
+      const cutoff = tradeWindowCutoff(w);
+      const shown = rows.filter((t) => t.date >= cutoff).length;
+      const olderLeft = rows.some((t) => t.date < cutoff);
+      if (shown > shownBefore || !olderLeft) break;
+      w += 7;
+      skipped += 7;
+    }
+    setWindowDays(w);
+    setSkipNote(
+      skipped > 0 ? `已跳过中间 ${skipped} 天无交易的时段` : null,
+    );
+  };
+  const pickWindow = (days: number | null) => {
+    setWindowDays(days);
+    setSkipNote(null);
+  };
+
+  // The window <select> speaks in preset values ("all" = 全部）; a
+  // window widened by 「显示更多」 past every preset becomes an extra
+  // option of its own, so the control always shows the window that
+  // is actually in force instead of silently snapping to a preset.
+  const windowIsCustom =
+    windowDays != null &&
+    !TRADE_WINDOW_PRESETS.some((p) => p.days === windowDays);
+  const windowSelectValue = windowDays == null ? "all" : String(windowDays);
+
+  // Group the (already date-desc) visible rows by trade date.
   const groups: { date: string; rows: TradeRow[] }[] = [];
-  for (const t of rows) {
+  for (const t of visibleRows) {
     const last = groups[groups.length - 1];
     if (last && last.date === t.date) last.rows.push(t);
     else groups.push({ date: t.date, rows: [t] });
@@ -581,7 +695,24 @@ function TradesSection({
   return (
     <section className="mt-3 rounded-[var(--radius)] bg-[var(--surface)] p-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h2 className="text-lg font-semibold">交易流水</h2>
+        <h2 className="text-lg font-semibold">
+          <button
+            type="button"
+            onClick={() => setCollapsed((v) => !v)}
+            aria-expanded={!collapsed}
+            aria-label={collapsed ? "展开交易流水" : "折叠交易流水"}
+            className="-my-1 -ml-2 flex items-center gap-2 rounded-lg px-2 py-1 transition-colors hover:bg-[var(--surface-2)] active:opacity-60"
+          >
+            交易流水
+            <span
+              aria-hidden
+              className="flex h-6 items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--surface)] px-2 text-xs font-normal text-[var(--dim)]"
+            >
+              {collapsed ? "展开" : "收起"}
+              <span className="text-[9px]">{collapsed ? "▼" : "▲"}</span>
+            </span>
+          </button>
+        </h2>
         {!readOnly && (
           <button
             type="button"
@@ -590,6 +721,7 @@ function TradesSection({
                 setShowForm(false);
                 resetForm();
               } else {
+                setCollapsed(false);
                 resetForm();
                 setShowForm(true);
               }
@@ -600,6 +732,9 @@ function TradesSection({
           </button>
         )}
       </div>
+
+      {!collapsed && (
+        <>
 
       {summary && (
         <div className="mt-2">
@@ -787,6 +922,59 @@ function TradesSection({
         </p>
       ) : (
         <div className="mt-2">
+          {/* Display-window picker: how many days of trades show
+              flat, chosen from a dropdown. A window widened by
+              「显示更多」 past every preset appears as its own
+              option line so the current window stays visible. */}
+          <div className="mt-2 flex flex-wrap items-center gap-x-2.5 gap-y-1.5">
+            <label
+              htmlFor="trade-window-select"
+              className="text-sm text-[var(--dim)]"
+            >
+              显示范围
+            </label>
+            <div className="relative">
+              <select
+                id="trade-window-select"
+                aria-label="交易显示范围"
+                value={windowSelectValue}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  pickWindow(v === "all" ? null : Number(v));
+                }}
+                className="appearance-none rounded-md border border-[var(--border)] bg-[var(--surface-2)] py-1.5 pl-3 pr-8 text-sm font-medium text-[var(--text)] transition-colors hover:border-[var(--dim)]"
+              >
+                {TRADE_WINDOW_PRESETS.map((p) => (
+                  <option
+                    key={p.label}
+                    value={p.days == null ? "all" : String(p.days)}
+                  >
+                    {p.label}
+                  </option>
+                ))}
+                {windowIsCustom && (
+                  <option value={String(windowDays)}>近 {windowDays} 天</option>
+                )}
+              </select>
+              <span
+                aria-hidden
+                className="pointer-events-none absolute right-2.5 top-1/2 -translate-y-1/2 text-[9px] text-[var(--dim)]"
+              >
+                ▼
+              </span>
+            </div>
+            {windowIsCustom && (
+              <span className="text-sm text-[var(--dim)]">
+                经「显示更多」扩窗
+              </span>
+            )}
+          </div>
+          {visibleRows.length === 0 && (
+            <p className="mt-4 text-sm text-[var(--dim)]">
+              近 {windowDays} 天内没有交易记录 —
+              点下方「显示更多」往前查看更早的交易。
+            </p>
+          )}
           {groups.map((g) => (
             <div key={g.date} className="mt-3">
               <p className="num text-sm font-medium text-[var(--dim)]">
@@ -903,7 +1091,32 @@ function TradesSection({
               </ul>
             </div>
           ))}
+          <div className="mt-5 border-t border-[var(--border)] pt-3">
+            <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+              <p className="num text-sm text-[var(--dim)]">
+                已显示 {visibleRows.length} 笔（共 {rows.length} 笔）
+                {windowDays != null ? ` · 近 ${windowDays} 天` : " · 全部"}
+              </p>
+              {hiddenCount === 0 && (
+                <p className="text-sm text-[var(--dim)]">已显示全部交易</p>
+              )}
+            </div>
+            {skipNote && (
+              <p className="mt-1 text-sm text-[var(--dim)]">{skipNote}</p>
+            )}
+            {hiddenCount > 0 && (
+              <button
+                type="button"
+                onClick={loadMore}
+                className="mt-2.5 w-full rounded-md border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2 text-base font-medium text-[var(--text)] transition-colors hover:border-[var(--dim)] active:opacity-70"
+              >
+                显示更多（还有 {hiddenCount} 笔更早的）
+              </button>
+            )}
+          </div>
         </div>
+      )}
+      </>
       )}
     </section>
   );
