@@ -156,6 +156,12 @@ export function App() {
   const calendar = useQuery({
     queryKey: ["calendar"],
     queryFn: () => api.getCalendar({}),
+    // First-screen loads occasionally fail transiently (webview/network
+    // hiccups). Retry with backoff before surfacing an error: the query
+    // stays in its pending state while retries run, so the UI only shows
+    // 加载中 and never flashes the error block for a recoverable failure.
+    retry: 4,
+    retryDelay: (attempt) => Math.min(800 * 2 ** attempt, 8000),
   });
 
   const data = calendar.data;
@@ -224,10 +230,15 @@ export function App() {
         {calendar.isPending && (
           <p className="py-16 text-center text-base text-[var(--dim)]">
             加载中…
+            {calendar.failureCount > 0 && (
+              <span className="mt-1 block text-sm">
+                连接不稳定，正在重试（第 {calendar.failureCount} 次）…
+              </span>
+            )}
           </p>
         )}
 
-        {calendar.error && (
+        {calendar.isError && (
           <div className="py-16 text-center">
             <p className="text-base text-[var(--text)]">加载失败</p>
             <button
