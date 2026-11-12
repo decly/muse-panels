@@ -25,6 +25,28 @@ const cny = (v: number) => `¥${money(v, 0)}`;
 // standalone flag; smaller ones stay visible in the row detail only.
 const AFTER_ALERT_PCT = 3;
 
+// First-screen load retry policy, shared by every query that fires on
+// open (portfolio, trades). The first action call after the board has
+// been idle can fail transiently: the server worker cold-starts, or
+// the webview request hangs and never reaches the server at all — a
+// bare network TypeError, which the shared query client's default
+// policy does NOT retry (it only retries failures the server
+// explicitly marked retry-safe before invocation). Retry up to 3
+// times with backoff; the query stays in its loading state while
+// retrying and only surfaces the error (with its manual retry entry)
+// after every attempt has failed. Permanent 4xx errors are not
+// retried — they would fail identically every time.
+const firstLoadRetry = (failureCount: number, error: Error) => {
+  if (failureCount >= 3) return false;
+  const status = (error as { status?: unknown })?.status;
+  if (typeof status === "number" && status >= 400 && status < 500) {
+    return false;
+  }
+  return true;
+};
+const firstLoadRetryDelay = (attempt: number) =>
+  Math.min(600 * 2 ** attempt, 4000);
+
 // Effective extended-hours quote for a holding: the ext_* fields,
 // which the server derives from the per-session saved slots
 // (pre_*/post_*/overnight_*, plan B) for the CURRENT session — so
@@ -572,6 +594,13 @@ function TradesSection({
   const tradesQuery = useQuery({
     queryKey: ["trades"],
     queryFn: () => api.getTrades({}),
+    // First-screen query: same cold-open retry policy as the
+    // portfolio query (see firstLoadRetry). Without it this query
+    // fell back to the shared client's default, which does not retry
+    // bare network failures — a hung webview request on open surfaced
+    // 「交易流水加载失败」 immediately instead of self-healing.
+    retry: firstLoadRetry,
+    retryDelay: firstLoadRetryDelay,
   });
   const invalidate = () =>
     queryClient.invalidateQueries({ queryKey: ["trades"] });
@@ -1356,21 +1385,11 @@ export function App() {
   const portfolio = useQuery({
     queryKey: ["portfolio"],
     queryFn: () => api.getPortfolio({}),
-    // Cold start: the first action call after the board has been idle can
-    // fail transiently while the server worker spins up, before the
-    // handler ever runs. Retry with backoff so a cold open self-heals;
-    // the query stays in its loading state while retrying and only
-    // surfaces the error after every attempt has failed. Permanent 4xx
-    // errors are not retried — they would fail identically every time.
-    retry: (failureCount, error) => {
-      if (failureCount >= 3) return false;
-      const status = (error as { status?: unknown })?.status;
-      if (typeof status === "number" && status >= 400 && status < 500) {
-        return false;
-      }
-      return true;
-    },
-    retryDelay: (attempt) => Math.min(600 * 2 ** attempt, 4000),
+    // Cold-open retry with backoff (shared first-screen policy, see
+    // firstLoadRetry above): a cold open self-heals instead of
+    // surfacing the error on the first transient failure.
+    retry: firstLoadRetry,
+    retryDelay: firstLoadRetryDelay,
   });
 
   const refresh = useMutation({
