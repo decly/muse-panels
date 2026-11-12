@@ -23,7 +23,7 @@
 // Quote channels, in order:
 //  1. ctx.tool.finance_ticker (managed channel) for every holding.
 //  2. Nasdaq's public quote API as a fallback — the managed channel
-//     cannot resolve some NYSE symbols; Nasdaq can.
+//     cannot resolve BE (Bloom Energy, NYSE), Nasdaq can.
 // USD/CNY comes from open.er-api.com (ExchangeRate-API free endpoint),
 // falling back to api.frankfurter.app; the rate and its timestamp are
 // stored with every refresh. Cash is stored per account from the
@@ -314,7 +314,12 @@ function etDateOf(ms: number): { y: number; m: number; d: number } {
 // weekday's — without this exception the gate would discard this
 // morning's pre-market slot (saved before the open, measured
 // against that previous close) as soon as the first intraday print
-// landed.
+// landed. The same step-back applies in the pre-market and
+// overnight sessions when the stamp is dated today but today's
+// close is still in the future (the finance channel stamps the
+// settled close with a pre-market fetch time — see the branch
+// below); in the post session the stamp date's close has already
+// settled, so no step-back happens there.
 function extCloseBoundaryMs(
   s: typeof schema.quoteSnapshots.$inferSelect,
   sessionKey: string,
@@ -322,16 +327,42 @@ function extCloseBoundaryMs(
   const regMs = parseStampMs(s.asOf);
   if (regMs == null) return null;
   let { y, m, d } = etDateOf(regMs);
+  // Step back to the most recent weekday (Mon–Fri) before y-m-d.
+  const stepBack = () => {
+    do {
+      const prev = new Date(Date.UTC(y, m - 1, d - 1));
+      y = prev.getUTCFullYear();
+      m = prev.getUTCMonth() + 1;
+      d = prev.getUTCDate();
+    } while ([0, 6].includes(new Date(Date.UTC(y, m - 1, d)).getUTCDay()));
+  };
   if (sessionKey === "regular") {
     const today = etDateOf(Date.now());
-    if (y === today.y && m === today.m && d === today.d) {
-      // Step back to the most recent weekday (Mon–Fri).
-      do {
-        const prev = new Date(Date.UTC(y, m - 1, d - 1));
-        y = prev.getUTCFullYear();
-        m = prev.getUTCMonth() + 1;
-        d = prev.getUTCDate();
-      } while ([0, 6].includes(new Date(Date.UTC(y, m - 1, d)).getUTCDay()));
+    if (y === today.y && m === today.m && d === today.d) stepBack();
+  } else if (sessionKey === "pre" || sessionKey === "overnight") {
+    // The finance channel stamps a settled close with a fetch-time
+    // as_of that lands on TODAY's ET date during the pre-market and
+    // overnight hours (verified live 2026-11-12: AMZN's Nov 11 close
+    // stored with as_of 2026-11-12T09:12Z, i.e. 04:12 ET). Today's
+    // 16:00 close has not happened yet at those hours, so a stamp
+    // dated today still pairs with the previous weekday's settled
+    // close — judging the slots against today's future close gated
+    // out even genuine same-morning pre-market prints and pinned
+    // the whole board to the close price. The gate's rule is
+    // unchanged (a slot must be later than the latest SETTLED
+    // close); only the boundary's aim is corrected, the same
+    // correction the regular-session branch above already makes.
+    // The post session and the overnight 20:00 leg sit after
+    // today's close, so they keep the stamp date's own boundary.
+    const nowMs = Date.now();
+    const today = etDateOf(nowMs);
+    if (
+      y === today.y &&
+      m === today.m &&
+      d === today.d &&
+      nowMs < etWallClockToInstant(y, m, d, 16, 0).getTime()
+    ) {
+      stepBack();
     }
   }
   return etWallClockToInstant(y, m, d, 16, 0).getTime();
@@ -357,11 +388,26 @@ function extFresh(asOf: string | null, boundaryMs: number | null): boolean {
 // slots, their cross-slot fallbacks, and the legacy ext_*/after_*
 // mirrors — passes the staleness gate above, so a slot left over
 // from before the latest regular close never surfaces. Cross-slot
-// fallbacks mirror the pre-plan-B behavior: pre-market with no pre
-// data yet shows the after-hours last trade, overnight with no
-// Yahoo price shows the after-hours last trade (labeled
-// 夜盘最近可得价 in the detail) — in both cases only when that
-// after-hours save is itself fresh against the latest close.
+// fallbacks: pre-market with no pre data yet falls back through
+// the overnight slot to the after-hours last trade (see the chain
+// note on effectiveExt below), overnight with no Yahoo price shows
+// the after-hours last trade (labeled 夜盘最近可得价 in the
+// detail) — in every case only when that save is itself fresh
+// against the latest close.
+// Pre-market fallback chain (2026-11-12, user-approved): pre →
+// overnight → post → close. Right after the pre session opens most
+// symbols have no pre-market trade yet, and falling straight back
+// to the close made the live estimate hug the official total even
+// though the overnight session that just ended had really moved —
+// the overnight slot (saved minutes earlier, measured against the
+// same close) is strictly fresher than that close, so it prices the
+// row until a real pre-market print lands, with the post slot as
+// the next fallback. Every level passes the same staleness gate, so
+// a slot left over from before the latest close is skipped at every
+// step of the chain. The emitted ext_session names the slot that
+// actually priced the row, so the client labels it 夜盘价 / 盘后价
+// and the badges, the ±3% alert strip and the live estimate all
+// tell the same story. Other sessions keep their existing chains.
 function effectiveExt(
   s: typeof schema.quoteSnapshots.$inferSelect,
   sessionKey: string,
@@ -376,7 +422,7 @@ function effectiveExt(
   };
   let eff: ReturnType<typeof pick> = null;
   if (sessionKey === "pre") {
-    eff = pick("pre") ?? pick("post");
+    eff = pick("pre") ?? pick("overnight") ?? pick("post");
   } else if (sessionKey === "overnight") {
     eff = pick("overnight") ?? pick("post");
   } else if (sessionKey === "regular") {
@@ -927,9 +973,9 @@ async function fetchNasdaqQuote(
   if (!d) return null;
   // During an extended session (Pre-Market / After-Hours) Nasdaq's
   // primaryData is the LIVE extended-hours trade, not the regular
-  // close — verified live 2026-11-09 pre-market: primaryData
-  // carried a real-time extended-hours print while secondaryData
-  // carried the settled regular close. The regular
+  // close — verified live 2026-11-09 pre-market: NVDA primaryData
+  // $175.55 real-time ("Nov 9, 2026 9:12 AM ET") vs secondaryData
+  // $186.64 ("Closed at Nov 6, 2026 4:00 PM ET"). The regular
   // quote — this board's official basis — is secondaryData in
   // those sessions. Outside them primaryData is the regular quote
   // (live intraday, or the last close when the market is closed).
@@ -1134,9 +1180,11 @@ async function fetchNasdaqExtended(
 // Nasdaq has no overnight quote stream, so during the overnight
 // session (20:00–04:00 ET) the extended price comes from Yahoo
 // Finance's chart API instead: meta.fulldayPrice is the latest price
-// including pre/post/overnight (Blue Ocean) trades — during the
-// overnight session it tracks the live overnight tape while Nasdaq's
-// post feed still shows the stale after-hours last trade.
+// including pre/post/overnight (Blue Ocean) trades — verified live
+// 2026-11-09 during the Sunday-night session (NVDA fulldayPrice
+// $179.15 vs the $186.64 Friday close, ≈ −4.0%, matching press
+// reports of the Sunday overnight move, while Nasdaq's post feed
+// still showed the stale $188.70 after-hours last trade).
 // fulldayPrice carries NO trade timestamp, so callers stamp ext_as_of
 // with the fetch moment and the UI labels it 抓取于 (fetched at) —
 // never as a trade time. Yahoo symbols match quoteSymbol except
@@ -3832,11 +3880,10 @@ export const Actions = {
 
           // Acceptance. The finance channel fuzzy-matches instruments
           // and intermittently returns a DIFFERENT security for a
-          // symbol — verified live 2026-11-09 pre-market: a wrong
-          // instrument priced in single digits against a triple-digit
-          // close; stored as the \"close\", it also became the
-          // pre-market % reference and printed an absurd
-          // four-digit percentage. Nasdaq's endpoint is addressed by symbol and
+          // symbol — verified live 2026-11-09 pre-market: MRVL at
+          // $7.6281 vs its $141.20 close; stored as the "close", it
+          // also became the pre-market % reference and printed
+          // +1775.96%. Nasdaq's endpoint is addressed by symbol and
           // cannot mismatch, so: during the regular session the
           // finance candidate is plausibility-checked against the
           // stored close with Nasdaq as fallback; outside the
