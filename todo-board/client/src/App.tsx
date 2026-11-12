@@ -771,11 +771,25 @@ function scrollToItem(id: number) {
   }, 450);
 }
 
+/* ------------------------------------------------------------------ */
+/* 首屏读加载硬化：打开页面时的 getBoard 请求偶发失败（webview 挂起、   */
+/* 请求没到服务端），此前直接弹「加载失败」。现在统一口径：单次读请求   */
+/* 10 秒超时（挂起也算失败，才能触发重试），失败后自动重试 3 次、     */
+/* 指数退避（1s → 2s → 4s）；重试期间只显示「正在加载」，全部重试     */
+/* 失败后才显示错误提示并带手动重试入口。写请求硬化（上方）保持不动。 */
+/* ------------------------------------------------------------------ */
+
+const BOARD_LOAD_TIMEOUT_MS = 10000;
+const BOARD_LOAD_RETRIES = 3;
+
 export function App() {
   const queryClient = useQueryClient();
   const board = useQuery({
     queryKey: ["board"],
-    queryFn: () => api.getBoard({}),
+    queryFn: () =>
+      withTimeout(api.getBoard({}), BOARD_LOAD_TIMEOUT_MS),
+    retry: BOARD_LOAD_RETRIES,
+    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 8000),
   });
   // Visible success confirmation: a banner names what was saved, and the
   // affected card is scrolled into view and outlined until it fades.
@@ -884,12 +898,21 @@ export function App() {
         }`}
       >
         {board.isPending ? (
-          <p className="py-16 text-center text-sm text-[var(--dim)]">
-            正在加载…
-          </p>
+          <div className="py-16 text-center">
+            <p className="text-sm text-[var(--dim)]">正在加载…</p>
+            {board.failureCount > 0 ? (
+              <p className="mt-2 text-[12.5px] leading-[18px] text-[var(--dim)]">
+                网络不稳，正在自动重试（第 {board.failureCount}/
+                {BOARD_LOAD_RETRIES} 次）…
+              </p>
+            ) : null}
+          </div>
         ) : board.error ? (
           <div className="py-16 text-center">
-            <p className="text-sm text-[var(--dim)]">加载失败，稍后再试。</p>
+            <p className="text-sm text-[var(--dim)]">
+              加载失败：已自动重试 {BOARD_LOAD_RETRIES}{" "}
+              次仍没连上，可能是网络或服务暂时不可用。
+            </p>
             <button
               type="button"
               onClick={() => board.refetch()}
