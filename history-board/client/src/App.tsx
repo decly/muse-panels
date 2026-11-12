@@ -230,6 +230,32 @@ export function App() {
   // leaving a dead error screen: refetch when the board becomes
   // visible again, when connectivity returns, and on a slow timer.
   // The manual 重新加载 button stays as an immediate fallback.
+  // Stall watchdog for the first load: the retry policy above only
+  // engages when a request actually settles as a failure. A request
+  // that hangs inside the webview (never reaches the server, promise
+  // never settles — the failure mode suspected from the 2026-11-11
+  // todo-board incident) would otherwise leave this board on
+  // "正在加载" forever: no retry, no error state, no recovery. While
+  // the first load is still pending, periodically cancel the stuck
+  // fetch and start a fresh one; the query stays in the loading
+  // state throughout, so no error is shown for a stall.
+  const queryIsPending = query.isPending;
+  useEffect(() => {
+    if (!queryIsPending) return;
+    const kickStalled = async () => {
+      try {
+        await queryClient.cancelQueries({ queryKey: ["history"] });
+        await queryClient.invalidateQueries({ queryKey: ["history"] });
+      } catch {
+        // A failed kick is harmless: the interval fires again.
+      }
+    };
+    const timer = window.setInterval(() => {
+      void kickStalled();
+    }, 30000);
+    return () => window.clearInterval(timer);
+  }, [queryIsPending, queryClient]);
+
   const queryIsError = query.isError;
   useEffect(() => {
     if (!queryIsError) return;
