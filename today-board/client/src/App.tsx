@@ -335,6 +335,15 @@ export function App() {
   const today = useQuery({
     queryKey: ["today"],
     queryFn: () => api.getToday({}),
+    // First-screen load resilience: transient action-request failures
+    // (webview stalls, cold starts, brief 5xx) retry automatically —
+    // 3 retries after the initial attempt with exponential backoff
+    // (1s → 2s → 4s, capped at 8s). While retries are in flight the
+    // query stays in its pending state, so the page shows only the
+    // loading indicator; the error state (with its manual retry
+    // button) appears only after every attempt has failed.
+    retry: 3,
+    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 8000),
   });
 
   const togglePrivacy = () => {
@@ -429,7 +438,11 @@ export function App() {
         </header>
 
         {today.isPending ? (
-          <p className="py-12 text-center text-base text-[var(--dim)]">加载中…</p>
+          <p className="py-12 text-center text-base text-[var(--dim)]">
+            {today.failureCount > 0
+              ? `加载中，正在重试（第 ${today.failureCount} 次）…`
+              : "加载中…"}
+          </p>
         ) : today.error ? (
           <div className="py-12 text-center">
             <p className="text-base text-[var(--text)]">加载失败</p>
