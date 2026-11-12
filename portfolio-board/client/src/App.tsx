@@ -506,6 +506,57 @@ function stripAccountTail(note: string): string {
     .replace(/\(\s*\)/g, "");
 }
 
+// Render-only tidy-up of a stored trade note (user request
+// 2026-11-12): notes written from order screenshots embed the fill
+// times as a loose comma-joined string ("…：美东 11/11 18:43
+// 盘后成交，北京时间 11/12 07:43，GTC_EXTO") that reads scattered
+// and lines up differently from row to row. parseTradeNote pulls
+// the two clock readings out and re-renders them in one fixed
+// shape — Beijing first, then Eastern, zero-padded, joined by
+// " · ", the session word （盘后 / 夜盘 / 盘前成交） kept with the
+// Eastern time — drops the order-type flag (GTC_EXTO, GTC_EXT)
+// and the leading "订单截图成交（账户）：" descriptor (it repeats
+// the source label and the account, both shown elsewhere on the
+// row), and returns whatever prose remains （清仓退出 …) as plain
+// text. A bare "订单截图成交" note carries nothing beyond the
+// source label, so it collapses to empty text; a note with no
+// clock reading （期初初始化 …) keeps its natural text. The stored
+// ledger text is never modified.
+function parseTradeNote(raw: string): { time: string | null; text: string } {
+  let s = stripAccountTail(raw).replace(/\bGTC(?:_[A-Z]+)?\b/g, "");
+  const pad = (v: string) => v.padStart(2, "0");
+  let bj: string | null = null;
+  const bjMatch = s.match(
+    /北京时间\s*(\d{1,2})\/(\d{1,2})\s+(\d{1,2}):(\d{2})/,
+  );
+  if (bjMatch) {
+    const [, bm = "", bd = "", bh = "", bmin = ""] = bjMatch;
+    bj = `北京时间 ${pad(bm)}/${pad(bd)} ${pad(bh)}:${bmin}`;
+    s = s.replace(bjMatch[0], "");
+  }
+  let et: string | null = null;
+  const etMatch = s.match(
+    /美东\s*(\d{1,2})\/(\d{1,2})\s+(\d{1,2}):(\d{2})(?:\s*(盘后|夜盘|盘前)成交)?/,
+  );
+  if (etMatch) {
+    const [, em = "", ed = "", eh = "", emin = "", session = ""] = etMatch;
+    et =
+      `美东 ${pad(em)}/${pad(ed)} ${pad(eh)}:${emin}` +
+      (session ? `（${session}成交）` : "");
+    s = s.replace(etMatch[0], "");
+  }
+  s = s.replace(/^[^：:]{0,40}[：:]/, (m) =>
+    /订单截图|快照差分/.test(m) ? "" : m,
+  );
+  let text = s
+    .replace(/[，,；;、]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (text === "订单截图成交") text = "";
+  const time = [bj, et].filter(Boolean).join(" · ") || null;
+  return { time, text };
+}
+
 function TradesSection({
   accountId,
   readOnly,
@@ -1133,6 +1184,9 @@ function TradesSection({
                 {g.rows.map((t) => {
                   const amount =
                     t.price != null ? t.qty * t.price : null;
+                  const parsed = t.note
+                    ? parseTradeNote(t.note)
+                    : { time: null, text: "" };
                   return (
                     <li key={t.id} className="py-2">
                       <div className="flex items-baseline gap-2">
@@ -1189,15 +1243,27 @@ function TradesSection({
                             {t.price_kind === "estimated" ? "（估）" : ""}
                           </>
                         )}
-                        <span className="ml-2 rounded bg-[var(--surface-2)] px-1.5 py-0.5 text-xs">
-                          {TRADE_SOURCE_LABELS[t.source]}
-                        </span>
                       </div>
-                      {t.note && (
-                        <p className="mt-0.5 text-sm text-[var(--dim)]">
-                          {stripAccountTail(t.note)}
-                        </p>
-                      )}
+                      {/* Note line: the fill times come first in
+                          their fixed shape, leftover prose follows
+                          as-is, and the entry source is demoted to
+                          a faint parenthetical at the very end —
+                          bookkeeping, not trade information. */}
+                      <p className="mt-0.5 flex flex-wrap items-baseline gap-x-2 text-sm text-[var(--dim)]">
+                        {parsed.time && (
+                          <span className="num">{parsed.time}</span>
+                        )}
+                        {parsed.text && <span>{parsed.text}</span>}
+                        <span
+                          className="text-xs"
+                          style={{
+                            color:
+                              "color-mix(in srgb, var(--dim) 62%, transparent)",
+                          }}
+                        >
+                          （来源：{TRADE_SOURCE_LABELS[t.source]}）
+                        </span>
+                      </p>
                       {!readOnly && (
                         <div className="mt-1 flex gap-2 text-sm">
                           <button
