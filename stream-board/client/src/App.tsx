@@ -193,6 +193,14 @@ export function App() {
     queryKey: ["stream"],
     queryFn: () => api.getStream({}),
     refetchInterval: 5 * 60 * 1000,
+    // First-screen resilience: opening the board can hit a transient failure
+    // (webview hang, cold start, network reset). Retry with backoff before
+    // giving up — while retries are in flight the query stays pending, so
+    // the page shows only the loading state, never the error state. The
+    // error screen (with its manual retry button) appears only after every
+    // attempt has failed.
+    retry: 4,
+    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 10000),
   });
 
   const refresh = useMutation({
@@ -366,7 +374,7 @@ export function App() {
         {/* Event stream */}
         {stream.isPending ? (
           <p className="py-10 text-center text-sm text-[var(--dim)]">事件流加载中…</p>
-        ) : stream.isError ? (
+        ) : stream.isError && !data ? (
           <div className="py-10 text-center">
             <p className="text-sm text-[var(--dim)]">加载失败，请重试。</p>
             <button
