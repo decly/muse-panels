@@ -443,7 +443,9 @@ const fmtQty = (v: number) =>
 // page (after 集中度与结构）. Follows the account tabs: the global
 // view merges both accounts and is read-only (rows carry the account
 // name); a single-account view can add / edit / delete entries. The
-// realized-P/L summary at the top follows the same tab scope.
+// settled-P/L summary at the top （摊薄成本法： 只列已清仓结算；
+// 持仓中代码不进此块，其摊薄成本价在持仓行/详情里看） follows
+// the same tab scope.
 // Privacy mode masks the user's own execution prices and amounts
 // (they are account records, not public quotes); quantities, symbols,
 // dates and direction stay visible.
@@ -457,7 +459,7 @@ const fmtQty = (v: number) =>
 // trades keeps widening in 7-day steps until an older trade appears
 // (or everything is shown), and says how many tradeless days were
 // skipped — the list never just grows by an empty stretch. The
-// window only filters the list; the realized-P/L summary always
+// window only filters the list; the settled-P/L summary always
 // covers the whole ledger.
 //
 // 近1天 fallback (user request 2026-11-12): the ledger dates trades
@@ -666,9 +668,9 @@ function TradesSection({
   );
   const summary = data
     ? accountId
-      ? (data.realized.accounts.find((a) => a.account_id === accountId) ??
-        data.realized.global)
-      : data.realized.global
+      ? (data.settled.accounts.find((a) => a.account_id === accountId) ??
+        data.settled.global)
+      : data.settled.global
     : null;
 
   // 近1天 fallback: with the 1-day window picked and no trade dated
@@ -867,16 +869,21 @@ function TradesSection({
 
       {summary && (
         <div className="mt-3">
-          {/* Realized P/L (redesigned 2026-11-12): the total leads,
-              large and 红涨绿跌； below it each symbol gets a bar
-              scaled to the largest absolute realized value, growing
-              right of the zero line for gains and left for losses,
-              so winners / losers and their magnitudes read at a
-              glance. Always the whole ledger — the display window
-              never narrows it. An unknown symbol shows 未知， never
-              a fabricated 0. */}
+          {/* Settled P/L under the diluted-cost method （摊薄成本法，
+              layout redesigned 2026-11-12, basis switched the same
+              day): the total leads, large and 红涨绿跌 — and it
+              counts CLOSED cycles only （已清仓结算）: a sell alone
+              settles nothing, its proceeds dilute the cost of the
+              shares still held, and open positions never appear in
+              this block (their diluted cost is on the holdings
+              rows). Below the total each closed symbol gets a bar
+              scaled to the largest absolute settled value, growing
+              right of the zero line for gains and left for losses.
+              Always the whole ledger — the display window never
+              narrows it. An unknown figure shows 未知， never a
+              fabricated 0. */}
           <div className="flex flex-wrap items-baseline gap-x-2.5 gap-y-1">
-            <span className="text-sm text-[var(--dim)]">已实现盈亏</span>
+            <span className="text-sm text-[var(--dim)]">已清仓结算盈亏</span>
             {summary.total_usd == null ? (
               <span className="text-2xl font-bold text-[var(--dim)]">
                 未知
@@ -905,7 +912,7 @@ function TradesSection({
               const nameByAccount = new Map(
                 data.trades.map((t) => [t.account_id, t.account_name]),
               );
-              const subs = data.realized.accounts.filter(
+              const subs = data.settled.accounts.filter(
                 (a) => a.by_symbol.length > 0,
               );
               if (subs.length === 0) return null;
@@ -940,18 +947,18 @@ function TradesSection({
               const maxAbs = Math.max(
                 0,
                 ...summary.by_symbol.map((s) =>
-                  s.realized_usd == null ? 0 : Math.abs(s.realized_usd),
+                  s.settled_usd == null ? 0 : Math.abs(s.settled_usd),
                 ),
               );
               const ordered = [...summary.by_symbol].sort((a, b) => {
-                const av = a.realized_usd == null ? -1 : Math.abs(a.realized_usd);
-                const bv = b.realized_usd == null ? -1 : Math.abs(b.realized_usd);
+                const av = a.settled_usd == null ? -1 : Math.abs(a.settled_usd);
+                const bv = b.settled_usd == null ? -1 : Math.abs(b.settled_usd);
                 return bv - av;
               });
               return (
                 <ul className="mt-2.5 space-y-1.5">
                   {ordered.map((s) => {
-                    const v = s.realized_usd;
+                    const v = s.settled_usd;
                     const pct =
                       v != null && maxAbs > 0
                         ? (Math.abs(v) / maxAbs) * 50
@@ -1682,8 +1689,13 @@ export function App() {
       const dayChange =
         h.quote?.change != null ? h.quote.change * h.qty : null;
       const pnl = price != null ? (price - h.cost_per_share) * h.qty : null;
+      // Under the diluted-cost method a stored cost can be ≤ 0
+      // (sell proceeds covered the buys): the P/L amount stays
+      // meaningful — (price − cost) × qty — but a percentage
+      // against a non-positive base does not, so it renders "—"
+      // in the table and the expanded detail alike.
       const pnlPct =
-        price != null
+        price != null && h.cost_per_share > 0
           ? ((price - h.cost_per_share) / h.cost_per_share) * 100
           : null;
       return { h, price, mv, costBasis, dayChange, pnl, pnlPct };
@@ -3018,10 +3030,13 @@ export function App() {
                                 className="num shrink-0 whitespace-nowrap"
                                 style={{ color: pnlColor }}
                               >
-                                {r.pnl != null && r.pnlPct != null ? (
+                                {r.pnl != null ? (
                                   <>
                                     {mask(signedMoney(r.pnl))} (
-                                    {signedPct(r.pnlPct)})
+                                    {r.pnlPct != null
+                                      ? signedPct(r.pnlPct)
+                                      : "—"}
+                                    )
                                   </>
                                 ) : (
                                   "—"
@@ -3114,10 +3129,13 @@ export function App() {
                                 style={{ color: pnlColor }}
                               >
                                 浮盈亏{" "}
-                                {r.pnl != null && r.pnlPct != null ? (
+                                {r.pnl != null ? (
                                   <>
                                     {mask(signedMoney(r.pnl))} (
-                                    {signedPct(r.pnlPct)})
+                                    {r.pnlPct != null
+                                      ? signedPct(r.pnlPct)
+                                      : "—"}
+                                    )
                                   </>
                                 ) : (
                                   "—"

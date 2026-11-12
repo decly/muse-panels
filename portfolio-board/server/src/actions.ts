@@ -2196,15 +2196,26 @@ async function recalcSnapshotRow(
   const prev = rows
     .filter((r) => r.date < target.date)
     .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0))[0];
-  const dayChangeUsd = prev
-    ? accountValue - prev.accountValueUsd
-    : target.dayChangeUsd;
+  // The day change is re-derived from the account-value difference
+  // only when the recalculation actually moves the account value
+  // (a backfilled trade changed quantities or cash). A cost-only
+  // edit — e.g. restating a stored cost under a new cost method —
+  // leaves the value untouched, and the day change (which the daily
+  // refresh wrote from quote moves, a different basis than the raw
+  // value difference across days with trades / cash moves) stands
+  // as recorded: it does not depend on the cost basis.
+  const valueMoved =
+    Math.abs(accountValue - target.accountValueUsd) > 0.005;
+  const dayChangeUsd =
+    prev && valueMoved
+      ? accountValue - prev.accountValueUsd
+      : target.dayChangeUsd;
   const dayChangePct =
-    prev && prev.accountValueUsd > 0 && dayChangeUsd != null
-      ? (dayChangeUsd / prev.accountValueUsd) * 100
-      : prev
-        ? null
-        : target.dayChangePct;
+    prev && valueMoved
+      ? prev.accountValueUsd > 0 && dayChangeUsd != null
+        ? (dayChangeUsd / prev.accountValueUsd) * 100
+        : null
+      : target.dayChangePct;
   const fxRate = target.fxRate;
   await db
     .update(schema.dailySnapshots)
@@ -2279,8 +2290,10 @@ const extendedRefreshResponse = z.object({
 //
 // Pure record of the user's trades, per account. The ledger never
 // feeds holdings, quotes, totals or daily snapshots — it exists so
-// backfilled trades can be replayed exactly and realized P/L on sells
-// can be computed. Entries arrive from order fill records (source
+// backfilled trades can be replayed exactly and P/L can be computed
+// under the diluted-cost method （摊薄成本法）: sells do not settle
+// P/L on their own; a position's P/L settles only when a cycle
+// (quantity 0 → 0) closes. Entries arrive from order screenshots (source
 // "order"), whole-account snapshot diffs (source "snapshot_diff"),
 // the opening initialization (source "opening": side "buy" at the
 // broker cost price first recorded) or manual entry ("manual").
@@ -2308,36 +2321,41 @@ const tradeRowResponse = z.object({
 
 type TradeRowResponse = z.infer<typeof tradeRowResponse>;
 
-const realizedSymbolSchema = z.object({
+const settledSymbolSchema = z.object({
   symbol: z.string(),
-  // Null when the symbol's realized P/L is unknown (a sell price was
-  // unknown, or the cost basis at that point was unknown) — unknown
-  // is reported as unknown, never as 0.
-  realized_usd: z.number().nullable(),
-  // True when at least one valued sell used an estimated price.
+  // Settled P/L over CLOSED cycles only （已清仓结算）: for each cycle
+  // (quantity 0 → 0), Σ sell proceeds − Σ buy amounts, summed over
+  // every closed cycle. Null when the figure is unknown (an unpriced
+  // trade touched a closed cycle) — unknown is reported as unknown,
+  // never as 0.
+  settled_usd: z.number().nullable(),
+  // True when at least one valued trade used an estimated price.
   has_estimated: z.boolean(),
 });
 
-const realizedSummarySchema = z.object({
-  // Sum over the valued symbols. Null when any symbol's realized
-  // P/L is unknown (has_unknown); with no sells at all it is 0.
+const settledSummarySchema = z.object({
+  // Sum of settled_usd over the valued symbols. Null when any
+  // symbol's settled P/L is unknown (has_unknown); with no closed
+  // cycle at all it is 0. Settled cycles ONLY (user decision
+  // 2026-11-12): open positions never appear in this summary —
+  // their diluted cost is shown on the holdings rows instead.
   total_usd: z.number().nullable(),
   has_estimated: z.boolean(),
   has_unknown: z.boolean(),
-  by_symbol: z.array(realizedSymbolSchema),
+  by_symbol: z.array(settledSymbolSchema),
 });
 
-const realizedAccountSchema = realizedSummarySchema.extend({
+const settledAccountSchema = settledSummarySchema.extend({
   account_id: z.string(),
 });
 
-type RealizedSummary = z.infer<typeof realizedSummarySchema>;
+type SettledSummary = z.infer<typeof settledSummarySchema>;
 
 const tradesResponse = z.object({
   trades: z.array(tradeRowResponse),
-  realized: z.object({
-    global: realizedSummarySchema,
-    accounts: z.array(realizedAccountSchema),
+  settled: z.object({
+    global: settledSummarySchema,
+    accounts: z.array(settledAccountSchema),
   }),
 });
 
@@ -2418,97 +2436,141 @@ function toTradeRow(
   };
 }
 
-// Realized P/L replay for one (account, symbol) position, entries in
-// ascending date order: buys/opening entries fold into a weighted
-// average cost; a sell realizes qty × (sell price − average cost at
-// that moment). A sell whose price is unknown (price_kind "none") or
-// whose cost basis is unknown at that point (an earlier buy carried
-// no price, or the sell exceeds the recorded position) makes the
-// symbol's realized P/L unknown (null) rather than 0; a sell valued
-// with an estimated price counts but flags has_estimated.
-type RealizedAcc = {
+// Diluted-cost replay （摊薄成本法） for one (account, symbol)
+// position, entries in ascending date order (record order within a
+// date). A "cycle" runs from quantity 0 back to quantity 0. Within
+// a cycle a single cost pool is kept: a buy adds qty × price to the
+// pool, a sell SUBTRACTS qty × price (the proceeds) — sells never
+// settle P/L on their own. While the position is open, its diluted
+// cost per share is pool / qty (kept as-is, may be ≤ 0).
+//
+// Settlement is evaluated at TRADING-DAY granularity (user decision
+// 2026-11-12): a cycle settles only when the quantity is 0 after
+// ALL of the symbol's trades on one date have been applied — the
+// settled P/L then grows by the cycle's (Σ sells − Σ buys), i.e.
+// −pool at that day's close, and the pool resets to 0 for the next
+// cycle. A same-day sell-out followed by a buy-back is a 做T round
+// trip: the cycle does NOT settle, the pool carries over, and the
+// buy-back's diluted cost keeps the earlier sell proceeds in it. A
+// buy-back on a later date opens a fresh cycle, because the
+// close-out date already settled the old one.
+//
+// Price-kind rules are unchanged: an estimated price participates
+// and flags has_estimated; an entry with no price (price_kind
+// "none") makes the figures it touches unknown — the open pool /
+// diluted cost while its cycle is open, and the settled figure
+// once its cycle closes — reported as null, never as 0. A sell
+// exceeding the recorded position likewise taints its cycle.
+type DilutedAcc = {
+  // Shares held in the current cycle.
   qty: number;
-  costSum: number;
-  costKnown: boolean;
-  realized: number;
-  unknown: boolean;
+  // Current cycle's cost pool (Σ buys − Σ sells). Meaningful only
+  // while poolKnown.
+  pool: number;
+  poolKnown: boolean;
+  // Settled P/L summed over closed cycles. Meaningful only while
+  // settledKnown.
+  settled: number;
+  settledKnown: boolean;
+  hasClosedCycle: boolean;
   hasEstimated: boolean;
-  hasSell: boolean;
 };
 
-function replayRealized(
+function replayDilutedCost(
   entries: (typeof schema.trades.$inferSelect)[],
-): RealizedAcc {
-  const acc: RealizedAcc = {
+): DilutedAcc {
+  const acc: DilutedAcc = {
     qty: 0,
-    costSum: 0,
-    costKnown: true,
-    realized: 0,
-    unknown: false,
+    pool: 0,
+    poolKnown: true,
+    settled: 0,
+    settledKnown: true,
+    hasClosedCycle: false,
     hasEstimated: false,
-    hasSell: false,
   };
   const EPS = 1e-9;
-  for (const t of entries) {
-    if (t.side === "buy") {
-      if (t.price == null) {
-        // Shares acquired at an unknown price: any existing known
-        // cost can no longer describe the blended position.
-        if (acc.qty + t.qty > EPS) acc.costKnown = false;
-      } else if (acc.costKnown) {
-        acc.costSum += t.qty * t.price;
-      } else if (acc.qty <= EPS) {
-        acc.costSum = t.qty * t.price;
-        acc.costKnown = true;
+  // Entries arrive in ascending date order (record order within a
+  // date); process one trading date at a time and only then check
+  // for settlement — a quantity that touches 0 mid-day but is
+  // bought back the same day never closes the cycle.
+  let i = 0;
+  while (i < entries.length) {
+    const first = entries[i];
+    if (!first) break;
+    const date = first.date;
+    let dayTouched = false;
+    while (i < entries.length) {
+      const t = entries[i];
+      if (!t || t.date !== date) break;
+      i += 1;
+      dayTouched = true;
+      if (t.priceKind === "estimated" && t.price != null) {
+        acc.hasEstimated = true;
       }
-      // (cost unknown + shares held + priced buy: stays unknown)
-      acc.qty += t.qty;
-      continue;
-    }
-    // sell
-    acc.hasSell = true;
-    const covered = Math.min(t.qty, Math.max(acc.qty, 0));
-    if (t.price == null || !acc.costKnown || covered < t.qty - EPS) {
-      acc.unknown = true;
-    } else if (covered > EPS) {
-      const avgCost = acc.costSum / acc.qty;
-      acc.realized += covered * (t.price - avgCost);
-      if (t.priceKind === "estimated") acc.hasEstimated = true;
-    }
-    if (acc.qty > EPS && covered > 0) {
-      const avgCost = acc.costSum / acc.qty;
-      acc.costSum -= avgCost * covered;
+      if (t.side === "buy") {
+        if (t.price == null) {
+          // Shares acquired at an unknown price: the cycle's pool
+          // can no longer be stated.
+          acc.poolKnown = false;
+        } else if (acc.poolKnown) {
+          acc.pool += t.qty * t.price;
+        }
+        acc.qty += t.qty;
+        continue;
+      }
+      // sell
+      const covered = Math.min(t.qty, Math.max(acc.qty, 0));
+      if (t.price == null || covered < t.qty - EPS) {
+        // Unpriced sale, or a sale beyond the recorded position:
+        // the cycle's pool (and its eventual settlement) is
+        // unknown.
+        acc.poolKnown = false;
+      } else if (acc.poolKnown) {
+        acc.pool -= covered * t.price;
+      }
       acc.qty -= covered;
-      if (acc.qty <= EPS) {
-        acc.qty = 0;
-        acc.costSum = 0;
-        acc.costKnown = true;
+    }
+    if (dayTouched && acc.qty <= EPS) {
+      // The trading day ends flat: the cycle settles (Σ sells −
+      // Σ buys) = −pool, then the pool resets. An unpriceable
+      // cycle settles as unknown.
+      acc.qty = 0;
+      acc.hasClosedCycle = true;
+      if (acc.poolKnown) {
+        acc.settled += -acc.pool;
+      } else {
+        acc.settledKnown = false;
       }
-    } else if (covered > 0) {
-      acc.qty = Math.max(0, acc.qty - covered);
+      acc.pool = 0;
+      acc.poolKnown = true;
     }
   }
   return acc;
 }
 
-function summarizeRealized(
-  accs: Map<string, RealizedAcc>,
-): RealizedSummary {
-  const by_symbol: RealizedSummary["by_symbol"] = [];
+function summarizeSettled(
+  accs: Map<string, DilutedAcc>,
+): SettledSummary {
+  const by_symbol: SettledSummary["by_symbol"] = [];
   let total = 0;
   let hasUnknown = false;
   let hasEstimated = false;
   for (const symbol of [...accs.keys()].sort(cmpStr)) {
     const acc = accs.get(symbol);
-    if (!acc || !acc.hasSell) continue;
-    by_symbol.push({
-      symbol,
-      realized_usd: acc.unknown ? null : acc.realized,
-      has_estimated: acc.hasEstimated,
-    });
-    if (acc.unknown) hasUnknown = true;
-    else total += acc.realized;
-    if (acc.hasEstimated) hasEstimated = true;
+    if (!acc) continue;
+    // Settled cycles only: a symbol whose current cycle is still
+    // open contributes nothing here — its diluted cost lives on
+    // the holdings row, not in this summary.
+    if (acc.hasClosedCycle) {
+      by_symbol.push({
+        symbol,
+        settled_usd: acc.settledKnown ? acc.settled : null,
+        has_estimated: acc.hasEstimated,
+      });
+      if (!acc.settledKnown) hasUnknown = true;
+      else total += acc.settled;
+      if (acc.hasEstimated) hasEstimated = true;
+    }
   }
   return {
     total_usd: hasUnknown ? null : total,
@@ -2519,9 +2581,12 @@ function summarizeRealized(
 }
 
 // Loads every trade, returns the list (newest first, optionally
-// filtered to one account) plus realized-P/L summaries computed by
+// filtered to one account) plus diluted-cost summaries computed by
 // replaying each (account, symbol) position in date order — one
-// summary per account and one merged global summary.
+// summary per account and one merged global summary. The summaries
+// are derived at read time from the trades table alone; nothing is
+// stored, so a change of cost method re-presents the whole history
+// under the new method with no migration.
 async function loadTrades(
   ctx: Ctx,
   accountId?: string,
@@ -2537,7 +2602,7 @@ async function loadTrades(
     (x, y) => cmpStr(x.date, y.date) || x.id - y.id,
   );
   // Replay per (account, symbol).
-  const perAccount = new Map<string, Map<string, RealizedAcc>>();
+  const perAccount = new Map<string, Map<string, DilutedAcc>>();
   const grouped = new Map<string, (typeof rows)[number][]>();
   for (const t of ascending) {
     const key = `${t.accountId} ${t.symbol}`;
@@ -2554,19 +2619,23 @@ async function loadTrades(
       bySymbol = new Map();
       perAccount.set(accId, bySymbol);
     }
-    bySymbol.set(symbol, replayRealized(entries));
+    bySymbol.set(symbol, replayDilutedCost(entries));
   }
-  // Global summary merges the per-account accumulators by symbol.
-  const globalAccs = new Map<string, RealizedAcc>();
+  // Global summary merges the per-account accumulators by symbol:
+  // settled P/L sums across accounts (unknown if any account's is).
+  const globalAccs = new Map<string, DilutedAcc>();
   for (const bySymbol of perAccount.values()) {
     for (const [symbol, acc] of bySymbol) {
       const g = globalAccs.get(symbol);
       if (!g) {
         globalAccs.set(symbol, { ...acc });
       } else {
-        g.hasSell = g.hasSell || acc.hasSell;
-        g.realized += acc.realized;
-        g.unknown = g.unknown || acc.unknown;
+        g.qty += acc.qty;
+        g.pool += acc.pool;
+        g.poolKnown = g.poolKnown && acc.poolKnown;
+        g.settled += acc.settled;
+        g.settledKnown = g.settledKnown && acc.settledKnown;
+        g.hasClosedCycle = g.hasClosedCycle || acc.hasClosedCycle;
         g.hasEstimated = g.hasEstimated || acc.hasEstimated;
       }
     }
@@ -2576,7 +2645,7 @@ async function loadTrades(
     .sort(cmpStr)
     .map((id) => ({
       account_id: id,
-      ...summarizeRealized(perAccount.get(id) ?? new Map()),
+      ...summarizeSettled(perAccount.get(id) ?? new Map()),
     }));
   const list = rows
     .filter((t) => !accountId || t.accountId === accountId)
@@ -2584,8 +2653,8 @@ async function loadTrades(
     .map((t) => toTradeRow(t, nameById.get(t.accountId) ?? t.accountId));
   return {
     trades: list,
-    realized: {
-      global: summarizeRealized(globalAccs),
+    settled: {
+      global: summarizeSettled(globalAccs),
       accounts: accountsSummary,
     },
   };
@@ -3226,7 +3295,7 @@ export const Actions = {
 
   getTrades: defineAction({
     description:
-      "Returns the trade ledger （交易流水）: every recorded trade (optionally filtered to one account_id), newest first (date desc, id desc), each row carrying its account name. Also returns realized-P/L summaries computed by replaying each (account, symbol) position in date order — buys/opening entries fold into a weighted-average cost, a sell realizes qty × (sell price − average cost at that moment); a sell valued with an estimated price counts but flags has_estimated, and a sell with an unknown price or an unknown cost basis makes that symbol's realized P/L null (unknown, never 0) and the containing total null with has_unknown set. Summaries are provided globally and per account. The ledger is a pure record: nothing here touches holdings, quotes, totals or daily snapshots.",
+      "Returns the trade ledger （交易流水）: every recorded trade (optionally filtered to one account_id), newest first (date desc, id desc), each row carrying its account name. Also returns P/L summaries under the diluted-cost method （摊薄成本法）, computed at read time by replaying each (account, symbol) position in date order: within a cycle (quantity 0 → 0) buys add qty × price to a cost pool and sells subtract qty × price (proceeds), so an open position's diluted cost per share is pool / qty (kept as-is, may be ≤ 0). Settlement is evaluated at trading-day granularity: a cycle closes only when the quantity is 0 after all of the symbol's trades on one date are applied — a same-day sell-out followed by a buy-back is a 做T round trip that does not settle (the pool carries over), while a buy-back on a later date opens a fresh cycle. Only when a cycle closes does its (Σ sells − Σ buys) land in the settled total （已清仓结算）; summaries carry the settled total and per-symbol settled figures for closed cycles ONLY — open positions never appear (their diluted cost lives on the holdings rows). An estimated price participates and flags has_estimated; a trade with an unknown price makes the pool / diluted cost / settlement it touches null (unknown, never 0) and the containing settled total null with has_unknown set. Summaries are provided globally and per account. The ledger is a pure record: nothing here touches holdings, quotes, totals or daily snapshots.",
     request: z.object({
       account_id: z.string().min(1).max(40).optional(),
     }),
@@ -4436,11 +4505,11 @@ export const Actions = {
 
   updateHolding: defineAction({
     description:
-      "Updates the quantity and/or cost per share of one holding, then recalculates that account's latest daily snapshot from the current holdings at the stored regular close (backfilled-trade convergence; manual-sourced rows are protected and skipped). The edit itself always stands: the recalculation outcome rides along as snapshot_recalc (updated / skipped_no_snapshot / skipped_protected / failed) instead of failing the edit.",
+      "Updates the quantity and/or cost per share of one holding, then recalculates that account's latest daily snapshot from the current holdings at the stored regular close (backfilled-trade convergence; manual-sourced rows are protected and skipped). The edit itself always stands: the recalculation outcome rides along as snapshot_recalc (updated / skipped_no_snapshot / skipped_protected / failed) instead of failing the edit. cost_per_share may be ≤ 0: under the diluted-cost method a position whose sell proceeds exceeded its buy amounts carries a zero or negative cost, stored as-is.",
     request: z.object({
       id: z.number().int().positive(),
       qty: z.number().nonnegative(),
-      cost_per_share: z.number().nonnegative(),
+      cost_per_share: z.number(),
     }),
     response: z.object({
       ok: z.literal(true),
