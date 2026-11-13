@@ -878,6 +878,7 @@ async function loadPortfolio(ctx: Ctx): Promise<PortfolioResponse> {
     "CSI300",
     "A500",
     "HSTECH",
+    "HXC",
     "N225",
     "VNI",
     "GOLD",
@@ -1296,6 +1297,15 @@ const BENCHMARKS = [
 // Eastmoney is its source — price/change from the last two daily
 // closes, peak seeded from the full history back to the 2014 base
 // period: max close 10,945.22 on 2021-02-17).
+// 251.HXC is the Nasdaq Golden Dragon China Index (data.name
+// 纳斯达克中国金龙指数， verified live 2026-11-13). Yahoo's ^HXC was
+// tried first: it returns a live price but no usable history
+// (validRanges only 1d/5d, a single daily bar), so no peak could be
+// seeded from it; Eastmoney's series cross-checked exactly (2026-11-12
+// close 5,476.34 and −3.09% on both sources, day high/low identical).
+// Eastmoney's HXC history starts 2023-05-08 (884 daily rows), which
+// fully covers the trailing-3-year window; its max close — all-time
+// and 3y alike — is 8,852.95 on 2025-10-02.
 // Price/change come from the last two daily closes; the peak seed is
 // the same endpoint's full history. 中证A500's series carries
 // back-calculated history before its 2024 launch — seeded as returned.
@@ -1304,6 +1314,7 @@ const EM_INDICES = [
   { key: "CSI300", label: "沪深300", secid: "1.000300", note: "指数 · 常规收盘" },
   { key: "A500", label: "中证A500", secid: "1.000510", note: "指数 · 常规收盘" },
   { key: "HSTECH", label: "恒生科技", secid: "124.HSTECH", note: "指数 · 常规收盘" },
+  { key: "HXC", label: "金龙中国", secid: "251.HXC", note: "指数 · 常规收盘" },
   { key: "VNI", label: "越南胡志明", secid: "100.VNINDEX", note: "指数 · 常规收盘" },
 ] as const;
 
@@ -3335,7 +3346,7 @@ type PersonalImportResponse = z.infer<typeof personalImportResponse>;
 export const Actions = {
   getPortfolio: defineAction({
     description:
-      "Returns all accounts （券商A/券商B…) with their stored holdings, per-account cash and per-account daily history, plus the merged global view (same-symbol holdings combined across accounts, cash and history summed), the latest cached regular-close quotes, session-aware extended-hours annotations (pre-market / after-hours), the current US market session (America/New_York), the cached USD/CNY rate, and market benchmarks (S&P 500, Nasdaq-100, Nasdaq Composite, Shanghai Composite, CSI 300, CSI A500, Nikkei 225, Vietnam Ho Chi Minh Index, spot gold XAU/USD, Shanghai Gold Au99.99 in CNY/gram) — each benchmark carrying both its all-time highest close (peak_price/peak_date) and its trailing-3-year highest close (peak3y_price/peak3y_date).",
+      "Returns all accounts （券商A/券商B…) with their stored holdings, per-account cash and per-account daily history, plus the merged global view (same-symbol holdings combined across accounts, cash and history summed), the latest cached regular-close quotes, session-aware extended-hours annotations (pre-market / after-hours), the current US market session (America/New_York), the cached USD/CNY rate, and market benchmarks (S&P 500, Nasdaq-100, Nasdaq Composite, Shanghai Composite, CSI 300, CSI A500, Hang Seng TECH, Nasdaq Golden Dragon China, Nikkei 225, Vietnam Ho Chi Minh Index, spot gold XAU/USD, Shanghai Gold Au99.99 in CNY/gram) — each benchmark carrying both its all-time highest close (peak_price/peak_date) and its trailing-3-year highest close (peak3y_price/peak3y_date).",
     request: z.object({}),
     response: portfolioResponse,
     handler: async (ctx): Promise<PortfolioResponse> => loadPortfolio(ctx),
@@ -4243,7 +4254,7 @@ export const Actions = {
         }),
       );
 
-      // Eastmoney indices （上证 / 沪深300 / 中证A500 / 恒生科技 / 越南胡志明）:
+      // Eastmoney indices （上证 / 沪深300 / 中证A500 / 恒生科技 / 金龙中国 / 越南胡志明）:
       // price + day change from the last two daily closes, peak
       // seeded once from the same endpoint's full history.
       await Promise.all(

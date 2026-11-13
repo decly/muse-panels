@@ -117,7 +117,8 @@ export const fxSnapshots = sqliteTable("fx_snapshots", {
 });
 
 // Market benchmarks (S&P 500, Nasdaq-100, Nasdaq Composite, Shanghai
-// Composite, CSI 300, CSI A500, Hang Seng TECH, Nikkei 225, Vietnam
+// Composite, CSI 300, CSI A500, Hang Seng TECH, Nasdaq Golden Dragon
+// China, Nikkei 225, Vietnam
 // Ho Chi Minh Index, spot gold, Shanghai gold), one row per key, upserted by
 // refreshQuotes. peak_price / peak_date
 // hold the all-time highest close and the date it was set (YYYY-MM-DD):
