@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useEffect, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { SafeAreaTopScrim } from "@hatch/space-sdk/client";
 import { api, type ApiResponse } from "./api";
 
@@ -324,6 +324,7 @@ function EventRow({
 }
 
 export function App() {
+  const queryClient = useQueryClient();
   const [privacy, setPrivacy] = useState<boolean>(() => {
     try {
       return window.localStorage.getItem(PRIVACY_KEY) === "1";
@@ -345,6 +346,31 @@ export function App() {
     retry: 3,
     retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 8000),
   });
+
+  // Stall watchdog (same pattern as the history board): retries only
+  // fire when a request settles with a failure — a request that never
+  // settles in the webview would otherwise leave the page in the
+  // loading state forever. While the first-screen query is pending, a
+  // 30s interval cancels the stalled request and invalidates the query
+  // so it refetches; the query stays in its pending (loading) state
+  // throughout and no error surfaces from the watchdog itself. The
+  // interval is cleared as soon as the query leaves pending.
+  const todayIsPending = today.isPending;
+  useEffect(() => {
+    if (!todayIsPending) return;
+    const kickStalled = async () => {
+      try {
+        await queryClient.cancelQueries({ queryKey: ["today"] });
+        await queryClient.invalidateQueries({ queryKey: ["today"] });
+      } catch {
+        // A failed kick is harmless: the interval fires again.
+      }
+    };
+    const timer = window.setInterval(() => {
+      void kickStalled();
+    }, 30000);
+    return () => window.clearInterval(timer);
+  }, [todayIsPending, queryClient]);
 
   const togglePrivacy = () => {
     setPrivacy((prev) => {
