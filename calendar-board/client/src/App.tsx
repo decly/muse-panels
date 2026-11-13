@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useEffect, useMemo, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { SafeAreaTopScrim } from "@hatch/space-sdk/client";
 import { api, type ApiResponse } from "./api";
 
@@ -163,6 +163,27 @@ export function App() {
     retry: 4,
     retryDelay: (attempt) => Math.min(800 * 2 ** attempt, 8000),
   });
+
+  // Stall watchdog (same pattern as the history board): retries only fire
+  // when a request settles as failed, so a request that never returns would
+  // leave the page on 加载中 forever. While the first load is pending, every
+  // 30s cancel the stuck request and invalidate the query so it refetches;
+  // the query stays in its pending state throughout, never showing an error.
+  const queryClient = useQueryClient();
+  useEffect(() => {
+    if (!calendar.isPending) return;
+    const timer = setInterval(() => {
+      void (async () => {
+        try {
+          await queryClient.cancelQueries({ queryKey: ["calendar"] });
+          await queryClient.invalidateQueries({ queryKey: ["calendar"] });
+        } catch {
+          // Harmless if it fails — the next interval tick tries again.
+        }
+      })();
+    }, 30_000);
+    return () => clearInterval(timer);
+  }, [calendar.isPending, queryClient]);
 
   const data = calendar.data;
   const sections = useMemo(() => {
