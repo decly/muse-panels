@@ -140,7 +140,30 @@ function splitPoints(text: string): string[] {
   return cleaned.length > 0 ? cleaned : [text];
 }
 
-// Prose blocks render as an unordered bullet list, one point per row.
+// A trailing source attribution ("来源：A、B、C", possibly preceded by a
+// sentence break) is provenance, not content: it must never be split
+// into bullet points by splitPoints (its 、-enumeration would become
+// fake content rows). Extract it before splitting and render it as a
+// small muted line under the bullets. Only a 来源： that starts the
+// text or follows a sentence/clause break counts as an attribution.
+function extractSource(text: string): { body: string; source: string | null } {
+  const idx = text.lastIndexOf("来源：");
+  if (idx < 0) return { body: text, source: null };
+  const before = text.slice(0, idx);
+  if (before.trim().length > 0 && !/[。；;、\n]\s*$/.test(before)) {
+    return { body: text, source: null };
+  }
+  const source = text
+    .slice(idx)
+    .replace(/[。；;]\s*$/, "")
+    .trim();
+  const body = before.replace(/[。；;]\s*$/, "").trim();
+  if (!source) return { body: text, source: null };
+  return { body: body.length > 0 ? body : text, source: body.length > 0 ? source : null };
+}
+
+// Prose blocks render as an unordered bullet list, one point per row,
+// with any trailing 来源 attribution shown as a muted source line.
 function BulletText({
   text,
   className,
@@ -148,19 +171,25 @@ function BulletText({
   text: string;
   className?: string;
 }) {
-  const points = splitPoints(text);
+  const { body, source } = extractSource(text);
+  const points = splitPoints(body);
   return (
-    <ul className={`space-y-1.5 ${className ?? ""}`}>
-      {points.map((p, i) => (
-        <li key={i} className="flex items-start gap-2.5">
-          <span
-            aria-hidden="true"
-            className="mt-[0.62em] h-[7px] w-[7px] shrink-0 rounded-full bg-[var(--dim)]"
-          />
-          <span className="min-w-0 flex-1">{p}</span>
-        </li>
-      ))}
-    </ul>
+    <>
+      <ul className={`space-y-1.5 ${className ?? ""}`}>
+        {points.map((p, i) => (
+          <li key={i} className="flex items-start gap-2.5">
+            <span
+              aria-hidden="true"
+              className="mt-[0.62em] h-[7px] w-[7px] shrink-0 rounded-full bg-[var(--dim)]"
+            />
+            <span className="min-w-0 flex-1">{p}</span>
+          </li>
+        ))}
+      </ul>
+      {source ? (
+        <p className="mt-2 text-xs leading-5 text-[var(--dim)]">{source}</p>
+      ) : null}
+    </>
   );
 }
 
