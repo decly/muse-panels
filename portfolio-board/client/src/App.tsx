@@ -604,6 +604,23 @@ function TradesSection({
     retry: firstLoadRetry,
     retryDelay: firstLoadRetryDelay,
   });
+  // Stalled-request watchdog, same pattern as the portfolio query
+  // (and the history board): if the first trades request never
+  // settles, cancel + invalidate every 30s while pending so it
+  // refetches; the query stays in its loading state, no error shown.
+  useEffect(() => {
+    if (!tradesQuery.isPending) return;
+    const timer = setInterval(async () => {
+      try {
+        await queryClient.cancelQueries({ queryKey: ["trades"] });
+        await queryClient.invalidateQueries({ queryKey: ["trades"] });
+      } catch {
+        // Harmless: the next interval tick tries again.
+      }
+    }, 30000);
+    return () => clearInterval(timer);
+  }, [tradesQuery.isPending, queryClient]);
+
   const invalidate = () =>
     queryClient.invalidateQueries({ queryKey: ["trades"] });
   const addTrade = useMutation({
@@ -1398,6 +1415,26 @@ export function App() {
     retry: firstLoadRetry,
     retryDelay: firstLoadRetryDelay,
   });
+
+  // Stalled-request watchdog (same pattern as the history board):
+  // the retry policy above only fires when a request settles as a
+  // failure. If a webview request never settles at all, the query
+  // would sit in its loading state forever. While the query is
+  // pending, every 30s cancel the stuck request and invalidate the
+  // query so it refetches; the query stays in its loading state
+  // throughout — the watchdog never surfaces an error.
+  useEffect(() => {
+    if (!portfolio.isPending) return;
+    const timer = setInterval(async () => {
+      try {
+        await queryClient.cancelQueries({ queryKey: ["portfolio"] });
+        await queryClient.invalidateQueries({ queryKey: ["portfolio"] });
+      } catch {
+        // Harmless: the next interval tick tries again.
+      }
+    }, 30000);
+    return () => clearInterval(timer);
+  }, [portfolio.isPending, queryClient]);
 
   const refresh = useMutation({
     mutationFn: () => api.refreshQuotes({}),
