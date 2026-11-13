@@ -110,7 +110,6 @@ const TABLE_COLS: { key: SortKey; label: string }[] = [
   { key: "qty", label: "股数" },
   { key: "weight", label: "占比" },
 ];
-const SORT_KEYS: SortKey[] = TABLE_COLS.map((c) => c.key);
 
 // Segment colors for the concentration stacked bar, assigned in
 // descending theme-size order.
@@ -1611,36 +1610,15 @@ export function App() {
       /* storage unavailable */
     }
   }, [density]);
-  // Table sort: default 市值 descending (same as the card list). Clicking
-  // a header selects that column (numbers descending, 股票 ascending);
-  // clicking the active column flips direction. Persisted like density.
+  // Table sort: default 占比 descending (same order as the card list).
+  // Clicking a header selects that column (numbers descending, 股票
+  // ascending); clicking the active column flips direction. The choice
+  // is session-only: NOT persisted — every page open and every account
+  // tab switch returns to 占比 descending (user request 2026-11-13).
   const [tableSort, setTableSort] = useState<{
     key: SortKey;
     dir: 1 | -1;
-  }>(() => {
-    try {
-      const raw = localStorage.getItem("portfolio-board-table-sort");
-      if (raw) {
-        const p = JSON.parse(raw) as { key?: string; dir?: number };
-        if (p.key && (SORT_KEYS as string[]).includes(p.key)) {
-          return { key: p.key as SortKey, dir: p.dir === 1 ? 1 : -1 };
-        }
-      }
-    } catch {
-      /* storage unavailable or malformed */
-    }
-    return { key: "mv", dir: -1 };
-  });
-  useEffect(() => {
-    try {
-      localStorage.setItem(
-        "portfolio-board-table-sort",
-        JSON.stringify(tableSort),
-      );
-    } catch {
-      /* storage unavailable */
-    }
-  }, [tableSort]);
+  }>({ key: "weight", dir: -1 });
   const toggleSort = (key: SortKey) =>
     setTableSort((s) =>
       s.key === key
@@ -1669,11 +1647,16 @@ export function App() {
     setExpanded(null);
     setShowAdd(false);
     setShowCashEdit(false);
+    // Table sort is view-only: switching tabs returns it to the
+    // default 占比 descending (user request 2026-11-13).
+    setTableSort({ key: "weight", dir: -1 });
   };
-  // Market strip collapse: the ten benchmark rows can be folded down
-  // to just the first two (SPX / NDX, user-confirmed 2026-11-09); the
-  // column-header row doubles as the full-width toggle and always
-  // stays visible. Default expanded; the choice persists across opens.
+  // Market strip collapse: the twelve benchmark rows can be folded
+  // down to just the first two (SPX / NDX, user-confirmed 2026-11-09);
+  // the whole strip (header row + every data row) is the toggle —
+  // the click handler lives on the section and the header button's
+  // clicks bubble up to it (2026-11-13). Default expanded; the choice
+  // persists across opens.
   const [marketExpanded, setMarketExpanded] = useState<boolean>(() => {
     try {
       return localStorage.getItem("portfolio-board-market-expanded") !== "0";
@@ -1750,9 +1733,24 @@ export function App() {
     const dayPct = prevTotal > 0 ? (totalDay / prevTotal) * 100 : 0;
     const totalPnl = totalMv - totalCost;
     const totalPnlPct = totalCost > 0 ? (totalPnl / totalCost) * 100 : 0;
-    const sorted = [...rows].sort(
-      (a, b) => (b.mv ?? b.costBasis) - (a.mv ?? a.costBasis),
-    );
+    // Holdings order (standard/card list, and the base order the table
+    // falls back to): 市值占比 descending — the largest position first
+    // (user request 2026-11-13). Weight is mv ÷ totalMv of THIS view,
+    // so each account tab (and the merged global view) sorts by its own
+    // weights. Ties break by market value, then symbol, for a stable
+    // order; unpriced rows (no weight) sink to the bottom.
+    const weightOf = (r: (typeof rows)[number]) =>
+      r.mv != null && totalMv > 0 ? (r.mv / totalMv) * 100 : null;
+    const sorted = [...rows].sort((a, b) => {
+      const wa = weightOf(a);
+      const wb = weightOf(b);
+      if (wa != null && wb != null && wb !== wa) return wb - wa;
+      if (wa == null && wb != null) return 1;
+      if (wa != null && wb == null) return -1;
+      const mvCmp = (b.mv ?? b.costBasis) - (a.mv ?? a.costBasis);
+      if (mvCmp !== 0) return mvCmp;
+      return a.h.symbol.localeCompare(b.h.symbol);
+    });
     const themes = new Map<string, number>();
     for (const r of priced) {
       themes.set(r.h.theme, (themes.get(r.h.theme) ?? 0) + (r.mv ?? 0));
@@ -2015,31 +2013,34 @@ export function App() {
                 the stored price and the 距高点 math keep full
                 precision), which lets the price column run narrower
                 and gives the two percentage columns more room. The
-                header row itself is the collapse toggle (full-width
-                button, ~36px tall): tapping anywhere on it folds the
-                strip down to the first two rows （标普500 / 纳指100）
-                or expands it back to all eleven; default expanded
-                and the choice persists. */}
+                WHOLE strip is the collapse toggle (2026-11-13):
+                clicking anywhere on the section — the header row or
+                any benchmark row — folds the strip down to the first
+                two rows （标普500 / 纳指100） or expands it back to
+                all twelve; default expanded and the choice persists.
+                Rows carry no links or buttons, so no click conflicts. */}
             {data.market.length > 0 && (
               <section
                 aria-label="市场行情"
-                className="mt-3 rounded-[var(--radius)] bg-[var(--surface)] px-3 py-1.5"
+                onClick={() => setMarketExpanded((v) => !v)}
+                className="mt-3 cursor-pointer rounded-[var(--radius)] bg-[var(--surface)] px-3 py-1.5"
               >
                 <div className="divide-y divide-[color-mix(in_srgb,var(--border)_55%,transparent)]">
-                  {/* Column-header row = the collapse toggle: the
-                      whole row is one full-width button (~36px tall),
-                      so tapping anywhere on it — labels included —
-                      folds/expands the strip. The name column shows the
-                      state hint （收起/展开 + arrow) instead of a label
+                  {/* Column-header row: a full-width button (~36px
+                      tall) carrying the state hint （收起/展开 +
+                      arrow) in the name column instead of a label
                       (names are self-evident); the three right columns
                       keep the exact widths / alignment of the data
-                      rows below, in both states, so nothing shifts. */}
+                      rows below, in both states, so nothing shifts.
+                      The button has no onClick of its own — its clicks
+                      (pointer or keyboard activation) bubble up to the
+                      section, whose onClick toggles the strip, so the
+                      header and every data row behave identically. */}
                   <button
                     type="button"
                     aria-expanded={marketExpanded}
                     aria-label={marketExpanded ? "收起市场行情" : "展开市场行情"}
-                    onClick={() => setMarketExpanded((v) => !v)}
-                    className="flex min-h-[36px] w-full items-center gap-x-2 text-left text-[11px] leading-4 text-[var(--dim)] transition-opacity active:opacity-50"
+                    className="flex min-h-[36px] w-full cursor-pointer items-center gap-x-2 text-left text-[11px] leading-4 text-[var(--dim)] transition-opacity active:opacity-50"
                   >
                     <span className="flex min-w-0 flex-1 items-center gap-1">
                       {marketExpanded ? "收起" : "展开"}
