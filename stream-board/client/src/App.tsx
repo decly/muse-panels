@@ -1,4 +1,4 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { SafeAreaTopScrim } from "@hatch/space-sdk/client";
 import { api, type ApiResponse } from "./api";
@@ -202,6 +202,27 @@ export function App() {
     retry: 4,
     retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 10000),
   });
+
+  // Stall watchdog (same pattern as the history board): if the first-screen
+  // query never settles (webview hang), the retry policy above never fires
+  // and the page would sit on the loading state forever. While the query is
+  // pending, every 30s cancel the stuck request and invalidate the query so
+  // React Query refetches it. Runs only during the no-data first load —
+  // once data exists the background refetch path is untouched. The watchdog
+  // itself never surfaces an error; failures are ignored until the next tick.
+  const streamIsPending = stream.isPending;
+  useEffect(() => {
+    if (!streamIsPending) return;
+    const timer = setInterval(async () => {
+      try {
+        await queryClient.cancelQueries({ queryKey: ["stream"] });
+        await queryClient.invalidateQueries({ queryKey: ["stream"] });
+      } catch {
+        // Harmless — the next interval tick tries again.
+      }
+    }, 30000);
+    return () => clearInterval(timer);
+  }, [streamIsPending, queryClient]);
 
   const refresh = useMutation({
     mutationFn: async () => await api.refreshStrip({}),
