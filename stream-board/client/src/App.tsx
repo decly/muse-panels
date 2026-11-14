@@ -155,6 +155,33 @@ function richText(text: string, tickers: string[]): ReactNode {
   );
 }
 
+/**
+ * Event note: a single paragraph renders as before; a multi-line note is
+ * rendered as an unordered list, one line per item.
+ */
+function NoteText({ note, tickers }: { note: string; tickers: string[] }) {
+  const lines = note
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  if (lines.length <= 1) {
+    return (
+      <p className="mt-1.5 break-words text-[15px] leading-[1.5] text-[var(--dim)]">
+        {richText(note, tickers)}
+      </p>
+    );
+  }
+  return (
+    <ul className="mt-1.5 list-disc space-y-0.5 pl-5 text-[15px] leading-[1.5] text-[var(--dim)]">
+      {lines.map((line, i) => (
+        <li key={i} className="break-words">
+          {richText(line, tickers)}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 type Mover = StreamEvent["movers"][number];
 
 function fmtMoverChange(pct: number): string {
@@ -447,9 +474,7 @@ export function App() {
                           {richText(e.keyNumbers, e.tickers)}
                         </p>
                       ) : null}
-                      <p className="mt-1.5 break-words text-[15px] leading-[1.5] text-[var(--dim)]">
-                        {richText(e.note, e.tickers)}
-                      </p>
+                      <NoteText note={e.note} tickers={e.tickers} />
                       {e.impact ? (
                         <p className="mt-2 break-words border-l-[3px] bg-[var(--bg)] py-1 pl-2.5 pr-2 text-[14px] leading-6" style={{ borderColor: meta.color }}>
                           <span className="mr-1.5 font-semibold" style={{ color: meta.color }}>
