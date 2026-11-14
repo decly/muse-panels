@@ -1,6 +1,6 @@
 # muse-panels
 
-我用 Muse 搭建的全部面板（Web Artifact）源码归档库 — 六个面板各占一个
+我用 Muse 搭建的全部面板（Web Artifact）源码归档库 — 七个面板各占一个
 子目录，线上托管页面是运行副本、本仓库是源码的版本管理归档；代码与数据
 严格分离（见「维护机制」）。
 
@@ -14,6 +14,7 @@
 | 看板 · 全天动态 | `stream-board/` | 24 小时全资产事件流：七类事件、顶部实时行情条，事件保留 7 天 | kan-ban-quan-tian-dong-tai |
 | 看板 · 待办总览 | `todo-board/` | 跨对话待办面板：待拍板 / 进行中 / 已办三区，面板内可拍板、巡检执行回写 | kan-ban-dai-ban-zong-lan |
 | 看板 · 事件日历 | `calendar-board/` | 事件单一事实来源：未来 30 天财报 + 宏观日程滚动清单、按周分组、未确认财报日期标注 | kan-ban-shi-jian-ri-li |
+| 看板 · A股持仓 | `cn-portfolio-board/` | 人民币 A 股单账户持仓 + 板内历史：持仓明细、集中度、交易流水、每日快照，东方财富报价 | kan-ban-agu-chi-cang |
 
 每个面板目录下有独立的 README.md，写明该面板的功能、服务端动作清单与
 特有维护口径。
@@ -64,4 +65,5 @@ today-board/       看板 · 今日页（client / server / drizzle）
 stream-board/      看板 · 全天动态（client / server / drizzle）
 todo-board/        看板 · 待办总览（client / server / drizzle）
 calendar-board/    看板 · 事件日历（client / server / drizzle）
+cn-portfolio-board/   看板 · A股持仓（client / server / drizzle）
 ```
