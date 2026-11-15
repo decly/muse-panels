@@ -2232,8 +2232,8 @@ export function App() {
         />
         <HoldingsSection board={data} totals={totals} mask={mask} />
         <Concentration board={data} totals={totals} mask={mask} />
-        <TradesSection mask={mask} />
         <HistorySection history={data.history} mask={mask} />
+        <TradesSection mask={mask} />
         <DataSection />
       </main>
     </div>
