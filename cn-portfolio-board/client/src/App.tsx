@@ -1686,11 +1686,11 @@ function TradesSection({ mask }: { mask: (s: string) => string }) {
                         )}
                       </span>
                     </div>
-                    {t.note && (
+                    {t.note?.trim() ? (
                       <p className="mt-0.5 leading-relaxed break-words">
                         备注：{t.note}
                       </p>
-                    )}
+                    ) : null}
                   </div>
                 </li>
               ))}
