@@ -1010,50 +1010,52 @@ function HoldingsSection({
           ))}
         </ul>
       ) : (
-        <div className="overflow-x-auto border-y border-[var(--border)]">
-          <table className="tnum w-full min-w-[980px] border-collapse text-sm">
-            <thead>
-              <tr>
-                {columns.map((c, i) => (
-                  <th
-                    key={c.key}
-                    className={`bg-[var(--surface)] px-2 py-2 text-xs font-medium whitespace-nowrap text-[var(--dim)] ${i === 0 ? "sticky left-0 z-10 min-w-[9rem] text-left" : "text-right"}`}
-                  >
-                    <button
-                      type="button"
-                      aria-label={`按${c.label}排序`}
-                      onClick={() => clickSort(c.key)}
-                      className="min-h-0 px-0.5"
-                    >
-                      {c.label}
-                      {sortKey === c.key ? (sortAsc ? " ↑" : " ↓") : ""}
-                    </button>
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {tableRows.map((h) => (
-                <tr
-                  key={h.id}
-                  className="cursor-pointer border-t border-[var(--border)]"
-                  onClick={() => {
-                    pickDensity("standard");
-                    setExpanded(h.id);
-                  }}
-                >
+        <div className="border-y border-[var(--border)]">
+          <div className="overflow-auto" style={{ maxHeight: "75vh" }}>
+            <table className="tnum w-full min-w-[980px] border-collapse text-sm">
+              <thead>
+                <tr>
                   {columns.map((c, i) => (
-                    <td
+                    <th
                       key={c.key}
-                      className={`px-2 py-2 whitespace-nowrap ${i === 0 ? "sticky left-0 bg-[var(--surface)]" : "text-right"}`}
+                      className={`sticky top-0 border-b border-[var(--border)] bg-[var(--surface)] px-2 py-2 text-xs font-medium whitespace-nowrap text-[var(--dim)] ${i === 0 ? "left-0 z-30 min-w-[9rem] text-left" : "z-20 text-right"}`}
                     >
-                      {cell(h, c.key)}
-                    </td>
+                      <button
+                        type="button"
+                        aria-label={`按${c.label}排序`}
+                        onClick={() => clickSort(c.key)}
+                        className="min-h-0 px-0.5"
+                      >
+                        {c.label}
+                        {sortKey === c.key ? (sortAsc ? " ↑" : " ↓") : ""}
+                      </button>
+                    </th>
                   ))}
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {tableRows.map((h) => (
+                  <tr
+                    key={h.id}
+                    className="cursor-pointer border-t border-[var(--border)]"
+                    onClick={() => {
+                      pickDensity("standard");
+                      setExpanded(h.id);
+                    }}
+                  >
+                    {columns.map((c, i) => (
+                      <td
+                        key={c.key}
+                        className={`px-2 py-2 whitespace-nowrap ${i === 0 ? "sticky left-0 bg-[var(--surface)]" : "text-right"}`}
+                      >
+                        {cell(h, c.key)}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
           <p className="px-1 py-1.5 text-[11px] text-[var(--dim)]">
             点任意行回到标准模式编辑该持仓；点表头排序仅本次会话有效。
           </p>
