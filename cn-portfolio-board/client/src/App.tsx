@@ -1009,6 +1009,107 @@ function HoldingsSection({
 
 // ---------- concentration ----------
 
+// ---------- concentration ----------
+
+// Concentration groups holdings by underlying exposure: ETFs from
+// different issuers tracking the same index (e.g. the three Nasdaq-100
+// ETFs) merge into one category. The symbol map wins; name keywords
+// are the fallback for holdings added later; anything unmatched forms
+// its own category under its own name. Colors are stable per category.
+const CONC_CATEGORIES: {
+  label: string;
+  color: string;
+  symbols: string[];
+  keywords: string[];
+}[] = [
+  {
+    label: "纳斯达克100",
+    color: "#4e79a7",
+    symbols: ["513100", "159941"],
+    keywords: ["纳斯达克", "纳指"],
+  },
+  {
+    label: "红利低波",
+    color: "#f28e2b",
+    symbols: ["512890"],
+    keywords: ["红利"],
+  },
+  {
+    label: "标普500",
+    color: "#76b7b2",
+    symbols: ["513500"],
+    keywords: ["标普"],
+  },
+  { label: "黄金", color: "#c9a227", symbols: ["518800"], keywords: ["黄金"] },
+  {
+    label: "日经225",
+    color: "#b07aa1",
+    symbols: ["513880"],
+    keywords: ["日经"],
+  },
+  {
+    label: "恒生科技",
+    color: "#e15759",
+    symbols: ["513180"],
+    keywords: ["恒生"],
+  },
+  {
+    label: "沪深300",
+    color: "#59a14f",
+    symbols: ["159919"],
+    keywords: ["沪深300"],
+  },
+  {
+    label: "中证A500",
+    color: "#9c755f",
+    symbols: ["159338"],
+    keywords: ["A500"],
+  },
+  {
+    label: "中概互联",
+    color: "#7f8c9b",
+    symbols: ["164906"],
+    keywords: ["中概", "互联网"],
+  },
+];
+const CONC_FALLBACK_COLORS = [
+  "#4e79a7",
+  "#f28e2b",
+  "#76b7b2",
+  "#c9a227",
+  "#b07aa1",
+  "#59a14f",
+  "#9c755f",
+  "#7f8c9b",
+];
+const CONC_CASH_COLOR = "#a8adb3";
+
+function categoryOf(
+  h: HoldingRow,
+  fallbackIdx: number,
+): { label: string; color: string } {
+  for (const c of CONC_CATEGORIES) {
+    if (c.symbols.includes(h.symbol)) return c;
+  }
+  for (const c of CONC_CATEGORIES) {
+    if (c.keywords.some((k) => h.name.includes(k))) return c;
+  }
+  return {
+    label: h.name,
+    color:
+      CONC_FALLBACK_COLORS[fallbackIdx % CONC_FALLBACK_COLORS.length] ??
+      "#7f8c9b",
+  };
+}
+
+type ConcGroup = {
+  label: string;
+  color: string;
+  share: number;
+  mv: number | null;
+  members: HoldingRow[];
+};
+
 function Concentration({
   board,
   totals,
@@ -1018,53 +1119,87 @@ function Concentration({
   totals: Totals;
   mask: (s: string) => string;
 }) {
-  const rows = enrichHoldings(board, totals)
-    .filter((h) => h.share != null)
-    .sort((a, b) => (b.share ?? 0) - (a.share ?? 0));
+  const rows = enrichHoldings(board, totals).filter((h) => h.share != null);
   const cashShare =
     board.cash_cny != null && totals.total != null && totals.total > 0
       ? (board.cash_cny / totals.total) * 100
       : null;
   if (rows.length === 0 && cashShare == null) return null;
-  const bar = (share: number) => (
-    <span className="block h-2 flex-1 bg-[var(--surface-alt)]">
-      <span
-        className="block h-2"
-        style={{
-          width: `${Math.min(100, Math.max(share, 0.5))}%`,
-          background: "var(--accent)",
-        }}
-      />
-    </span>
-  );
+  const groups = new Map<string, ConcGroup>();
+  rows.forEach((h, i) => {
+    const cat = categoryOf(h, i);
+    const g = groups.get(cat.label) ?? {
+      label: cat.label,
+      color: cat.color,
+      share: 0,
+      mv: 0,
+      members: [],
+    };
+    g.share += h.share ?? 0;
+    g.mv = (g.mv ?? 0) + (h.mv ?? 0);
+    g.members.push(h);
+    groups.set(cat.label, g);
+  });
+  const list: ConcGroup[] = [...groups.values()];
+  if (cashShare != null) {
+    list.push({
+      label: "现金",
+      color: CONC_CASH_COLOR,
+      share: cashShare,
+      mv: board.cash_cny,
+      members: [],
+    });
+  }
+  list.sort((a, b) => b.share - a.share);
   return (
     <section aria-label="集中度">
       <SectionTitle>集中度</SectionTitle>
-      <ul className="space-y-2">
-        {rows.map((h) => (
-          <li key={h.id} className="flex items-center gap-2 text-sm">
-            <span className="w-44 shrink-0 truncate">
-              {h.name}
-              <span className="ml-1 text-xs text-[var(--dim)]">{h.symbol}</span>
+      <div
+        className="flex h-3 w-full overflow-hidden rounded-sm"
+        role="img"
+        aria-label="各类资产占比分段条"
+      >
+        {list.map((g) => (
+          <span
+            key={g.label}
+            style={{ width: `${g.share}%`, background: g.color }}
+          />
+        ))}
+      </div>
+      <ul className="mt-3 space-y-2.5">
+        {list.map((g) => (
+          <li key={g.label} className="flex items-center gap-2 text-sm">
+            <span
+              className="h-2.5 w-2.5 shrink-0 rounded-[3px]"
+              style={{ background: g.color }}
+            />
+            <span className="min-w-0 flex-1">
+              <span className="block truncate whitespace-nowrap">
+                {g.label}
+                {g.members.length > 1 && (
+                  <span className="text-xs text-[var(--dim)]">
+                    {" "}
+                    · {g.members.length}只
+                  </span>
+                )}
+              </span>
+              {g.members.length > 1 && (
+                <span className="block truncate text-[11px] whitespace-nowrap text-[var(--dim)]">
+                  {g.members.map((m) => m.name).join("、")}
+                </span>
+              )}
             </span>
-            {bar(h.share ?? 0)}
-            <span className="tnum w-24 shrink-0 text-right text-xs text-[var(--dim)]">
-              {(h.share ?? 0).toFixed(2)}% · {h.mv != null ? mask(fmtMoney(h.mv)) : "—"}
+            <span className="tnum w-16 shrink-0 text-right font-medium whitespace-nowrap">
+              {g.share.toFixed(2)}%
+            </span>
+            <span className="tnum w-[6.5rem] shrink-0 text-right text-xs whitespace-nowrap text-[var(--dim)]">
+              {g.mv != null ? mask(fmtMoney(g.mv)) : "—"}
             </span>
           </li>
         ))}
-        {cashShare != null && (
-          <li className="flex items-center gap-2 text-sm">
-            <span className="w-44 shrink-0">现金</span>
-            {bar(cashShare)}
-            <span className="tnum w-24 shrink-0 text-right text-xs text-[var(--dim)]">
-              {cashShare.toFixed(2)}% · {mask(fmtMoney(board.cash_cny ?? 0))}
-            </span>
-          </li>
-        )}
       </ul>
       <p className="mt-1.5 text-[11px] text-[var(--dim)]">
-        占比按总账户值计（现金未录入时按证券市值计）。
+        按底层敞口归类，同一指数的多只 ETF 合并；占比按总账户值计（现金未录入时按证券市值计）。
       </p>
     </section>
   );
