@@ -188,30 +188,27 @@ function MarketStrip({ market }: { market: Board["market"] }) {
     ? market.filter((m) => m.key === "CSI300" || m.key === "CSIA500")
     : market;
   return (
-    <section aria-label="行情">
+    // The whole strip is the collapse toggle (same behaviour as the
+    // US board): clicking anywhere — the header or any benchmark row —
+    // folds it to exactly two rows （沪深300 / 中证A500) or expands it
+    // back to all five; the choice persists. The header button has no
+    // onClick of its own; its clicks bubble up to the section.
+    <section
+      aria-label="行情"
+      onClick={() => setCollapsed(!collapsed)}
+      className="cursor-pointer"
+    >
       <button
         type="button"
         aria-expanded={!collapsed}
         aria-label={collapsed ? "展开行情条" : "折叠行情条"}
-        onClick={() => setCollapsed(!collapsed)}
         className="flex w-full items-center justify-between py-2 text-left"
       >
         <span className="text-xs text-[var(--dim)]">
           行情 {collapsed ? "▸" : "▾"}
         </span>
-        {collapsed && (
-          <span className="tnum text-xs text-[var(--dim)]">
-            {shown
-              .map(
-                (m) =>
-                  `${m.label} ${m.price != null ? Math.round(m.price).toLocaleString("zh-CN") : "—"}`,
-              )
-              .join(" · ")}
-          </span>
-        )}
       </button>
-      {!collapsed && (
-        <ul className="divide-y divide-[var(--border)] border-y border-[var(--border)]">
+      <ul className="divide-y divide-[var(--border)] border-y border-[var(--border)]">
           {shown.map((m) => {
             const drawdown =
               m.price != null && m.peak3y_price != null && m.peak3y_price > 0
@@ -241,9 +238,8 @@ function MarketStrip({ market }: { market: Board["market"] }) {
               </li>
             );
           })}
-        </ul>
-      )}
-      {!collapsed && market.every((m) => m.price == null) && (
+      </ul>
+      {market.every((m) => m.price == null) && (
         <p className="py-1 text-xs text-[var(--dim)]">
           暂无行情，点下方「刷新报价」拉取东方财富收盘数据。
         </p>
@@ -660,13 +656,6 @@ function HoldingDetail({
 
 type SortKey = "stock" | "chg" | "price" | "cost" | "pnlPct" | "pnl" | "mv" | "costAmt" | "qty" | "share";
 
-// Standard-mode column budget (fits a 390px phone with no horizontal
-// scroll and nothing clipped): name takes the remainder (≥ ~116px, so
-// the longest names like 纳斯达克100ETF招商 fit on one line at 12px),
-// then fixed right-aligned numeric columns — 涨跌幅 / 现价 / 成本价 /
-// 浮盈亏% / 市值 (price columns render at 11px to stay narrow).
-const HOLD_GRID = "minmax(0,1fr) 2.75rem 2.25rem 2.25rem 3.25rem 4.5rem";
-
 function HoldingsSection({
   board,
   totals,
@@ -956,69 +945,53 @@ function HoldingsSection({
           暂无持仓 · 等待录入。
         </p>
       ) : density === "standard" ? (
-        <div className="border-y border-[var(--border)]">
-          <div
-            className="grid items-baseline gap-0.5 border-b border-[var(--border)] px-1 py-1.5 text-[11px] whitespace-nowrap text-[var(--dim)]"
-            style={{ gridTemplateColumns: HOLD_GRID }}
-            aria-hidden="true"
-          >
-            <span>股票</span>
-            <span className="text-right">涨跌幅</span>
-            <span className="text-right">现价</span>
-            <span className="text-right">成本价</span>
-            <span className="text-right">浮盈亏%</span>
-            <span className="text-right">市值</span>
-          </div>
-          <ul className="divide-y divide-[var(--border)]">
-            {byShare.map((h) => (
-              <li key={h.id}>
-                <button
-                  type="button"
-                  aria-expanded={expanded === h.id}
-                  aria-label={`${h.name} 明细`}
-                  onClick={() => setExpanded(expanded === h.id ? null : h.id)}
-                  className="block w-full px-1 py-2 text-left"
-                >
-                  <span
-                    className="grid items-baseline gap-0.5"
-                    style={{ gridTemplateColumns: HOLD_GRID }}
-                  >
-                    <span className="min-w-0">
-                      <span className="block truncate text-xs font-medium tracking-tight whitespace-nowrap">
-                        {h.name}
-                      </span>
-                      <span className="block text-[11px] text-[var(--dim)]">
-                        {h.symbol}
-                      </span>
-                    </span>
-                    <span className="tnum text-right text-xs whitespace-nowrap">
-                      <Pct v={h.quote?.change_percent ?? null} />
-                    </span>
-                    <span className="tnum text-right text-[11px] whitespace-nowrap">
-                      {h.quote ? fmtPrice(h.quote.price) : "—"}
-                    </span>
-                    <span className="tnum text-right text-[11px] whitespace-nowrap">
-                      {fmtPrice(h.cost_per_share)}
-                    </span>
-                    <span className="tnum text-right text-xs whitespace-nowrap">
-                      <Pct v={h.pnlPct} />
-                    </span>
-                    <span className="tnum text-right text-xs font-medium whitespace-nowrap">
-                      {h.mv != null ? mask(fmtMoney(h.mv)) : "—"}
+        <ul className="divide-y divide-[var(--border)] border-y border-[var(--border)]">
+          {byShare.map((h) => (
+            <li key={h.id}>
+              <button
+                type="button"
+                aria-expanded={expanded === h.id}
+                aria-label={`${h.symbol} ${displayName(h.symbol, h.name)} 明细`}
+                onClick={() => setExpanded(expanded === h.id ? null : h.id)}
+                className="block w-full px-1 py-2.5 text-left"
+              >
+                <span className="flex items-baseline justify-between gap-2">
+                  <span className="text-sm">
+                    <span className="tnum font-bold">{h.symbol}</span>
+                    <span className="ml-2 font-medium">
+                      {displayName(h.symbol, h.name)}
                     </span>
                   </span>
-                </button>
-                {expanded === h.id && (
-                  <HoldingDetail
-                    h={h}
-                    mask={mask}
-                    onDone={() => setExpanded(null)}
-                  />
-                )}
-              </li>
-            ))}
-          </ul>
-        </div>
+                  <span className="tnum shrink-0 text-sm">
+                    {h.quote ? fmtPrice(h.quote.price) : "—"}
+                    <Pct
+                      v={h.quote?.change_percent ?? null}
+                      className="ml-2 text-xs"
+                    />
+                  </span>
+                </span>
+                <span className="tnum mt-1 flex items-baseline justify-between gap-2 text-xs text-[var(--dim)]">
+                  <span>
+                    市值 {h.mv != null ? mask(fmtMoney(h.mv)) : "—"} · 占比{" "}
+                    {h.share != null ? `${h.share.toFixed(2)}%` : "—"}
+                  </span>
+                  <span style={{ color: moveColor(h.pnl) }}>
+                    {h.pnl != null
+                      ? `${mask(fmtSignedMoney(h.pnl))} (${fmtPct(h.pnlPct ?? 0)})`
+                      : "—"}
+                  </span>
+                </span>
+              </button>
+              {expanded === h.id && (
+                <HoldingDetail
+                  h={h}
+                  mask={mask}
+                  onDone={() => setExpanded(null)}
+                />
+              )}
+            </li>
+          ))}
+        </ul>
       ) : (
         <div className="overflow-x-auto border-y border-[var(--border)]">
           <table className="tnum w-full min-w-[880px] border-collapse text-sm">
