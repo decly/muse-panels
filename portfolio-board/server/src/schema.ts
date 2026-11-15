@@ -116,11 +116,12 @@ export const fxSnapshots = sqliteTable("fx_snapshots", {
     .$defaultFn(() => new Date()),
 });
 
-// Market benchmarks (S&P 500, Nasdaq-100, Nasdaq Composite, Shanghai
+// Market benchmarks (S&P 500, Nasdaq-100, Nasdaq Composite, spot
+// gold), one row per key, upserted by refreshQuotes. Rows for the
+// benchmarks that moved to the A-share board on 2026-11-15 (Shanghai
 // Composite, CSI 300, CSI A500, Hang Seng TECH, Nasdaq Golden Dragon
-// China, Nikkei 225, Vietnam
-// Ho Chi Minh Index, spot gold, Shanghai gold), one row per key, upserted by
-// refreshQuotes. peak_price / peak_date
+// China, Nikkei 225, Vietnam Ho Chi Minh Index, Shanghai gold) stay
+// stored but are neither refreshed nor returned. peak_price / peak_date
 // hold the all-time highest close and the date it was set (YYYY-MM-DD):
 // seeded once from long history when empty, afterwards only ratcheted
 // up by refreshQuotes — never lowered. peak3y_price / peak3y_date hold

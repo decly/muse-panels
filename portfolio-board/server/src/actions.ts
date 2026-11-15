@@ -870,21 +870,14 @@ async function loadPortfolio(ctx: Ctx): Promise<PortfolioResponse> {
         }
       : null;
   const fxRow = fxRows[0];
-  const marketOrder = [
-    "SPX",
-    "NDX",
-    "IXIC",
-    "SSEC",
-    "CSI300",
-    "A500",
-    "HSTECH",
-    "HXC",
-    "N225",
-    "VNI",
-    "GOLD",
-    "SGOLD",
-  ];
+  // The strip carries only the US/gold benchmarks since 2026-11-15:
+  // the A-share / Hong Kong / Nikkei / Vietnam indices and Shanghai
+  // gold moved to the A-share board. Stored rows for the removed keys
+  // stay in market_snapshots (history is kept) but are filtered out
+  // here and no longer refreshed.
+  const marketOrder = ["SPX", "NDX", "IXIC", "GOLD"];
   const market = marketRows
+    .filter((m) => marketOrder.includes(m.key))
     .map((m) => ({
       key: m.key,
       label: m.label,
@@ -1277,45 +1270,18 @@ async function fetchUsdCny(): Promise<{
 
 // ---------- Market benchmarks ----------
 
-// Yahoo chart API: ^GSPC / ^NDX / ^IXIC / ^N225 are the cash indices
-// on their regular-session basis. `tz` is the market's own timezone,
-// used to date-stamp the all-time peak (seed + ratchet).
+// Yahoo chart API: ^GSPC / ^NDX / ^IXIC are the cash
+// indices on their regular-session basis. `tz` is the market's own
+// timezone, used to date-stamp the all-time peak (seed + ratchet).
+// The Nikkei 225 used to ride along here, and the A-share / Hang
+// Seng TECH / Golden Dragon / Ho Chi Minh indices rode an Eastmoney
+// list; all of those moved to the A-share board on 2026-11-15 and
+// are no longer fetched by this board (their stored rows stay in
+// market_snapshots, unrefreshed and undisplayed).
 const BENCHMARKS = [
   { key: "SPX", label: "标普500", yahoo: "^GSPC", note: "指数 · 常规收盘", tz: "America/New_York" },
   { key: "NDX", label: "纳指100", yahoo: "^NDX", note: "指数 · 常规收盘", tz: "America/New_York" },
   { key: "IXIC", label: "纳指综合", yahoo: "^IXIC", note: "指数 · 常规收盘", tz: "America/New_York" },
-  { key: "N225", label: "日经225", yahoo: "^N225", note: "指数 · 常规收盘", tz: "Asia/Tokyo" },
-] as const;
-
-// Eastmoney K-line indices (same endpoint family as the gold seeds
-// below): A-share indices under market 1, global indices under market
-// 100, Hong Kong indices under market 124. 100.VNINDEX is Eastmoney's
-// Ho Chi Minh index (data.name 越南胡志明， verified live 2026-11-09;
-// Yahoo has no VN-Index symbol). 124.HSTECH is the Hang Seng TECH
-// Index (data.name 恒生科技指数， verified live 2026-11-09; Yahoo's
-// ^HSTECH returns "No data found, symbol may be delisted", so
-// Eastmoney is its source — price/change from the last two daily
-// closes, peak seeded from the full history back to the 2014 base
-// period: max close 10,945.22 on 2021-02-17).
-// 251.HXC is the Nasdaq Golden Dragon China Index (data.name
-// 纳斯达克中国金龙指数， verified live 2026-11-13). Yahoo's ^HXC was
-// tried first: it returns a live price but no usable history
-// (validRanges only 1d/5d, a single daily bar), so no peak could be
-// seeded from it; Eastmoney's series cross-checked exactly (2026-11-12
-// close 5,476.34 and −3.09% on both sources, day high/low identical).
-// Eastmoney's HXC history starts 2023-05-08 (884 daily rows), which
-// fully covers the trailing-3-year window; its max close — all-time
-// and 3y alike — is 8,852.95 on 2025-10-02.
-// Price/change come from the last two daily closes; the peak seed is
-// the same endpoint's full history. 中证A500's series carries
-// back-calculated history before its 2024 launch — seeded as returned.
-const EM_INDICES = [
-  { key: "SSEC", label: "上证指数", secid: "1.000001", note: "指数 · 常规收盘" },
-  { key: "CSI300", label: "沪深300", secid: "1.000300", note: "指数 · 常规收盘" },
-  { key: "A500", label: "中证A500", secid: "1.000510", note: "指数 · 常规收盘" },
-  { key: "HSTECH", label: "恒生科技", secid: "124.HSTECH", note: "指数 · 常规收盘" },
-  { key: "HXC", label: "金龙中国", secid: "251.HXC", note: "指数 · 常规收盘" },
-  { key: "VNI", label: "越南胡志明", secid: "100.VNINDEX", note: "指数 · 常规收盘" },
 ] as const;
 
 async function fetchBenchmark(b: (typeof BENCHMARKS)[number]): Promise<{
@@ -1353,7 +1319,7 @@ async function fetchBenchmark(b: (typeof BENCHMARKS)[number]): Promise<{
       : null;
   // The daily closes are authoritative whenever the reported price IS
   // the latest close (always true outside that market's live session):
-  // some index feeds report a bogus fulldayChange of 0 (^N225 does —
+  // some index feeds report a bogus fulldayChange of 0 (^N225 did —
   // verified 2026-11-09: meta said 0 while the Nov 6 close was −5.97%
   // vs Nov 5). During a live session the price is intraday and ahead
   // of the last daily close, so the meta change stands.
@@ -1386,14 +1352,10 @@ async function fetchBenchmark(b: (typeof BENCHMARKS)[number]): Promise<{
 //
 // peak_price / peak_date power the 距高点 line. A peak is seeded ONCE,
 // only while the stored value is null, from long history:
-//  - SPX / NDX / IXIC / N225: Yahoo chart daily closes, range=10y
+//  - SPX / NDX / IXIC: Yahoo chart daily closes, range=10y
 //    (the same endpoint fetchBenchmark uses, wider range) — max close
 //    + the date of its bar, read in the market's own timezone
-//    (America/New_York for the US indices, Asia/Tokyo for N225).
-//  - SSEC / CSI300 / A500 / VNI: Eastmoney K-line full history (the
-//    fetchEastmoneyKlines endpoint below) — max close + its date.
-//    A500's series includes back-calculated history predating its
-//    2024 launch; it is seeded exactly as returned.
+//    (America/New_York).
 //  - GOLD (spot XAU/USD; live price from Sina): the seed comes from
 //    Eastmoney's London-gold K-line (secid 122.XAU, daily, full
 //    history back to 1992) — max close + its date. Yahoo's XAUUSD=X
@@ -1403,8 +1365,6 @@ async function fetchBenchmark(b: (typeof BENCHMARKS)[number]): Promise<{
 //    never GC=F futures. Either seed is accepted only when the
 //    series' last close sits within 1.5% of the board's live Sina
 //    spot price; otherwise the GOLD peak stays null.
-//  - SGOLD: Eastmoney K-line for SGE Au99.99 (secid 118.Au9999, daily,
-//    full history back to 2004) — max close column + its date string.
 // After seeding, refreshQuotes only ever ratchets the peak up: a new
 // price above the stored peak replaces it (date = the new price's
 // asOf date); a lower price never touches it, and a later seed attempt
@@ -1507,8 +1467,7 @@ async function fetchStooqGoldPeak(
 
 // GOLD seed (primary): Eastmoney K-line for London spot gold
 // (secid 122.XAU — data.name 黄金/美元， code XAU; daily closes back
-// to 1992-05-19, the full listed history). Same endpoint and row
-// shape as the SGOLD seed below. Consistency guard, identical to the
+// to 1992-05-19, the full listed history). Consistency guard, identical to the
 // Stooq fallback's: the series' last close must be within 1.5% of
 // the board's live Sina spot price (referencePrice), otherwise the
 // seed is refused and the GOLD peak stays null.
@@ -1594,51 +1553,6 @@ async function fetchEastmoneyKlines(
   return null;
 }
 
-// Peak seed from an Eastmoney series' full history: max close + date.
-async function fetchEastmoneyKlinePeak(
-  secid: string,
-): Promise<PeakSeed | null> {
-  const rows = await fetchEastmoneyKlines(secid, "0");
-  if (!rows) return null;
-  let best: PeakSeed | null = null;
-  for (const r of rows) {
-    if (!best || r.close > best.price) best = { price: r.close, date: r.date };
-  }
-  return best;
-}
-
-// Eastmoney index quote: the last close is the price, the previous
-// close gives the day change; asOf is the last row's own date (that
-// market's latest trading day — Asia-Pacific indices refresh on their
-// own calendar, independent of the US session).
-async function fetchEastmoneyIndexQuote(secid: string): Promise<{
-  price: number;
-  change: number | null;
-  changePercent: number | null;
-  asOf: string;
-} | null> {
-  const d = new Date(Date.now() - 40 * 24 * 3600 * 1000);
-  const beg = `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, "0")}${String(d.getUTCDate()).padStart(2, "0")}`;
-  const rows = await fetchEastmoneyKlines(secid, beg);
-  const last = rows?.[rows.length - 1];
-  if (!rows || !last) return null;
-  const prev = rows[rows.length - 2];
-  const change = prev ? last.close - prev.close : null;
-  return {
-    price: last.close,
-    change,
-    changePercent:
-      change != null && prev && prev.close !== 0
-        ? (change / prev.close) * 100
-        : null,
-    asOf: last.date,
-  };
-}
-
-async function fetchSgoldPeak(): Promise<PeakSeed | null> {
-  return fetchEastmoneyKlinePeak("118.Au9999");
-}
-
 // Computes the peak to store alongside a fresh price: seed once when
 // the stored peak is null (a failed seed leaves it null — never
 // back-filled from just the current price, which would understate the
@@ -1685,7 +1599,7 @@ async function resolvePeak(
 //  - Yahoo indices: chart API range=5y daily closes (fetched wider
 //    than 3y so the window's right end is never truncated), windowed
 //    by bar date in the market's own timezone.
-//  - Eastmoney indices + SGOLD + GOLD: the shared K-line endpoint
+//  - GOLD: the shared Eastmoney K-line endpoint
 //    with beg ~3 years back (plus a small buffer), windowed by the
 //    last row's date. GOLD keeps its spot-only rule and 1.5%
 //    last-close consistency guard (Eastmoney 122.XAU primary, Stooq
@@ -1763,15 +1677,6 @@ function eastmoneyBeg3y(): string {
   const start = new Date(`${yearsBefore(today, 3)}T00:00:00Z`);
   start.setUTCDate(start.getUTCDate() - 45);
   return `${p(start.getUTCFullYear(), 4)}${p(start.getUTCMonth() + 1, 2)}${p(start.getUTCDate(), 2)}`;
-}
-
-// 3y peak seed from an Eastmoney K-line series (indices, SGOLD).
-async function fetchEastmoneyKlinePeak3y(
-  secid: string,
-): Promise<PeakSeed | null> {
-  const rows = await fetchEastmoneyKlines(secid, eastmoneyBeg3y());
-  if (!rows) return null;
-  return windowPeak3y(rows);
 }
 
 // GOLD 3y seed (primary): Eastmoney London spot gold (122.XAU),
@@ -1859,17 +1764,13 @@ async function resolvePeak3y(
   return { peak3yPrice, peak3yDate };
 }
 
-// ---------- Gold: spot XAU/USD + Shanghai Gold (Sina quote feed) ----------
+// ---------- Gold: spot XAU/USD (Sina quote feed) ----------
 
-// One Sina request carries both codes:
-//  - hf_XAU: London spot gold (XAU/USD) — fields [0]=last, [7]=prev close,
-//    [6]=time, [12]=date (Beijing time).
-//  - gds_AU9999: SGE Au99.99 in CNY per gram — same field layout.
-// Fallbacks: spot price from gold-api.com (no change); Shanghai gold
-// converted from spot × USD/CNY ÷ 31.1035 (troy oz → gram), labeled as
-// a converted price, never as the exchange price.
-const TROY_OZ_GRAMS = 31.1035;
-
+// hf_XAU: London spot gold (XAU/USD) — fields [0]=last, [7]=prev
+// close, [6]=time, [12]=date (Beijing time). Fallback: spot price
+// from gold-api.com (no change figure). Shanghai gold (SGE Au99.99)
+// used to be fetched alongside; it moved to the A-share board on
+// 2026-11-15 and is no longer fetched here.
 type GoldQuote = {
   price: number;
   change: number | null;
@@ -1902,22 +1803,17 @@ function sinaGoldQuote(fields: string[]): GoldQuote | null {
   };
 }
 
-async function fetchGoldQuotes(fxRate: number | null): Promise<{
-  spot: (GoldQuote & { source: string }) | null;
-  shanghai: (GoldQuote & { source: string; note: string }) | null;
-}> {
+async function fetchGoldQuote(): Promise<
+  (GoldQuote & { source: string }) | null
+> {
   let spot: (GoldQuote & { source: string }) | null = null;
-  let shanghai: (GoldQuote & { source: string; note: string }) | null = null;
   try {
-    const res = await fetch(
-      "https://hq.sinajs.cn/list=hf_XAU,gds_AU9999",
-      {
-        headers: {
-          "User-Agent": "Mozilla/5.0",
-          Referer: "https://finance.sina.com.cn",
-        },
+    const res = await fetch("https://hq.sinajs.cn/list=hf_XAU", {
+      headers: {
+        "User-Agent": "Mozilla/5.0",
+        Referer: "https://finance.sina.com.cn",
       },
-    );
+    });
     if (res.ok) {
       const text = await res.text();
       const xau = parseSinaRow(text, "hf_XAU");
@@ -1925,15 +1821,9 @@ async function fetchGoldQuotes(fxRate: number | null): Promise<{
         const q = sinaGoldQuote(xau);
         if (q) spot = { ...q, source: "新浪财经" };
       }
-      const au = parseSinaRow(text, "gds_AU9999");
-      if (au) {
-        const q = sinaGoldQuote(au);
-        if (q)
-          shanghai = { ...q, source: "新浪财经", note: "上金所 Au99.99 · 元/克" };
-      }
     }
   } catch {
-    // fall through to the fallbacks below
+    // fall through to the fallback below
   }
   if (!spot) {
     try {
@@ -1959,19 +1849,7 @@ async function fetchGoldQuotes(fxRate: number | null): Promise<{
       spot = null;
     }
   }
-  if (!shanghai && spot && fxRate != null && fxRate > 0) {
-    const perGram = (spot.price * fxRate) / TROY_OZ_GRAMS;
-    shanghai = {
-      price: perGram,
-      change:
-        spot.change != null ? (spot.change * fxRate) / TROY_OZ_GRAMS : null,
-      changePercent: spot.changePercent,
-      asOf: spot.asOf,
-      source: "换算",
-      note: "现货金换算 · 元/克",
-    };
-  }
-  return { spot, shanghai };
+  return spot;
 }
 
 // ---------- Daily account snapshots ----------
@@ -3346,7 +3224,7 @@ type PersonalImportResponse = z.infer<typeof personalImportResponse>;
 export const Actions = {
   getPortfolio: defineAction({
     description:
-      "Returns all accounts （券商A/券商B…) with their stored holdings, per-account cash and per-account daily history, plus the merged global view (same-symbol holdings combined across accounts, cash and history summed), the latest cached regular-close quotes, session-aware extended-hours annotations (pre-market / after-hours), the current US market session (America/New_York), the cached USD/CNY rate, and market benchmarks (S&P 500, Nasdaq-100, Nasdaq Composite, Shanghai Composite, CSI 300, CSI A500, Hang Seng TECH, Nasdaq Golden Dragon China, Nikkei 225, Vietnam Ho Chi Minh Index, spot gold XAU/USD, Shanghai Gold Au99.99 in CNY/gram) — each benchmark carrying both its all-time highest close (peak_price/peak_date) and its trailing-3-year highest close (peak3y_price/peak3y_date).",
+      "Returns all accounts （券商A/券商B…) with their stored holdings, per-account cash and per-account daily history, plus the merged global view (same-symbol holdings combined across accounts, cash and history summed), the latest cached regular-close quotes, session-aware extended-hours annotations (pre-market / after-hours), the current US market session (America/New_York), the cached USD/CNY rate, and market benchmarks (S&P 500, Nasdaq-100, Nasdaq Composite, spot gold XAU/USD — the A-share / Hong Kong / Nikkei / Vietnam indices and Shanghai gold moved to the A-share board on 2026-11-15; their stored rows are filtered out) — each benchmark carrying both its all-time highest close (peak_price/peak_date) and its trailing-3-year highest close (peak3y_price/peak3y_date).",
     request: z.object({}),
     response: portfolioResponse,
     handler: async (ctx): Promise<PortfolioResponse> => loadPortfolio(ctx),
@@ -4254,145 +4132,54 @@ export const Actions = {
         }),
       );
 
-      // Eastmoney indices （上证 / 沪深300 / 中证A500 / 恒生科技 / 金龙中国 / 越南胡志明）:
-      // price + day change from the last two daily closes, peak
-      // seeded once from the same endpoint's full history.
-      await Promise.all(
-        EM_INDICES.map(async (b) => {
-          try {
-            const q = await fetchEastmoneyIndexQuote(b.secid);
-            if (!q) return;
-            const peak = await resolvePeak(
-              existingMarketByKey.get(b.key),
-              q.price,
-              q.asOf,
-              "Asia/Shanghai",
-              () => fetchEastmoneyKlinePeak(b.secid),
-            );
-            const peak3y = await resolvePeak3y(
-              existingMarketByKey.get(b.key),
-              q.price,
-              q.asOf,
-              "Asia/Shanghai",
-              () => fetchEastmoneyKlinePeak3y(b.secid),
-            );
-            const values = {
-              key: b.key,
-              label: b.label,
-              price: q.price,
-              change: q.change,
-              changePercent: q.changePercent,
-              asOf: q.asOf,
-              source: "东方财富",
-              note: b.note,
-              peakPrice: peak.peakPrice,
-              peakDate: peak.peakDate,
-              peak3yPrice: peak3y.peak3yPrice,
-              peak3yDate: peak3y.peak3yDate,
-              fetchedAt: now,
-            };
-            await db
-              .insert(schema.marketSnapshots)
-              .values(values)
-              .onConflictDoUpdate({
-                target: schema.marketSnapshots.key,
-                set: values,
-              });
-          } catch {
-            // keep the last cached benchmark row
-          }
-        }),
-      );
-
-      // Gold: spot XAU/USD + Shanghai Gold (CNY per gram). Peaks seed
-      // once (GOLD from Eastmoney's London-gold full-history K-line,
-      // secid 122.XAU, with Stooq's XAU/USD spot CSV as fallback now
-      // that Yahoo's XAUUSD=X is delisted — a failed or inconsistent
-      // seed leaves it null, never a futures substitute; SGOLD from
-      // the Eastmoney full-history K-line) and ratchet on every
-      // refresh.
+      // Gold: spot XAU/USD only (Shanghai gold moved to the A-share
+      // board on 2026-11-15). Peaks seed once (from Eastmoney's
+      // London-gold full-history K-line, secid 122.XAU, with Stooq's
+      // XAU/USD spot CSV as fallback now that Yahoo's XAUUSD=X is
+      // delisted — a failed or inconsistent seed leaves it null,
+      // never a futures substitute) and ratchet on every refresh.
       try {
-        const gold = await fetchGoldQuotes(effectiveFxRate);
-        const goldPeak = gold.spot
+        const spot = await fetchGoldQuote();
+        const goldPeak = spot
           ? await resolvePeak(
               existingMarketByKey.get("GOLD"),
-              gold.spot.price,
-              gold.spot.asOf,
+              spot.price,
+              spot.asOf,
               "Asia/Shanghai",
               () =>
-                fetchEastmoneyGoldPeak(gold.spot?.price ?? null).then(
-                  (s) => s ?? fetchStooqGoldPeak(gold.spot?.price ?? null),
+                fetchEastmoneyGoldPeak(spot.price).then(
+                  (s) => s ?? fetchStooqGoldPeak(spot.price),
                 ),
             )
           : null;
-        const goldPeak3y = gold.spot
+        const goldPeak3y = spot
           ? await resolvePeak3y(
               existingMarketByKey.get("GOLD"),
-              gold.spot.price,
-              gold.spot.asOf,
+              spot.price,
+              spot.asOf,
               "Asia/Shanghai",
               () =>
-                fetchEastmoneyGoldPeak3y(gold.spot?.price ?? null).then(
-                  (s) => s ?? fetchStooqGoldPeak3y(gold.spot?.price ?? null),
+                fetchEastmoneyGoldPeak3y(spot.price).then(
+                  (s) => s ?? fetchStooqGoldPeak3y(spot.price),
                 ),
             )
           : null;
-        const sgoldPeak = gold.shanghai
-          ? await resolvePeak(
-              existingMarketByKey.get("SGOLD"),
-              gold.shanghai.price,
-              gold.shanghai.asOf,
-              "Asia/Shanghai",
-              fetchSgoldPeak,
-            )
-          : null;
-        const sgoldPeak3y = gold.shanghai
-          ? await resolvePeak3y(
-              existingMarketByKey.get("SGOLD"),
-              gold.shanghai.price,
-              gold.shanghai.asOf,
-              "Asia/Shanghai",
-              () => fetchEastmoneyKlinePeak3y("118.Au9999"),
-            )
-          : null;
-        const goldRows = [
-          gold.spot && goldPeak
-            ? {
-                key: "GOLD",
-                label: "现货黄金",
-                price: gold.spot.price,
-                change: gold.spot.change,
-                changePercent: gold.spot.changePercent,
-                asOf: gold.spot.asOf,
-                source: gold.spot.source,
-                note: "现货 XAU/USD · 美元/盎司",
-                peakPrice: goldPeak.peakPrice,
-                peakDate: goldPeak.peakDate,
-                peak3yPrice: goldPeak3y?.peak3yPrice ?? null,
-                peak3yDate: goldPeak3y?.peak3yDate ?? null,
-                fetchedAt: now,
-              }
-            : null,
-          gold.shanghai && sgoldPeak
-            ? {
-                key: "SGOLD",
-                label: "上海黄金",
-                price: gold.shanghai.price,
-                change: gold.shanghai.change,
-                changePercent: gold.shanghai.changePercent,
-                asOf: gold.shanghai.asOf,
-                source: gold.shanghai.source,
-                note: gold.shanghai.note,
-                peakPrice: sgoldPeak.peakPrice,
-                peakDate: sgoldPeak.peakDate,
-                peak3yPrice: sgoldPeak3y?.peak3yPrice ?? null,
-                peak3yDate: sgoldPeak3y?.peak3yDate ?? null,
-                fetchedAt: now,
-              }
-            : null,
-        ];
-        for (const values of goldRows) {
-          if (!values) continue;
+        if (spot && goldPeak) {
+          const values = {
+            key: "GOLD",
+            label: "现货黄金",
+            price: spot.price,
+            change: spot.change,
+            changePercent: spot.changePercent,
+            asOf: spot.asOf,
+            source: spot.source,
+            note: "现货 XAU/USD · 美元/盎司",
+            peakPrice: goldPeak.peakPrice,
+            peakDate: goldPeak.peakDate,
+            peak3yPrice: goldPeak3y?.peak3yPrice ?? null,
+            peak3yDate: goldPeak3y?.peak3yDate ?? null,
+            fetchedAt: now,
+          };
           await db
             .insert(schema.marketSnapshots)
             .values(values)
@@ -4402,7 +4189,7 @@ export const Actions = {
             });
         }
       } catch {
-        // keep the last cached gold rows
+        // keep the last cached gold row
       }
 
       // Daily snapshot: seed the verified manual record once, then

@@ -1651,7 +1651,7 @@ export function App() {
     // default 占比 descending (user request 2026-11-13).
     setTableSort({ key: "weight", dir: -1 });
   };
-  // Market strip collapse: the twelve benchmark rows can be folded
+  // Market strip collapse: the four benchmark rows can be folded
   // down to just the first two (SPX / NDX, user-confirmed 2026-11-09);
   // the whole strip (header row + every data row) is the toggle —
   // the click handler lives on the section and the header button's
@@ -2006,9 +2006,11 @@ export function App() {
                 peak still reads 历史新高. Public market data, never
                 masked by privacy mode.
                 Fixed-width right columns keep the rows aligned and
-                overflow-free at phone width. Eleven benchmarks since
-                2026-11-09 （纳指综合 / 上证 / 沪深300 / 中证A500 /
-                恒生科技 / 日经225 / 越南胡志明 added). Prices render
+                overflow-free at phone width. Four benchmarks since
+                2026-11-15 （标普500 / 纳指100 / 纳指综合 /
+                现货黄金）: the A-share, Hang Seng, Golden Dragon,
+                Nikkei, Vietnam and Shanghai-gold rows moved to the
+                A-share board. Prices render
                 as integers (display-only rounding via money(v, 0);
                 the stored price and the 距高点 math keep full
                 precision), which lets the price column run narrower
@@ -2017,7 +2019,7 @@ export function App() {
                 clicking anywhere on the section — the header row or
                 any benchmark row — folds the strip down to the first
                 two rows （标普500 / 纳指100） or expands it back to
-                all twelve; default expanded and the choice persists.
+                all four; default expanded and the choice persists.
                 Rows carry no links or buttons, so no click conflicts. */}
             {data.market.length > 0 && (
               <section
@@ -2089,20 +2091,12 @@ export function App() {
                       >
                         <p className="flex min-w-0 flex-1 items-baseline gap-1.5 overflow-hidden whitespace-nowrap text-[15px] font-semibold leading-[22px]">
                           <span>{m.label}</span>
-                          {m.key === "SGOLD" ? (
-                            <span className="text-[11px] font-normal text-[var(--dim)]">
-                              元/克
-                              {m.source === "换算" ? " · 换算价" : ""}
-                            </span>
-                          ) : null}
                         </p>
                         <span className="num w-[74px] shrink-0 whitespace-nowrap text-right text-[17px] font-semibold leading-[22px] tracking-tight">
                           {m.price != null
                             ? m.key === "GOLD"
                               ? `$${money(m.price, 0)}`
-                              : m.key === "SGOLD"
-                                ? `¥${money(m.price, 0)}`
-                                : money(m.price, 0)
+                              : money(m.price, 0)
                             : "—"}
                         </span>
                         <span className="flex w-[74px] shrink-0 items-center">
