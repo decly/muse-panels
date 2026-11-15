@@ -99,6 +99,29 @@ function weekdayOf(dateStr: string): string {
   return WEEKDAYS[d.getDay()] ?? "";
 }
 
+// ---------- display names (code-first) ----------
+//
+// The 6-digit code is the primary identifier everywhere; names render
+// as short display names. The stored name (broker name, overwritten
+// by the Eastmoney quote name on every refresh) is never shown raw:
+// a code → short-name map wins, and a generic shortening pass covers
+// holdings not in the map.
+const DISPLAY_NAME_MAP: Record<string, string> = {
+  "513100": "纳指100ETF示例甲",
+  "159941": "纳指100ETF示例乙",
+  "513300": "纳指ETF示例",
+  "164906": "中概互联ETF示例",
+  "159338": "中证A500ETF示例",
+};
+
+function displayName(symbol: string, name: string): string {
+  const mapped = DISPLAY_NAME_MAP[symbol];
+  if (mapped) return mapped;
+  return name
+    .replace(/纳斯达克/g, "纳指")
+    .replace(/互联网/g, "互联");
+}
+
 // ---------- first-load resilience (shared policy with the other boards) ----------
 
 // Retry up to 3 failures with exponential backoff; a stalled request
@@ -580,7 +603,7 @@ function HoldingDetail({
         <label className="text-xs text-[var(--dim)]">
           股数
           <input
-            aria-label={`${h.name} 股数`}
+            aria-label={`${h.symbol} ${displayName(h.symbol, h.name)} 股数`}
             inputMode="decimal"
             value={qty}
             onChange={(e) => setQty(e.target.value)}
@@ -590,7 +613,7 @@ function HoldingDetail({
         <label className="text-xs text-[var(--dim)]">
           成本价
           <input
-            aria-label={`${h.name} 成本价`}
+            aria-label={`${h.symbol} ${displayName(h.symbol, h.name)} 成本价`}
             inputMode="decimal"
             value={cost}
             onChange={(e) => setCost(e.target.value)}
@@ -607,7 +630,7 @@ function HoldingDetail({
         {confirmDelete ? (
           <button
             type="button"
-            aria-label={`确认删除 ${h.name}`}
+            aria-label={`确认删除 ${h.symbol} ${displayName(h.symbol, h.name)}`}
             disabled={remove.isPending}
             onClick={() => remove.mutate()}
             className="rounded-md px-3 text-xs font-medium disabled:opacity-50"
@@ -618,7 +641,7 @@ function HoldingDetail({
         ) : (
           <button
             type="button"
-            aria-label={`删除 ${h.name}`}
+            aria-label={`删除 ${h.symbol} ${displayName(h.symbol, h.name)}`}
             onClick={() => setConfirmDelete(true)}
             className="rounded-md border border-[var(--border)] px-3 text-xs"
           >
@@ -782,8 +805,12 @@ function HoldingsSection({
       case "stock":
         return (
           <span>
-            <span className="block font-medium whitespace-nowrap">{h.name}</span>
-            <span className="block text-xs text-[var(--dim)]">{h.symbol}</span>
+            <span className="tnum block font-bold whitespace-nowrap">
+              {h.symbol}
+            </span>
+            <span className="block text-xs whitespace-nowrap text-[var(--dim)]">
+              {displayName(h.symbol, h.name)}
+            </span>
           </span>
         );
       case "chg":
@@ -1134,7 +1161,7 @@ function categoryOf(
     if (c.keywords.some((k) => h.name.includes(k))) return c;
   }
   return {
-    label: h.name,
+    label: displayName(h.symbol, h.name),
     color:
       CONC_FALLBACK_COLORS[fallbackIdx % CONC_FALLBACK_COLORS.length] ??
       "#7f8c9b",
@@ -1223,8 +1250,12 @@ function Concentration({
                 )}
               </span>
               {g.members.length > 1 && (
-                <span className="block truncate text-[11px] whitespace-nowrap text-[var(--dim)]">
-                  {g.members.map((m) => m.name).join("、")}
+                <span className="block text-[11px] leading-relaxed text-[var(--dim)]">
+                  {g.members
+                    .map(
+                      (m) => `${m.symbol} ${displayName(m.symbol, m.name)}`,
+                    )
+                    .join("、")}
                 </span>
               )}
             </span>
@@ -1440,7 +1471,8 @@ function TradesSection({ mask }: { mask: (s: string) => string }) {
               <span className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-[var(--dim)]">
                 {data.settled.by_symbol.map((s) => (
                   <span key={s.symbol}>
-                    {s.name ?? s.symbol} {s.symbol}：
+                    {s.symbol}
+                    {s.name ? ` ${displayName(s.symbol, s.name)}` : ""}：
                     <span style={{ color: moveColor(s.settled_cny) }}>
                       {s.settled_cny != null
                         ? mask(fmtSignedMoney(s.settled_cny))
@@ -1614,11 +1646,9 @@ function TradesSection({ mask }: { mask: (s: string) => string }) {
                       >
                         {t.side === "buy" ? "买入" : "卖出"}
                       </span>
-                      <span className="ml-2 font-medium">
-                        {t.name ?? t.symbol}
-                      </span>
-                      <span className="ml-1 text-xs text-[var(--dim)]">
-                        {t.symbol}
+                      <span className="tnum ml-2 font-bold">{t.symbol}</span>
+                      <span className="ml-1.5 font-medium">
+                        {t.name ? displayName(t.symbol, t.name) : ""}
                       </span>
                     </span>
                     <span className="tnum shrink-0 text-xs whitespace-nowrap text-[var(--dim)]">
@@ -1635,42 +1665,48 @@ function TradesSection({ mask }: { mask: (s: string) => string }) {
                         : "—"}
                     </span>
                   </div>
-                  <div className="mt-0.5 flex items-center gap-2 text-xs text-[var(--dim)]">
-                    <span className="min-w-0 flex-1 truncate whitespace-nowrap">
-                      {SOURCE_LABELS[t.source]}
-                      {t.note ? ` · ${t.note}` : ""}
-                    </span>
-                    <span className="flex shrink-0 gap-2">
-                      <button
-                        type="button"
-                        aria-label={`编辑 ${t.date} ${t.symbol} 交易`}
-                        onClick={() => startEdit(t)}
-                        className="min-h-0 text-[var(--accent)] underline"
-                      >
-                        编辑
-                      </button>
-                      {confirmDeleteId === t.id ? (
+                  <div className="mt-1 text-xs text-[var(--dim)]">
+                    <div className="flex items-center justify-between gap-2">
+                      <span>
+                        {t.date} · {SOURCE_LABELS[t.source]}
+                      </span>
+                      <span className="flex shrink-0 gap-2">
                         <button
                           type="button"
-                          aria-label={`确认删除 ${t.date} ${t.symbol} 交易`}
-                          disabled={del.isPending}
-                          onClick={() => del.mutate(t.id)}
-                          className="min-h-0 font-medium disabled:opacity-50"
-                          style={{ color: "var(--up)" }}
+                          aria-label={`编辑 ${t.date} ${t.symbol} 交易`}
+                          onClick={() => startEdit(t)}
+                          className="min-h-0 text-[var(--accent)] underline"
                         >
-                          确认删除？
+                          编辑
                         </button>
-                      ) : (
-                        <button
-                          type="button"
-                          aria-label={`删除 ${t.date} ${t.symbol} 交易`}
-                          onClick={() => setConfirmDeleteId(t.id)}
-                          className="min-h-0 underline"
-                        >
-                          删除
-                        </button>
-                      )}
-                    </span>
+                        {confirmDeleteId === t.id ? (
+                          <button
+                            type="button"
+                            aria-label={`确认删除 ${t.date} ${t.symbol} 交易`}
+                            disabled={del.isPending}
+                            onClick={() => del.mutate(t.id)}
+                            className="min-h-0 font-medium disabled:opacity-50"
+                            style={{ color: "var(--up)" }}
+                          >
+                            确认删除？
+                          </button>
+                        ) : (
+                          <button
+                            type="button"
+                            aria-label={`删除 ${t.date} ${t.symbol} 交易`}
+                            onClick={() => setConfirmDeleteId(t.id)}
+                            className="min-h-0 underline"
+                          >
+                            删除
+                          </button>
+                        )}
+                      </span>
+                    </div>
+                    {t.note && (
+                      <p className="mt-0.5 leading-relaxed break-words">
+                        备注：{t.note}
+                      </p>
+                    )}
                   </div>
                 </li>
               ))}
