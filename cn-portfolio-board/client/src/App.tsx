@@ -654,7 +654,7 @@ function HoldingDetail({
   );
 }
 
-type SortKey = "stock" | "chg" | "price" | "cost" | "pnlPct" | "pnl" | "mv" | "costAmt" | "qty" | "share";
+type SortKey = "stock" | "chg" | "dayPnl" | "price" | "cost" | "pnlPct" | "pnl" | "mv" | "costAmt" | "qty" | "share";
 
 function HoldingsSection({
   board,
@@ -741,6 +741,8 @@ function HoldingsSection({
         return h.symbol;
       case "chg":
         return h.quote?.change_percent ?? null;
+      case "dayPnl":
+        return h.dayPnl;
       case "price":
         return h.quote?.price ?? null;
       case "cost":
@@ -780,6 +782,7 @@ function HoldingsSection({
   const columns: { key: SortKey; label: string; masked?: boolean }[] = [
     { key: "stock", label: "股票" },
     { key: "chg", label: "涨跌幅" },
+    { key: "dayPnl", label: "今日盈亏", masked: true },
     { key: "price", label: "现价" },
     { key: "cost", label: "成本价" },
     { key: "pnlPct", label: "浮盈亏%" },
@@ -804,6 +807,14 @@ function HoldingsSection({
         );
       case "chg":
         return <Pct v={h.quote?.change_percent ?? null} />;
+      case "dayPnl":
+        return h.dayPnl != null ? (
+          <span style={{ color: moveColor(h.dayPnl) }}>
+            {mask(fmtSignedMoney(h.dayPnl))}
+          </span>
+        ) : (
+          "—"
+        );
       case "price":
         return h.quote ? fmtPrice(h.quote.price) : "—";
       case "cost":
@@ -994,7 +1005,7 @@ function HoldingsSection({
         </ul>
       ) : (
         <div className="overflow-x-auto border-y border-[var(--border)]">
-          <table className="tnum w-full min-w-[880px] border-collapse text-sm">
+          <table className="tnum w-full min-w-[980px] border-collapse text-sm">
             <thead>
               <tr>
                 {columns.map((c, i) => (
