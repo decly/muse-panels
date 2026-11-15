@@ -343,7 +343,7 @@ function Overview({
   return (
     <section aria-label="总览">
       <div className="mt-4 flex items-center justify-between gap-2">
-        <span className="text-xs text-[var(--dim)]">总览（人民币 · 收盘口径）</span>
+        <span className="text-sm text-[var(--dim)]">总览（人民币 · 收盘口径）</span>
         <span className="flex items-center gap-2">
           <button
             type="button"
@@ -365,7 +365,7 @@ function Overview({
           </button>
         </span>
       </div>
-      <p className="mt-0.5 text-right text-[11px] text-[var(--dim)]">
+      <p className="mt-0.5 text-right text-xs text-[var(--dim)]">
         {fetched ? `刷新于 ${fetched}（北京时间）` : "尚未刷新报价"}
         {refresh.isError ? " · 上次刷新失败，显示已存报价" : ""}
       </p>
@@ -376,24 +376,25 @@ function Overview({
         </p>
       ) : (
         <>
-          <div className="mt-2">
-            <span className="text-xs text-[var(--dim)]">总账户值</span>
-            {/* Total value deliberately renders one size below body text
-                (same rule as the US board, so it is not legible at a
-                glance to bystanders). */}
-            <span className="tnum ml-2 text-sm font-semibold">
+          <div className="mt-3">
+            <span className="text-sm text-[var(--dim)]">总账户值</span>
+            {/* Total value deliberately renders one size below the stat
+                figures (same rule as the US board, so it is not legible
+                at a glance to bystanders); it scales with the rest of
+                the overview, never above it. */}
+            <span className="tnum ml-2 text-base font-semibold">
               {totals.total != null ? mask(fmtMoney(totals.total)) : "—"}
             </span>
             {totals.total == null && (
-              <span className="ml-2 text-xs text-[var(--dim)]">
+              <span className="ml-2 text-sm text-[var(--dim)]">
                 （现金未录入，暂不合计）
               </span>
             )}
           </div>
-          <dl className="tnum mt-3 grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-4">
+          <dl className="tnum mt-4 grid grid-cols-2 gap-x-4 gap-y-4 border-t border-[var(--border)] pt-4 sm:grid-cols-4">
             <div>
-              <dt className="text-xs text-[var(--dim)]">证券市值</dt>
-              <dd className="text-sm font-medium whitespace-nowrap sm:text-base">
+              <dt className="text-sm text-[var(--dim)]">证券市值</dt>
+              <dd className="mt-0.5 text-base font-medium whitespace-nowrap sm:text-lg">
                 {board.holdings.length === 0
                   ? mask(fmtMoney(0))
                   : totals.complete
@@ -402,8 +403,8 @@ function Overview({
               </dd>
             </div>
             <div>
-              <dt className="text-xs text-[var(--dim)]">现金</dt>
-              <dd className="flex items-center gap-2 text-sm font-medium whitespace-nowrap sm:text-base">
+              <dt className="text-sm text-[var(--dim)]">现金</dt>
+              <dd className="mt-0.5 flex items-center gap-2 text-base font-medium whitespace-nowrap sm:text-lg">
                 {board.cash_cny != null ? mask(fmtMoney(board.cash_cny)) : "未录入"}
                 {!cashEditing && (
                   <button
@@ -423,27 +424,43 @@ function Overview({
               </dd>
             </div>
             <div>
-              <dt className="text-xs text-[var(--dim)]">总浮盈亏</dt>
+              <dt className="text-sm text-[var(--dim)]">总浮盈亏</dt>
               <dd
-                className="text-sm font-medium whitespace-nowrap sm:text-base"
+                className="mt-0.5 text-base font-medium whitespace-nowrap sm:text-lg"
                 style={{ color: moveColor(totals.pnl) }}
               >
-                {board.holdings.length === 0
-                  ? "—"
-                  : totals.complete
-                    ? `${mask(fmtSignedMoney(totals.pnl))}${totals.pnlPct != null ? ` (${fmtPct(totals.pnlPct)})` : ""}`
-                    : "—"}
+                {board.holdings.length === 0 || !totals.complete ? (
+                  "—"
+                ) : (
+                  <>
+                    {mask(fmtSignedMoney(totals.pnl))}
+                    {totals.pnlPct != null && (
+                      <span className="block text-sm font-normal">
+                        {fmtPct(totals.pnlPct)}
+                      </span>
+                    )}
+                  </>
+                )}
               </dd>
             </div>
             <div>
-              <dt className="text-xs text-[var(--dim)]">今日涨跌</dt>
+              <dt className="text-sm text-[var(--dim)]">今日涨跌</dt>
               <dd
-                className="text-sm font-medium whitespace-nowrap sm:text-base"
+                className="mt-0.5 text-base font-medium whitespace-nowrap sm:text-lg"
                 style={{ color: moveColor(totals.dayChange) }}
               >
-                {totals.dayChange != null
-                  ? `${mask(fmtSignedMoney(totals.dayChange))}${totals.dayChangePct != null ? ` (${fmtPct(totals.dayChangePct)})` : ""}`
-                  : "—"}
+                {totals.dayChange == null ? (
+                  "—"
+                ) : (
+                  <>
+                    {mask(fmtSignedMoney(totals.dayChange))}
+                    {totals.dayChangePct != null && (
+                      <span className="block text-sm font-normal">
+                        {fmtPct(totals.dayChangePct)}
+                      </span>
+                    )}
+                  </>
+                )}
               </dd>
             </div>
           </dl>
