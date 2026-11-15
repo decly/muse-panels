@@ -1370,6 +1370,12 @@ const closeSnapshotResponse = z.object({
   board: boardResponse,
 });
 
+const baselineSnapshotResponse = z.object({
+  status: z.enum(["written", "already_present"]),
+  date: z.string(),
+  board: boardResponse,
+});
+
 const editResponse = z.object({
   ok: z.literal(true),
   snapshot_recomputed: z.array(z.string()),
@@ -1445,6 +1451,55 @@ export const Actions = {
         };
       }
       return { status: "written", date: today, board: await loadBoard(ctx) };
+    },
+  }),
+
+  seedBaselineSnapshot: defineAction({
+    description:
+      "One-time write of the first snapshot: the baseline date's (Friday close, opening-entry baseline day) account state exactly as reconciled against the user's broker screenshots, so history has its first point today. Insert-only — a snapshot already stored for that date is left untouched and reported as already_present. After this row exists it is an ordinary snapshot: later edits recompute per the usual rules and the weekday 15:10 close refresh chains its day change from it.",
+    request: z.object({}),
+    response: baselineSnapshotResponse,
+    handler: async (
+      ctx,
+    ): Promise<z.infer<typeof baselineSnapshotResponse>> => {
+      const db = ctx.db<typeof schema>();
+      const existing = await db
+        .select()
+        .from(schema.dailySnapshots)
+        .where(eq(schema.dailySnapshots.date, "2026-01-09"));
+      if (existing.length > 0) {
+        return {
+          status: "already_present",
+          date: "2026-01-09",
+          board: await loadBoard(ctx),
+        };
+      }
+      // Figures supplied by the user in the edit brief, reconciled
+      // to the cent against the broker screenshots: totals
+      // ¥100,000.00 = securities ¥90,000.00 + cash ¥10,000.00;
+      // unrealised P/L +¥5,000.00 on the broker displayed-cost
+      // basis; Friday day P/L +¥100.00 (+0.10%), verified as the
+      // per-holding sum, not derived; CSI 300 close 4000.00
+      // (+0.50%).
+      await db.insert(schema.dailySnapshots).values({
+        date: "2026-01-09",
+        accountValueCny: 100000,
+        securitiesValueCny: 90000,
+        cashCny: 10000,
+        totalPnlCny: 5000,
+        dayChangeCny: 100,
+        dayChangePct: 0.1,
+        csi300Price: 4000,
+        csi300ChangePct: 0.5,
+        source: "manual",
+        createdAt: new Date(),
+      });
+      ctx.invalidateQueries();
+      return {
+        status: "written",
+        date: "2026-01-09",
+        board: await loadBoard(ctx),
+      };
     },
   }),
 
