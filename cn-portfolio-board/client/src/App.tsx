@@ -188,8 +188,8 @@ function SectionTitle({
 // Lightweight jump bar: five section anchors in board order. It lives
 // in its own fixed layer (outside the market strip, so its clicks can
 // never trigger the strip's collapse toggle), stays hidden while the
-// page is near the top so it costs no screen height, and fades in once
-// the user has scrolled about one viewport. No scrollspy — plain
+// page is at the very top so it costs no screen height, and fades in
+// as soon as the user starts scrolling down. No scrollspy — plain
 // smooth-scroll jumps to the section anchors (each carries a
 // scroll-margin-top so its title lands clear of the bar).
 const NAV_ITEMS = [
@@ -212,7 +212,9 @@ function StickyNav() {
     );
     if (!scroller) return;
     const onScroll = () => {
-      setVisible(scroller.scrollTop > scroller.clientHeight * 0.9);
+      // Show as soon as the page starts scrolling down; the small
+      // 8px margin avoids flicker from rubber-band bounce at the top.
+      setVisible(scroller.scrollTop > 8);
     };
     onScroll();
     scroller.addEventListener("scroll", onScroll, { passive: true });
