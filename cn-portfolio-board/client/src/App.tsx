@@ -16,8 +16,10 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { SafeAreaTopScrim } from "@hatch/space-sdk/client";
 import {
 CartesianGrid,
+Label,
 Line,
 LineChart,
+ReferenceDot,
 ResponsiveContainer,
 Tooltip,
 XAxis,
@@ -1714,6 +1716,10 @@ function HistorySection({
   mask: (s: string) => string;
 }) {
   const chartData = [...history].reverse();
+  // A lone snapshot has no line to draw; it is rendered as a single
+  // annotated dot (see ReferenceDot below) so the first point is
+  // visible today instead of an empty chart area.
+  const singlePoint = chartData.length === 1 ? chartData[0] : undefined;
   return (
     <section aria-label="历史">
       <SectionTitle>历史</SectionTitle>
@@ -1739,7 +1745,14 @@ function HistorySection({
                   minTickGap={40}
                 />
                 <YAxis
-                  domain={["auto", "auto"]}
+                  domain={
+                    singlePoint
+                      ? [
+                          (dataMin: number) => dataMin * 0.995,
+                          (dataMax: number) => dataMax * 1.005,
+                        ]
+                      : ["auto", "auto"]
+                  }
                   width={64}
                   tick={{ fontSize: 11, fill: "var(--dim)" }}
                   tickLine={false}
@@ -1783,6 +1796,24 @@ function HistorySection({
                   dot={chartData.length <= 40}
                   activeDot={{ r: 3 }}
                 />
+                {singlePoint && (
+                  <ReferenceDot
+                    x={singlePoint.date}
+                    y={singlePoint.account_value_cny}
+                    r={5}
+                    fill="var(--accent)"
+                    stroke="var(--surface)"
+                    strokeWidth={2}
+                  >
+                    <Label
+                      value={`${singlePoint.date.slice(5)} · ${mask(fmtMoney(singlePoint.account_value_cny))}`}
+                      position="top"
+                      offset={10}
+                      fill="var(--dim)"
+                      fontSize={11}
+                    />
+                  </ReferenceDot>
+                )}
               </LineChart>
             </ResponsiveContainer>
           </div>
