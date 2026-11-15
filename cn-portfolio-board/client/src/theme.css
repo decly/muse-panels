@@ -62,6 +62,13 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* Anchor targets for the sticky section nav: leave room for the
+   ~34px nav bar (plus the top safe-area inset it sits below) and a
+   small gap, so a jumped-to section title is never hidden under it. */
+.section-anchor {
+  scroll-margin-top: calc(env(safe-area-inset-top, 0px) + 44px);
+}
+
 /* Phone tap targets: at least 32px tall. */
 @layer base {
   button, [role="button"], select, summary, input:not([type="checkbox"], [type="radio"]) {

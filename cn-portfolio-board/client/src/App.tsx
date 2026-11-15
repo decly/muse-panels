@@ -183,6 +183,96 @@ function SectionTitle({
   );
 }
 
+// ---------- sticky section nav ----------
+//
+// Lightweight jump bar: five section anchors in board order. It lives
+// in its own fixed layer (outside the market strip, so its clicks can
+// never trigger the strip's collapse toggle), stays hidden while the
+// page is near the top so it costs no screen height, and fades in once
+// the user has scrolled about one viewport. No scrollspy — plain
+// smooth-scroll jumps to the section anchors (each carries a
+// scroll-margin-top so its title lands clear of the bar).
+const NAV_ITEMS = [
+  { id: "sec-overview", label: "总览" },
+  { id: "sec-holdings", label: "持仓" },
+  { id: "sec-concentration", label: "集中度" },
+  { id: "sec-history", label: "历史" },
+  { id: "sec-trades", label: "流水" },
+] as const;
+
+function StickyNav() {
+  const navRef = useRef<HTMLElement | null>(null);
+  const [visible, setVisible] = useState(false);
+  useEffect(() => {
+    // The shell scrolls the page inside the fixed
+    // [data-generated-space-root] container, not the window — listen
+    // to that scroller (window.scrollY never moves here).
+    const scroller = navRef.current?.closest<HTMLElement>(
+      "[data-generated-space-root]",
+    );
+    if (!scroller) return;
+    const onScroll = () => {
+      setVisible(scroller.scrollTop > scroller.clientHeight * 0.9);
+    };
+    onScroll();
+    scroller.addEventListener("scroll", onScroll, { passive: true });
+    window.addEventListener("resize", onScroll);
+    return () => {
+      scroller.removeEventListener("scroll", onScroll);
+      window.removeEventListener("resize", onScroll);
+    };
+  }, []);
+
+  const jump = (id: string) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const reduce = window.matchMedia(
+      "(prefers-reduced-motion: reduce)",
+    ).matches;
+    el.scrollIntoView({
+      behavior: reduce ? "auto" : "smooth",
+      block: "start",
+    });
+  };
+
+  return (
+    <nav
+      ref={navRef}
+      aria-label="板块导航"
+      aria-hidden={!visible}
+      className="fixed inset-x-0 z-50 transition-all duration-200"
+      style={{
+        top: "env(safe-area-inset-top, 0px)",
+        opacity: visible ? 1 : 0,
+        transform: visible ? "translateY(0)" : "translateY(-100%)",
+        visibility: visible ? "visible" : "hidden",
+        pointerEvents: visible ? "auto" : "none",
+      }}
+    >
+      <div
+        className="mx-auto flex h-[34px] max-w-5xl items-stretch justify-between border-b border-[var(--border)] px-2 backdrop-blur-md sm:justify-start sm:gap-1 sm:px-4"
+        style={{
+          backgroundColor:
+            "color-mix(in srgb, var(--bg) 82%, transparent)",
+        }}
+      >
+        {NAV_ITEMS.map((item) => (
+          <button
+            key={item.id}
+            type="button"
+            tabIndex={visible ? 0 : -1}
+            aria-label={`跳转到${item.label}`}
+            onClick={() => jump(item.id)}
+            className="flex-1 text-[13px] text-[var(--text)] sm:flex-none sm:px-3"
+          >
+            {item.label}
+          </button>
+        ))}
+      </div>
+    </nav>
+  );
+}
+
 // ---------- market strip ----------
 
 function MarketStrip({ market }: { market: Board["market"] }) {
@@ -341,7 +431,7 @@ function Overview({
     cashMutation.mutate(v);
   };
   return (
-    <section aria-label="总览">
+    <section aria-label="总览" id="sec-overview" className="section-anchor">
       <div className="mt-4 flex items-center justify-between gap-2">
         <span className="text-sm text-[var(--dim)]">总览（人民币 · 收盘口径）</span>
         <span className="flex items-center gap-2">
@@ -864,7 +954,7 @@ function HoldingsSection({
   };
 
   return (
-    <section aria-label="持仓明细">
+    <section aria-label="持仓明细" id="sec-holdings" className="section-anchor">
       <SectionTitle
         right={
           <span className="flex items-center gap-2">
@@ -1227,7 +1317,7 @@ function Concentration({
   }
   list.sort((a, b) => b.share - a.share);
   return (
-    <section aria-label="集中度">
+    <section aria-label="集中度" id="sec-concentration" className="section-anchor">
       <SectionTitle>集中度</SectionTitle>
       <div
         className="flex h-3 w-full overflow-hidden rounded-sm"
@@ -1420,7 +1510,7 @@ function TradesSection({ mask }: { mask: (s: string) => string }) {
   const olderCount = allRows.length - rows.length;
 
   return (
-    <section aria-label="交易流水">
+    <section aria-label="交易流水" id="sec-trades" className="section-anchor">
       <SectionTitle
         right={
           <span className="flex items-center gap-2">
@@ -1772,7 +1862,7 @@ function HistorySection({
   const axisTick = { fontSize: 11, fill: "var(--dim)" } as const;
 
   return (
-    <section aria-label="历史">
+    <section aria-label="历史" id="sec-history" className="section-anchor">
       <SectionTitle>历史</SectionTitle>
       {history.length === 0 ? (
         <p className="border border-dashed border-[var(--border)] px-3 py-4 text-sm text-[var(--dim)]">
@@ -2221,6 +2311,7 @@ export function App() {
   return (
     <div className="min-h-screen bg-[var(--bg)] text-[var(--text)]">
       <SafeAreaTopScrim backgroundColor="var(--bg)" />
+      <StickyNav />
       <main className="mx-auto max-w-5xl px-2 pb-12 sm:px-4">
         <MarketStrip market={data.market} />
         <Overview
