@@ -200,14 +200,14 @@ function MarketStrip({ market }: { market: Board["market"] }) {
                 className="flex items-baseline justify-between gap-2 py-1.5"
               >
                 <span className="text-sm">{m.label}</span>
-                <span className="tnum flex items-baseline gap-3 text-sm">
-                  <span className="font-medium">
+                <span className="tnum flex items-baseline gap-2 text-sm">
+                  <span className="w-[4.25rem] text-right font-medium">
                     {m.price != null
                       ? Math.round(m.price).toLocaleString("zh-CN")
                       : "—"}
                   </span>
-                  <Pct v={m.change_percent} className="w-16 text-right" />
-                  <span className="w-20 text-right text-xs text-[var(--dim)]">
+                  <Pct v={m.change_percent} className="w-14 text-right" />
+                  <span className="w-[5.5rem] whitespace-nowrap text-right text-xs text-[var(--dim)]">
                     {drawdown == null
                       ? "距高点 —"
                       : drawdown >= -0.05
@@ -368,7 +368,7 @@ function Overview({
           <dl className="tnum mt-3 grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-4">
             <div>
               <dt className="text-xs text-[var(--dim)]">证券市值</dt>
-              <dd className="text-base font-medium">
+              <dd className="text-sm font-medium whitespace-nowrap sm:text-base">
                 {board.holdings.length === 0
                   ? mask(fmtMoney(0))
                   : totals.complete
@@ -378,7 +378,7 @@ function Overview({
             </div>
             <div>
               <dt className="text-xs text-[var(--dim)]">现金</dt>
-              <dd className="flex items-center gap-2 text-base font-medium">
+              <dd className="flex items-center gap-2 text-sm font-medium whitespace-nowrap sm:text-base">
                 {board.cash_cny != null ? mask(fmtMoney(board.cash_cny)) : "未录入"}
                 {!cashEditing && (
                   <button
@@ -400,7 +400,7 @@ function Overview({
             <div>
               <dt className="text-xs text-[var(--dim)]">总浮盈亏</dt>
               <dd
-                className="text-base font-medium"
+                className="text-sm font-medium whitespace-nowrap sm:text-base"
                 style={{ color: moveColor(totals.pnl) }}
               >
                 {board.holdings.length === 0
@@ -413,7 +413,7 @@ function Overview({
             <div>
               <dt className="text-xs text-[var(--dim)]">今日涨跌</dt>
               <dd
-                className="text-base font-medium"
+                className="text-sm font-medium whitespace-nowrap sm:text-base"
                 style={{ color: moveColor(totals.dayChange) }}
               >
                 {totals.dayChange != null
@@ -556,6 +556,22 @@ function HoldingDetail({
             {h.dayPnl != null ? mask(fmtSignedMoney(h.dayPnl)) : "—"}
           </dd>
         </div>
+        <div>
+          <dt className="text-xs text-[var(--dim)]">市值</dt>
+          <dd>{h.mv != null ? mask(fmtMoney(h.mv)) : "—"}</dd>
+        </div>
+        <div>
+          <dt className="text-xs text-[var(--dim)]">浮盈亏</dt>
+          <dd style={{ color: moveColor(h.pnl) }}>
+            {h.pnl != null
+              ? `${mask(fmtSignedMoney(h.pnl))} (${fmtPct(h.pnlPct ?? 0)})`
+              : "—"}
+          </dd>
+        </div>
+        <div>
+          <dt className="text-xs text-[var(--dim)]">市值占比</dt>
+          <dd>{h.share != null ? `${h.share.toFixed(2)}%` : "—"}</dd>
+        </div>
       </dl>
       <form
         onSubmit={submit}
@@ -620,6 +636,13 @@ function HoldingDetail({
 }
 
 type SortKey = "stock" | "chg" | "price" | "cost" | "pnlPct" | "pnl" | "mv" | "costAmt" | "qty" | "share";
+
+// Standard-mode column budget (fits a 390px phone with no horizontal
+// scroll and nothing clipped): name takes the remainder (≥ ~116px, so
+// the longest names like 纳斯达克100ETF招商 fit on one line at 12px),
+// then fixed right-aligned numeric columns — 涨跌幅 / 现价 / 成本价 /
+// 浮盈亏% / 市值 (price columns render at 11px to stay narrow).
+const HOLD_GRID = "minmax(0,1fr) 2.75rem 2.25rem 2.25rem 3.25rem 4.5rem";
 
 function HoldingsSection({
   board,
@@ -759,7 +782,7 @@ function HoldingsSection({
       case "stock":
         return (
           <span>
-            <span className="block font-medium">{h.name}</span>
+            <span className="block font-medium whitespace-nowrap">{h.name}</span>
             <span className="block text-xs text-[var(--dim)]">{h.symbol}</span>
           </span>
         );
@@ -906,62 +929,78 @@ function HoldingsSection({
           暂无持仓 · 等待录入。
         </p>
       ) : density === "standard" ? (
-        <ul className="divide-y divide-[var(--border)] border-y border-[var(--border)]">
-          {byShare.map((h) => (
-            <li key={h.id}>
-              <button
-                type="button"
-                aria-expanded={expanded === h.id}
-                aria-label={`${h.name} 明细`}
-                onClick={() => setExpanded(expanded === h.id ? null : h.id)}
-                className="block w-full px-1 py-2.5 text-left"
-              >
-                <span className="flex items-baseline justify-between gap-2">
-                  <span className="text-sm font-medium">
-                    {h.name}
-                    <span className="ml-2 text-xs font-normal text-[var(--dim)]">
-                      {h.symbol}
+        <div className="border-y border-[var(--border)]">
+          <div
+            className="grid items-baseline gap-0.5 border-b border-[var(--border)] px-1 py-1.5 text-[11px] whitespace-nowrap text-[var(--dim)]"
+            style={{ gridTemplateColumns: HOLD_GRID }}
+            aria-hidden="true"
+          >
+            <span>股票</span>
+            <span className="text-right">涨跌幅</span>
+            <span className="text-right">现价</span>
+            <span className="text-right">成本价</span>
+            <span className="text-right">浮盈亏%</span>
+            <span className="text-right">市值</span>
+          </div>
+          <ul className="divide-y divide-[var(--border)]">
+            {byShare.map((h) => (
+              <li key={h.id}>
+                <button
+                  type="button"
+                  aria-expanded={expanded === h.id}
+                  aria-label={`${h.name} 明细`}
+                  onClick={() => setExpanded(expanded === h.id ? null : h.id)}
+                  className="block w-full px-1 py-2 text-left"
+                >
+                  <span
+                    className="grid items-baseline gap-0.5"
+                    style={{ gridTemplateColumns: HOLD_GRID }}
+                  >
+                    <span className="min-w-0">
+                      <span className="block truncate text-xs font-medium tracking-tight whitespace-nowrap">
+                        {h.name}
+                      </span>
+                      <span className="block text-[11px] text-[var(--dim)]">
+                        {h.symbol}
+                      </span>
+                    </span>
+                    <span className="tnum text-right text-xs whitespace-nowrap">
+                      <Pct v={h.quote?.change_percent ?? null} />
+                    </span>
+                    <span className="tnum text-right text-[11px] whitespace-nowrap">
+                      {h.quote ? fmtPrice(h.quote.price) : "—"}
+                    </span>
+                    <span className="tnum text-right text-[11px] whitespace-nowrap">
+                      {fmtPrice(h.cost_per_share)}
+                    </span>
+                    <span className="tnum text-right text-xs whitespace-nowrap">
+                      <Pct v={h.pnlPct} />
+                    </span>
+                    <span className="tnum text-right text-xs font-medium whitespace-nowrap">
+                      {h.mv != null ? mask(fmtMoney(h.mv)) : "—"}
                     </span>
                   </span>
-                  <span className="tnum text-sm">
-                    {h.quote ? fmtPrice(h.quote.price) : "—"}
-                    <Pct
-                      v={h.quote?.change_percent ?? null}
-                      className="ml-2 text-xs"
-                    />
-                  </span>
-                </span>
-                <span className="tnum mt-1 flex items-baseline justify-between gap-2 text-xs text-[var(--dim)]">
-                  <span>
-                    市值 {h.mv != null ? mask(fmtMoney(h.mv)) : "—"} · 占比{" "}
-                    {h.share != null ? `${h.share.toFixed(2)}%` : "—"}
-                  </span>
-                  <span style={{ color: moveColor(h.pnl) }}>
-                    {h.pnl != null
-                      ? `${mask(fmtSignedMoney(h.pnl))} (${fmtPct(h.pnlPct ?? 0)})`
-                      : "—"}
-                  </span>
-                </span>
-              </button>
-              {expanded === h.id && (
-                <HoldingDetail
-                  h={h}
-                  mask={mask}
-                  onDone={() => setExpanded(null)}
-                />
-              )}
-            </li>
-          ))}
-        </ul>
+                </button>
+                {expanded === h.id && (
+                  <HoldingDetail
+                    h={h}
+                    mask={mask}
+                    onDone={() => setExpanded(null)}
+                  />
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
       ) : (
         <div className="overflow-x-auto border-y border-[var(--border)]">
-          <table className="tnum w-full min-w-[720px] border-collapse text-sm">
+          <table className="tnum w-full min-w-[880px] border-collapse text-sm">
             <thead>
               <tr>
                 {columns.map((c, i) => (
                   <th
                     key={c.key}
-                    className={`bg-[var(--surface)] px-2 py-2 text-xs font-medium text-[var(--dim)] ${i === 0 ? "sticky left-0 z-10 text-left" : "text-right"}`}
+                    className={`bg-[var(--surface)] px-2 py-2 text-xs font-medium whitespace-nowrap text-[var(--dim)] ${i === 0 ? "sticky left-0 z-10 min-w-[9rem] text-left" : "text-right"}`}
                   >
                     <button
                       type="button"
@@ -989,7 +1028,7 @@ function HoldingsSection({
                   {columns.map((c, i) => (
                     <td
                       key={c.key}
-                      className={`px-2 py-2 ${i === 0 ? "sticky left-0 bg-[var(--surface)]" : "text-right"}`}
+                      className={`px-2 py-2 whitespace-nowrap ${i === 0 ? "sticky left-0 bg-[var(--surface)]" : "text-right"}`}
                     >
                       {cell(h, c.key)}
                     </td>
@@ -1563,9 +1602,9 @@ function TradesSection({ mask }: { mask: (s: string) => string }) {
           ) : (
             <ul className="divide-y divide-[var(--border)] border-y border-[var(--border)]">
               {rows.map((t) => (
-                <li key={t.id} className="px-1 py-2">
+                <li key={t.id} className="px-1 py-2.5">
                   <div className="flex items-baseline justify-between gap-2 text-sm">
-                    <span>
+                    <span className="min-w-0 truncate whitespace-nowrap">
                       <span
                         className="font-medium"
                         style={{
@@ -1582,22 +1621,26 @@ function TradesSection({ mask }: { mask: (s: string) => string }) {
                         {t.symbol}
                       </span>
                     </span>
-                    <span className="tnum text-xs text-[var(--dim)]">
-                      {t.date.slice(5)} 周{weekdayOf(t.date)} ·{" "}
-                      {SOURCE_LABELS[t.source]}
+                    <span className="tnum shrink-0 text-xs whitespace-nowrap text-[var(--dim)]">
+                      {t.date.slice(5)} 周{weekdayOf(t.date)}
                     </span>
                   </div>
-                  <div className="tnum mt-0.5 flex flex-wrap items-baseline justify-between gap-2 text-xs text-[var(--dim)]">
-                    <span>
-                      {fmtQty(t.qty)} 份 @{" "}
-                      {t.price != null ? mask(fmtPrice(t.price)) : "未知价"}
-                      {t.price_kind === "estimated" ? "（估算）" : ""} · 成交额{" "}
+                  <div className="tnum mt-1 text-sm whitespace-nowrap">
+                    {fmtQty(t.qty)} 份 @{" "}
+                    {t.price != null ? mask(fmtPrice(t.price)) : "未知价"}
+                    {t.price_kind === "estimated" ? "（估算）" : ""} · 成交额{" "}
+                    <span className="font-medium">
                       {t.price != null
                         ? mask(fmtMoney(t.qty * t.price))
                         : "—"}
+                    </span>
+                  </div>
+                  <div className="mt-0.5 flex items-center gap-2 text-xs text-[var(--dim)]">
+                    <span className="min-w-0 flex-1 truncate whitespace-nowrap">
+                      {SOURCE_LABELS[t.source]}
                       {t.note ? ` · ${t.note}` : ""}
                     </span>
-                    <span className="flex gap-2">
+                    <span className="flex shrink-0 gap-2">
                       <button
                         type="button"
                         aria-label={`编辑 ${t.date} ${t.symbol} 交易`}
@@ -1735,7 +1778,7 @@ function HistorySection({
                   </span>
                   <span>{mask(fmtMoney(s.account_value_cny))}</span>
                   <span
-                    className="w-36 text-right"
+                    className="w-36 whitespace-nowrap text-right"
                     style={{ color: moveColor(s.day_change_cny) }}
                   >
                     {s.day_change_cny != null
@@ -1919,7 +1962,7 @@ export function App() {
   return (
     <div className="min-h-screen bg-[var(--bg)] text-[var(--text)]">
       <SafeAreaTopScrim backgroundColor="var(--bg)" />
-      <main className="mx-auto max-w-5xl px-3 pb-12 sm:px-4">
+      <main className="mx-auto max-w-5xl px-2 pb-12 sm:px-4">
         <MarketStrip market={data.market} />
         <Overview
           board={data}
