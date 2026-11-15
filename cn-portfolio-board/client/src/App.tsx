@@ -15,11 +15,15 @@ type ReactNode,
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { SafeAreaTopScrim } from "@hatch/space-sdk/client";
 import {
+Bar,
 CartesianGrid,
+Cell,
+ComposedChart,
 Label,
 Line,
 LineChart,
 ReferenceDot,
+ReferenceLine,
 ResponsiveContainer,
 Tooltip,
 XAxis,
@@ -1706,20 +1710,48 @@ function TradesSection({ mask }: { mask: (s: string) => string }) {
 
 // ---------- history ----------
 
+// Colour of the CSI 300 comparison series in both history charts: a
+// warm amber that stays distinct from the account series' slate
+// accent in both colour schemes.
+const CSI_LINE_COLOR = "#d97706";
+
 function HistorySection({
   history,
-  privacy,
   mask,
 }: {
   history: Snapshot[];
-  privacy: boolean;
   mask: (s: string) => string;
 }) {
   const chartData = [...history].reverse();
-  // A lone snapshot has no line to draw; it is rendered as a single
-  // annotated dot (see ReferenceDot below) so the first point is
-  // visible today instead of an empty chart area.
+  // A lone snapshot has no line to draw; both comparison series are
+  // rendered as single annotated dots (see the ReferenceDots below)
+  // so the first point is visible today instead of an empty chart.
   const singlePoint = chartData.length === 1 ? chartData[0] : undefined;
+
+  // Comparison series: the account value and the CSI 300 close stored
+  // on each snapshot are both rebased to cumulative % change since
+  // the first snapshot (both start at 0%), so the two series share
+  // one % axis. A snapshot without a stored CSI 300 close leaves a
+  // gap in the index line rather than an invented point.
+  const base = chartData[0];
+  const csiBase =
+    chartData.find((s) => s.csi300_price != null)?.csi300_price ?? null;
+  const cmpData = chartData.map((s) => ({
+    date: s.date,
+    snap: s,
+    acct:
+      base && base.account_value_cny > 0
+        ? (s.account_value_cny / base.account_value_cny - 1) * 100
+        : 0,
+    csi:
+      csiBase != null && csiBase > 0 && s.csi300_price != null
+        ? (s.csi300_price / csiBase - 1) * 100
+        : null,
+  }));
+  const lastCmp = cmpData[cmpData.length - 1];
+  const pctTick = (v: number) => `${v > 0 ? "+" : ""}${v.toFixed(1)}%`;
+  const axisTick = { fontSize: 11, fill: "var(--dim)" } as const;
+
   return (
     <section aria-label="历史">
       <SectionTitle>历史</SectionTitle>
@@ -1729,17 +1761,49 @@ function HistorySection({
         </p>
       ) : (
         <>
-          <div className="h-44 w-full" aria-label="总账户值曲线">
+          <div className="tnum mb-1 flex flex-wrap items-baseline gap-x-4 gap-y-0.5 text-xs">
+            <span className="text-sm font-medium">走势对比</span>
+            <span className="flex items-baseline gap-1.5">
+              <span
+                className="inline-block h-2 w-2 rounded-full"
+                style={{ background: "var(--accent)" }}
+              />
+              账户累计
+              <span
+                className="font-medium"
+                style={{ color: moveColor(lastCmp?.acct) }}
+              >
+                {lastCmp ? fmtPct(lastCmp.acct) : "—"}
+              </span>
+            </span>
+            <span className="flex items-baseline gap-1.5">
+              <span
+                className="inline-block h-2 w-2 rounded-full"
+                style={{ background: CSI_LINE_COLOR }}
+              />
+              沪深300 累计
+              <span
+                className="font-medium"
+                style={{ color: moveColor(lastCmp?.csi) }}
+              >
+                {lastCmp?.csi != null ? fmtPct(lastCmp.csi) : "—"}
+              </span>
+            </span>
+            <span className="text-[var(--dim)]">
+              相对首条快照归一化 · 起点 0%
+            </span>
+          </div>
+          <div className="h-44 w-full" aria-label="账户与沪深300走势对比图">
             <ResponsiveContainer width="100%" height="100%">
               <LineChart
-                data={chartData}
+                data={cmpData}
                 margin={{ top: 6, right: 8, bottom: 0, left: 4 }}
               >
                 <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" />
                 <XAxis
                   dataKey="date"
                   tickFormatter={(d: string) => d.slice(5)}
-                  tick={{ fontSize: 11, fill: "var(--dim)" }}
+                  tick={axisTick}
                   tickLine={false}
                   axisLine={{ stroke: "var(--border)" }}
                   minTickGap={40}
@@ -1747,42 +1811,44 @@ function HistorySection({
                 <YAxis
                   domain={
                     singlePoint
-                      ? [
-                          (dataMin: number) => dataMin * 0.995,
-                          (dataMax: number) => dataMax * 1.005,
-                        ]
+                      ? [() => -1, () => 1]
                       : ["auto", "auto"]
                   }
-                  width={64}
-                  tick={{ fontSize: 11, fill: "var(--dim)" }}
+                  width={52}
+                  tick={axisTick}
                   tickLine={false}
                   axisLine={false}
-                  tickFormatter={(v: number) =>
-                    privacy
-                      ? "••••"
-                      : v >= 10000
-                        ? `${(v / 10000).toFixed(1)}万`
-                        : String(Math.round(v))
-                  }
+                  tickFormatter={pctTick}
                 />
                 <Tooltip
                   content={({ active, payload }) => {
                     if (!active || !payload?.length) return null;
-                    const s = payload[0]?.payload as Snapshot | undefined;
-                    if (!s) return null;
+                    const p = payload[0]?.payload as
+                      | (typeof cmpData)[number]
+                      | undefined;
+                    if (!p) return null;
+                    const s = p.snap;
                     return (
                       <div className="tnum border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1.5 text-xs">
                         <div>
                           {s.date} 周{weekdayOf(s.date)}
                         </div>
                         <div>
-                          总值 {mask(fmtMoney(s.account_value_cny))}
+                          账户{" "}
+                          <span style={{ color: moveColor(p.acct) }}>
+                            {fmtPct(p.acct)}
+                          </span>{" "}
+                          · 总值 {mask(fmtMoney(s.account_value_cny))}
                         </div>
-                        <div style={{ color: moveColor(s.day_change_cny) }}>
-                          当日{" "}
-                          {s.day_change_cny != null
-                            ? `${mask(fmtSignedMoney(s.day_change_cny))} (${fmtPct(s.day_change_pct ?? 0)})`
-                            : "—"}
+                        <div>
+                          沪深300{" "}
+                          {p.csi != null ? (
+                            <span style={{ color: moveColor(p.csi) }}>
+                              {fmtPct(p.csi)}
+                            </span>
+                          ) : (
+                            "—"
+                          )}
                         </div>
                       </div>
                     );
@@ -1790,17 +1856,43 @@ function HistorySection({
                 />
                 <Line
                   type="monotone"
-                  dataKey="account_value_cny"
+                  dataKey="csi"
+                  stroke={CSI_LINE_COLOR}
+                  strokeWidth={1.5}
+                  dot={cmpData.length <= 40}
+                  activeDot={{ r: 3 }}
+                />
+                <Line
+                  type="monotone"
+                  dataKey="acct"
                   stroke="var(--accent)"
                   strokeWidth={1.8}
-                  dot={chartData.length <= 40}
+                  dot={cmpData.length <= 40}
                   activeDot={{ r: 3 }}
                 />
                 {singlePoint && (
                   <ReferenceDot
                     x={singlePoint.date}
-                    y={singlePoint.account_value_cny}
-                    r={5}
+                    y={0}
+                    r={7}
+                    fill={CSI_LINE_COLOR}
+                    stroke="var(--surface)"
+                    strokeWidth={2}
+                  >
+                    <Label
+                      value={`沪深300 ${singlePoint.csi300_price != null ? Math.round(singlePoint.csi300_price).toLocaleString("zh-CN") : "—"}`}
+                      position="bottom"
+                      offset={10}
+                      fill="var(--dim)"
+                      fontSize={11}
+                    />
+                  </ReferenceDot>
+                )}
+                {singlePoint && (
+                  <ReferenceDot
+                    x={singlePoint.date}
+                    y={0}
+                    r={4.5}
                     fill="var(--accent)"
                     stroke="var(--surface)"
                     strokeWidth={2}
@@ -1817,6 +1909,103 @@ function HistorySection({
               </LineChart>
             </ResponsiveContainer>
           </div>
+
+          <div className="tnum mt-4 mb-1 flex flex-wrap items-baseline gap-x-4 gap-y-0.5 text-xs">
+            <span className="text-sm font-medium">每日涨跌</span>
+            <span className="text-[var(--dim)]">
+              柱为账户当日涨跌幅（红涨绿跌），线为沪深300 当日涨跌幅
+            </span>
+          </div>
+          <div className="h-36 w-full" aria-label="每日涨跌图">
+            <ResponsiveContainer width="100%" height="100%">
+              <ComposedChart
+                data={chartData}
+                margin={{ top: 6, right: 8, bottom: 0, left: 4 }}
+              >
+                <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" />
+                <XAxis
+                  dataKey="date"
+                  tickFormatter={(d: string) => d.slice(5)}
+                  tick={axisTick}
+                  tickLine={false}
+                  axisLine={{ stroke: "var(--border)" }}
+                  minTickGap={40}
+                />
+                <YAxis
+                  width={52}
+                  tick={axisTick}
+                  tickLine={false}
+                  axisLine={false}
+                  tickFormatter={pctTick}
+                />
+                <Tooltip
+                  content={({ active, payload }) => {
+                    if (!active || !payload?.length) return null;
+                    const s = payload[0]?.payload as Snapshot | undefined;
+                    if (!s) return null;
+                    return (
+                      <div className="tnum border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1.5 text-xs">
+                        <div>
+                          {s.date} 周{weekdayOf(s.date)}
+                        </div>
+                        <div>
+                          账户当日{" "}
+                          {s.day_change_pct != null ? (
+                            <span
+                              style={{ color: moveColor(s.day_change_pct) }}
+                            >
+                              {fmtPct(s.day_change_pct)}
+                              {s.day_change_cny != null
+                                ? ` (${mask(fmtSignedMoney(s.day_change_cny))})`
+                                : ""}
+                            </span>
+                          ) : (
+                            "—"
+                          )}
+                        </div>
+                        <div>
+                          沪深300 当日{" "}
+                          {s.csi300_change_pct != null ? (
+                            <span
+                              style={{ color: moveColor(s.csi300_change_pct) }}
+                            >
+                              {fmtPct(s.csi300_change_pct)}
+                            </span>
+                          ) : (
+                            "—"
+                          )}
+                        </div>
+                      </div>
+                    );
+                  }}
+                />
+                <ReferenceLine y={0} stroke="var(--border)" />
+                <Bar dataKey="day_change_pct" maxBarSize={26}>
+                  {chartData.map((s) => (
+                    <Cell
+                      key={s.date}
+                      fill={
+                        s.day_change_pct == null || s.day_change_pct === 0
+                          ? "var(--dim)"
+                          : s.day_change_pct > 0
+                            ? "var(--up)"
+                            : "var(--down)"
+                      }
+                    />
+                  ))}
+                </Bar>
+                <Line
+                  type="monotone"
+                  dataKey="csi300_change_pct"
+                  stroke={CSI_LINE_COLOR}
+                  strokeWidth={1.5}
+                  dot={{ r: 2 }}
+                  activeDot={{ r: 3 }}
+                />
+              </ComposedChart>
+            </ResponsiveContainer>
+          </div>
+
           <ul className="mt-2 divide-y divide-[var(--border)] border-y border-[var(--border)]">
             {history.map((s) => (
               <li key={s.date} className="px-1 py-2">
@@ -2025,7 +2214,7 @@ export function App() {
         <HoldingsSection board={data} totals={totals} mask={mask} />
         <Concentration board={data} totals={totals} mask={mask} />
         <TradesSection mask={mask} />
-        <HistorySection history={data.history} privacy={privacy} mask={mask} />
+        <HistorySection history={data.history} mask={mask} />
         <DataSection />
       </main>
     </div>
