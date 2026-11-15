@@ -83,9 +83,9 @@ function secidForSymbol(symbol: string): string {
 
 const BENCHMARKS: { key: string; label: string; secid: string }[] = [
   { key: "SSE", label: "上证指数", secid: "1.000001" },
-  { key: "SZSE", label: "深证成指", secid: "0.399001" },
-  { key: "CSI300", label: "沪深300", secid: "1.000300" },
   { key: "CSIA500", label: "中证A500", secid: "1.000510" },
+  { key: "CSI300", label: "沪深300", secid: "1.000300" },
+  { key: "SZSE", label: "深证成指", secid: "0.399001" },
   { key: "CHINEXT", label: "创业板指", secid: "0.399006" },
 ];
 

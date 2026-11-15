@@ -185,13 +185,13 @@ function MarketStrip({ market }: { market: Board["market"] }) {
     false,
   );
   const shown = collapsed
-    ? market.filter((m) => m.key === "CSI300" || m.key === "CSIA500")
+    ? market.filter((m) => m.key === "SSE" || m.key === "CSIA500")
     : market;
   return (
     // The whole strip is the collapse toggle (same behaviour as the
     // US board): clicking anywhere — the header or any benchmark row —
-    // folds it to exactly two rows （沪深300 / 中证A500) or expands it
-    // back to all five; the choice persists. The header button has no
+    // folds it to exactly the first two rows （上证指数 / 中证A500) or
+    // expands it back to all five; the choice persists. The header button has no
     // onClick of its own; its clicks bubble up to the section.
     <section
       aria-label="行情"
