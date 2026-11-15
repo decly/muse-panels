@@ -81,12 +81,29 @@ function secidForSymbol(symbol: string): string {
   return `${market}.${symbol}`;
 }
 
-const BENCHMARKS: { key: string; label: string; secid: string }[] = [
-  { key: "SSE", label: "上证指数", secid: "1.000001" },
-  { key: "CSIA500", label: "中证A500", secid: "1.000510" },
-  { key: "CSI300", label: "沪深300", secid: "1.000300" },
-  { key: "SZSE", label: "深证成指", secid: "0.399001" },
-  { key: "CHINEXT", label: "创业板指", secid: "0.399006" },
+// Display order drives the strip: the five A-share indices first
+// (the collapsed strip keeps exactly the first two — 上证指数 /
+// 中证A500), then the five benchmarks moved over from the US board
+// （恒生科技 / 金龙中国 / 日经225 / 越南胡志明 / 上海黄金） so each
+// index lives on exactly one board. `cnDate` marks the A-share
+// session benchmarks: only their quote date may certify an A-share
+// trading day for refreshCloseSnapshot — the moved-over instruments
+// trade on other calendars (HXC's Beijing quote date is the next
+// day; Au99.99 trades a night session), so their dates must never
+// feed that check. All ten verified live 2026-11-15 via stock/get:
+// every one reports f59 = 2, so the ulist batch scaling (f2 / 100)
+// is unambiguous for all of them.
+const BENCHMARKS: { key: string; label: string; secid: string; cnDate?: boolean }[] = [
+  { key: "SSE", label: "上证指数", secid: "1.000001", cnDate: true },
+  { key: "CSIA500", label: "中证A500", secid: "1.000510", cnDate: true },
+  { key: "CSI300", label: "沪深300", secid: "1.000300", cnDate: true },
+  { key: "SZSE", label: "深证成指", secid: "0.399001", cnDate: true },
+  { key: "CHINEXT", label: "创业板指", secid: "0.399006", cnDate: true },
+  { key: "HSTECH", label: "恒生科技", secid: "124.HSTECH" },
+  { key: "HXC", label: "金龙中国", secid: "251.HXC" },
+  { key: "N225", label: "日经225", secid: "100.N225" },
+  { key: "VNI", label: "越南胡志明", secid: "100.VNINDEX" },
+  { key: "SGOLD", label: "上海黄金", secid: "118.Au9999" },
 ];
 
 // push2.eastmoney.com intermittently answers 502 through the egress
@@ -165,9 +182,10 @@ async function fetchEmQuote(secid: string): Promise<EmQuote | null> {
   };
 }
 
-// Batch quote for the five benchmarks via ulist.np (all indexes carry
-// 2 price decimals, so the batch scaling is unambiguous here — holding
-// ETFs report a wrong decimal count on this endpoint and are fetched
+// Batch quote for the ten benchmarks via ulist.np (all ten carry
+// 2 price decimals — verified per-instrument via stock/get f59, so
+// the batch scaling is unambiguous here — holding ETFs report a
+// wrong decimal count on this endpoint and are fetched
 // per-instrument instead). f124 is the quote timestamp (unix seconds).
 async function fetchEmBenchmarkQuotes(): Promise<Map<string, EmQuote>> {
   const out = new Map<string, EmQuote>();
@@ -194,7 +212,10 @@ async function fetchEmBenchmarkQuotes(): Promise<Map<string, EmQuote>> {
       typeof row.f124 === "number" && row.f124 > 0
         ? new Date(row.f124 * 1000)
         : null;
-    out.set(secid, {
+    // Keyed by upper-cased secid: the feed reports Au99.99's code as
+    // "AU9999" while BENCHMARKS carries the canonical "Au9999", and
+    // the lookup must not depend on the feed's casing.
+    out.set(secid.toUpperCase(), {
       price: row.f2 / 100,
       change: typeof row.f4 === "number" ? row.f4 / 100 : null,
       changePercent: typeof row.f3 === "number" ? row.f3 / 100 : null,
@@ -377,7 +398,7 @@ function toSnapshotOut(
 
 // Loads the whole board in stored-quote terms (no fetching): holdings
 // joined with their latest stored quotes, the cash row, the benchmark
-// strip (always all five rows, in the fixed display order, values null
+// strip (always all ten rows, in the fixed display order, values null
 // before the first refresh), and the snapshot history (newest first).
 async function loadBoard(ctx: Ctx): Promise<BoardResponse> {
   const db = ctx.db<typeof schema>();
@@ -457,7 +478,7 @@ type RefreshOutcome = {
   board: BoardResponse;
 };
 
-// Fetches Eastmoney realtime quotes for the five benchmarks and every
+// Fetches Eastmoney realtime quotes for the ten benchmarks and every
 // holding, upserts the stored quotes, maintains the benchmark 3-year
 // peaks, and returns the reloaded board. A failed instrument keeps its
 // stored quote and is reported in `failed`.
@@ -473,12 +494,15 @@ async function refreshQuotesInternal(ctx: Ctx): Promise<RefreshOutcome> {
   const marketByKey = new Map(marketRows.map((m) => [m.key, m]));
   let quoteDate: string | null = null;
   for (const b of BENCHMARKS) {
-    const q = benchQuotes.get(b.secid);
+    const q = benchQuotes.get(b.secid.toUpperCase());
     if (!q) {
       failed.push(b.label);
       continue;
     }
-    if (q.quoteDate) quoteDate = q.quoteDate;
+    // Only the A-share session benchmarks certify the trading day
+    // (see BENCHMARKS): the moved-over instruments trade on other
+    // calendars and their quote dates can be a day ahead.
+    if (b.cnDate && q.quoteDate) quoteDate = q.quoteDate;
     const existing = marketByKey.get(b.key);
     const peak = await resolvePeak3y(
       {
@@ -1402,7 +1426,7 @@ const symbolArg = z
 export const Actions = {
   getBoard: defineAction({
     description:
-      "Loads the whole A-share board: holdings with stored quotes, cash, the five-benchmark strip, and the daily snapshot history.",
+      "Loads the whole A-share board: holdings with stored quotes, cash, the ten-benchmark strip, and the daily snapshot history.",
     request: z.object({}),
     response: boardResponse,
     async handler(ctx): Promise<BoardResponse> {
@@ -1412,7 +1436,7 @@ export const Actions = {
 
   refreshQuotes: defineAction({
     description:
-      "Fetches Eastmoney realtime quotes for all holdings and the five A-share benchmarks (live intraday, closing prices after the close), updates stored quotes and 3-year peaks, and returns the board. Never writes a snapshot.",
+      "Fetches Eastmoney realtime quotes for all holdings and the ten benchmarks (five A-share indices plus 恒生科技 / 金龙中国 / 日经225 / 越南胡志明 / 上海黄金； live intraday, closing prices after the close), updates stored quotes and 3-year peaks, and returns the board. Never writes a snapshot.",
     request: z.object({}),
     response: refreshResponse,
     async handler(ctx): Promise<z.infer<typeof refreshResponse>> {

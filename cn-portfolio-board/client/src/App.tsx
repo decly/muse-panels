@@ -193,7 +193,7 @@ function MarketStrip({ market }: { market: Board["market"] }) {
     // The whole strip is the collapse toggle (same behaviour as the
     // US board): clicking anywhere — the header or any benchmark row —
     // folds it to exactly the first two rows （上证指数 / 中证A500) or
-    // expands it back to all five; the choice persists. The header button has no
+    // expands it back to all ten; the choice persists. The header button has no
     // onClick of its own; its clicks bubble up to the section.
     <section
       aria-label="行情"
