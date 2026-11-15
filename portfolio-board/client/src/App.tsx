@@ -1651,7 +1651,7 @@ export function App() {
     // default 占比 descending (user request 2026-11-13).
     setTableSort({ key: "weight", dir: -1 });
   };
-  // Market strip collapse: the four benchmark rows can be folded
+  // Market strip collapse: the six benchmark rows can be folded
   // down to just the first two (SPX / NDX, user-confirmed 2026-11-09);
   // the whole strip (header row + every data row) is the toggle —
   // the click handler lives on the section and the header button's
@@ -2006,20 +2006,23 @@ export function App() {
                 peak still reads 历史新高. Public market data, never
                 masked by privacy mode.
                 Fixed-width right columns keep the rows aligned and
-                overflow-free at phone width. Four benchmarks since
-                2026-11-15 （标普500 / 纳指100 / 纳指综合 /
-                现货黄金）: the A-share, Hang Seng, Golden Dragon,
-                Nikkei, Vietnam and Shanghai-gold rows moved to the
-                A-share board. Prices render
+                overflow-free at phone width. Six benchmarks since
+                2026-11-15 （标普500 / 纳指100 / 纳指综合 / 道琼斯 /
+                VIX / 现货黄金）: the A-share, Hang Seng, Golden
+                Dragon, Nikkei, Vietnam and Shanghai-gold rows moved
+                to the A-share board; 道琼斯 + VIX were added the
+                same day. Prices render
                 as integers (display-only rounding via money(v, 0);
                 the stored price and the 距高点 math keep full
-                precision), which lets the price column run narrower
+                precision) — the one exception is VIX, whose level
+                sits in the teens/twenties and renders with 2
+                decimals — which lets the price column run narrower
                 and gives the two percentage columns more room. The
                 WHOLE strip is the collapse toggle (2026-11-13):
                 clicking anywhere on the section — the header row or
                 any benchmark row — folds the strip down to the first
                 two rows （标普500 / 纳指100） or expands it back to
-                all four; default expanded and the choice persists.
+                all six; default expanded and the choice persists.
                 Rows carry no links or buttons, so no click conflicts. */}
             {data.market.length > 0 && (
               <section
@@ -2096,7 +2099,9 @@ export function App() {
                           {m.price != null
                             ? m.key === "GOLD"
                               ? `$${money(m.price, 0)}`
-                              : money(m.price, 0)
+                              : m.key === "VIX"
+                                ? money(m.price, 2)
+                                : money(m.price, 0)
                             : "—"}
                         </span>
                         <span className="flex w-[74px] shrink-0 items-center">

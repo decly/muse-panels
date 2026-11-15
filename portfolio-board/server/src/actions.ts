@@ -874,8 +874,10 @@ async function loadPortfolio(ctx: Ctx): Promise<PortfolioResponse> {
   // the A-share / Hong Kong / Nikkei / Vietnam indices and Shanghai
   // gold moved to the A-share board. Stored rows for the removed keys
   // stay in market_snapshots (history is kept) but are filtered out
-  // here and no longer refreshed.
-  const marketOrder = ["SPX", "NDX", "IXIC", "GOLD"];
+  // here and no longer refreshed. Dow Jones + VIX joined on
+  // 2026-11-15 (user request): indices first, VIX after them, gold
+  // last.
+  const marketOrder = ["SPX", "NDX", "IXIC", "DJI", "VIX", "GOLD"];
   const market = marketRows
     .filter((m) => marketOrder.includes(m.key))
     .map((m) => ({
@@ -1270,18 +1272,22 @@ async function fetchUsdCny(): Promise<{
 
 // ---------- Market benchmarks ----------
 
-// Yahoo chart API: ^GSPC / ^NDX / ^IXIC are the cash
+// Yahoo chart API: ^GSPC / ^NDX / ^IXIC / ^DJI / ^VIX are the cash
 // indices on their regular-session basis. `tz` is the market's own
 // timezone, used to date-stamp the all-time peak (seed + ratchet).
 // The Nikkei 225 used to ride along here, and the A-share / Hang
 // Seng TECH / Golden Dragon / Ho Chi Minh indices rode an Eastmoney
 // list; all of those moved to the A-share board on 2026-11-15 and
 // are no longer fetched by this board (their stored rows stay in
-// market_snapshots, unrefreshed and undisplayed).
+// market_snapshots, unrefreshed and undisplayed). DJI + VIX were
+// added the same day at the user's request, on this same Yahoo path
+// (peaks seed/ratchet through the shared Yahoo helpers below).
 const BENCHMARKS = [
   { key: "SPX", label: "标普500", yahoo: "^GSPC", note: "指数 · 常规收盘", tz: "America/New_York" },
   { key: "NDX", label: "纳指100", yahoo: "^NDX", note: "指数 · 常规收盘", tz: "America/New_York" },
   { key: "IXIC", label: "纳指综合", yahoo: "^IXIC", note: "指数 · 常规收盘", tz: "America/New_York" },
+  { key: "DJI", label: "道琼斯", yahoo: "^DJI", note: "指数 · 常规收盘", tz: "America/New_York" },
+  { key: "VIX", label: "VIX", yahoo: "^VIX", note: "波动率指数 · 常规收盘", tz: "America/New_York" },
 ] as const;
 
 async function fetchBenchmark(b: (typeof BENCHMARKS)[number]): Promise<{
@@ -1352,7 +1358,7 @@ async function fetchBenchmark(b: (typeof BENCHMARKS)[number]): Promise<{
 //
 // peak_price / peak_date power the 距高点 line. A peak is seeded ONCE,
 // only while the stored value is null, from long history:
-//  - SPX / NDX / IXIC: Yahoo chart daily closes, range=10y
+//  - SPX / NDX / IXIC / DJI / VIX: Yahoo chart daily closes, range=10y
 //    (the same endpoint fetchBenchmark uses, wider range) — max close
 //    + the date of its bar, read in the market's own timezone
 //    (America/New_York).
