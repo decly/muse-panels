@@ -63,3 +63,9 @@
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-variant-numeric: tabular-nums;
 }
+
+/* Anchor targets for the sticky section nav: land the section title
+   clear of the ~34px fixed bar (plus the safe-area inset). */
+.section-anchor {
+  scroll-margin-top: calc(env(safe-area-inset-top, 0px) + 44px);
+}

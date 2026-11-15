@@ -840,7 +840,7 @@ function TradesSection({
     "mt-1 w-full rounded-md border border-[var(--border)] bg-[var(--surface-2)] px-2 py-1.5 text-base text-[var(--text)]";
 
   return (
-    <section className="mt-3 rounded-[var(--radius)] bg-[var(--surface)] p-4">
+    <section id="sec-trades" className="section-anchor mt-3 rounded-[var(--radius)] bg-[var(--surface)] p-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <h2 className="text-lg font-semibold">
           <button
@@ -1403,6 +1403,98 @@ function TradesSection({
   );
 }
 
+// ---------- sticky section nav ----------
+//
+// Lightweight jump bar (ported from the A-share board's final form,
+// 2026-11-15): four section anchors in board order. It lives in its
+// own fixed layer (outside the market strip, so its clicks can never
+// trigger the strip's collapse toggle), stays hidden while the page
+// is at the very top so it costs no screen height, and fades in as
+// soon as the user starts scrolling down. No scrollspy — plain
+// smooth-scroll jumps to the section anchors (each carries a
+// scroll-margin-top so its title lands clear of the bar).
+const NAV_ITEMS = [
+  { id: "sec-overview", label: "总览" },
+  { id: "sec-holdings", label: "持仓" },
+  { id: "sec-concentration", label: "集中度" },
+  { id: "sec-trades", label: "流水" },
+] as const;
+
+function StickyNav() {
+  const navRef = useRef<HTMLElement | null>(null);
+  const [visible, setVisible] = useState(false);
+  useEffect(() => {
+    // The shell scrolls the page inside the fixed
+    // [data-generated-space-root] container, not the window — listen
+    // to that scroller (window.scrollY never moves here).
+    const scroller = navRef.current?.closest<HTMLElement>(
+      "[data-generated-space-root]",
+    );
+    if (!scroller) return;
+    const onScroll = () => {
+      // Show as soon as the page starts scrolling down; the small
+      // 8px margin avoids flicker from rubber-band bounce at the top.
+      setVisible(scroller.scrollTop > 8);
+    };
+    onScroll();
+    scroller.addEventListener("scroll", onScroll, { passive: true });
+    window.addEventListener("resize", onScroll);
+    return () => {
+      scroller.removeEventListener("scroll", onScroll);
+      window.removeEventListener("resize", onScroll);
+    };
+  }, []);
+
+  const jump = (id: string) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const reduce = window.matchMedia(
+      "(prefers-reduced-motion: reduce)",
+    ).matches;
+    el.scrollIntoView({
+      behavior: reduce ? "auto" : "smooth",
+      block: "start",
+    });
+  };
+
+  return (
+    <nav
+      ref={navRef}
+      aria-label="板块导航"
+      aria-hidden={!visible}
+      className="fixed inset-x-0 z-50 transition-all duration-200"
+      style={{
+        top: "env(safe-area-inset-top, 0px)",
+        opacity: visible ? 1 : 0,
+        transform: visible ? "translateY(0)" : "translateY(-100%)",
+        visibility: visible ? "visible" : "hidden",
+        pointerEvents: visible ? "auto" : "none",
+      }}
+    >
+      <div
+        className="mx-auto flex h-[34px] w-full max-w-3xl items-stretch justify-between border-b border-[var(--border)] px-4 backdrop-blur-md sm:justify-start sm:gap-1"
+        style={{
+          backgroundColor:
+            "color-mix(in srgb, var(--bg) 82%, transparent)",
+        }}
+      >
+        {NAV_ITEMS.map((item) => (
+          <button
+            key={item.id}
+            type="button"
+            tabIndex={visible ? 0 : -1}
+            aria-label={`跳转到${item.label}`}
+            onClick={() => jump(item.id)}
+            className="flex-1 text-[13px] text-[var(--text)] sm:flex-none sm:px-3"
+          >
+            {item.label}
+          </button>
+        ))}
+      </div>
+    </nav>
+  );
+}
+
 export function App() {
   const queryClient = useQueryClient();
   const portfolio = useQuery({
@@ -1953,6 +2045,7 @@ export function App() {
   return (
     <div className="min-h-screen bg-[var(--bg)] text-[var(--text)]">
       <SafeAreaTopScrim backgroundColor="var(--bg)" />
+      <StickyNav />
       <main className="mx-auto w-full max-w-3xl px-4 pb-10">
         {portfolio.isPending && (
           <p className="py-16 text-center text-sm text-[var(--dim)]">
@@ -2199,7 +2292,7 @@ export function App() {
                 every width. Amounts use compact sizes so nothing clips
                 at 390px. */}
             {(view.holdings.length > 0 || view.cash != null) && (
-            <section className="mt-3 rounded-[var(--radius)] bg-[var(--surface)] p-4">
+            <section id="sec-overview" className="section-anchor mt-3 rounded-[var(--radius)] bg-[var(--surface)] p-4">
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
                   <p className="text-sm text-[var(--dim)]">总账户值</p>
@@ -2514,7 +2607,7 @@ export function App() {
             {/* Holdings list. Section order below the overview is
                 user-confirmed (2026-11-09): 持仓明细 first, then
                 集中度与结构 — do not swap them back. */}
-            <section className="mt-3">
+            <section id="sec-holdings" className="section-anchor mt-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <h2 className="text-lg font-semibold">持仓明细</h2>
                 <div className="flex items-center gap-2">
@@ -3223,7 +3316,7 @@ export function App() {
                 figures derive from the active view's holdings + latest
                 quotes (global view = merged across accounts). */}
             {view.holdings.length > 0 && (
-            <section className="mt-3 rounded-[var(--radius)] bg-[var(--surface)] p-4">
+            <section id="sec-concentration" className="section-anchor mt-3 rounded-[var(--radius)] bg-[var(--surface)] p-4">
               <h2 className="text-lg font-semibold">集中度与结构</h2>
 
               <p className="mt-3 text-sm text-[var(--dim)]">主题占比（占证券市值）</p>
