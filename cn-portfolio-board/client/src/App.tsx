@@ -168,6 +168,52 @@ function Pct({ v, className = "" }: { v: number | null; className?: string }) {
   );
 }
 
+// ---------- stale quotes ----------
+//
+// A refresh can partially fail (Eastmoney drops individual
+// per-instrument requests): the failed holdings keep their previous
+// session's price / 涨跌幅 while everything else updates, and the
+// board-level 刷新于 stamp still shows the current time. To keep that
+// from passing as fresh data, a holding whose quote_date is older
+// than the newest quote_date on the board is marked 旧报价 wherever
+// its numbers render. On a non-trading day every quote shares the
+// same (last session) date, so nothing is marked.
+const STALE_COLOR = "#d97706";
+
+function fmtQuoteDate(d: string): string {
+  // "2026-11-13" -> "11/13"
+  return d.slice(5).replace("-", "/");
+}
+
+function latestHoldingQuoteDate(board: Board): string | null {
+  let latest: string | null = null;
+  for (const h of board.holdings) {
+    const d = h.quote?.quote_date;
+    if (d && (latest == null || d > latest)) latest = d;
+  }
+  return latest;
+}
+
+function isStaleQuote(h: Holding, latest: string | null): boolean {
+  return (
+    h.quote?.quote_date != null &&
+    latest != null &&
+    h.quote.quote_date < latest
+  );
+}
+
+function StaleTag({ date, className = "" }: { date: string; className?: string }) {
+  return (
+    <span
+      className={className}
+      style={{ color: STALE_COLOR }}
+      title="该持仓未随最近一次刷新更新，仍为旧报价"
+    >
+      旧报价 {fmtQuoteDate(date)}
+    </span>
+  );
+}
+
 function SectionTitle({
   children,
   right,
@@ -410,12 +456,23 @@ function Overview({
   const queryClient = useQueryClient();
   const [cashEditing, setCashEditing] = useState(false);
   const [cashInput, setCashInput] = useState("");
+  // Partial-refresh outcome: the action reports the instruments it
+  // could not fetch in `failed`; until now that list was dropped and
+  // a refresh that left holdings on old quotes looked identical to a
+  // full success. Keep the latest outcome visible under the stamp.
+  const [refreshNote, setRefreshNote] = useState<string | null>(null);
   const refresh = useMutation({
     mutationFn: async () => await api.refreshQuotes({}),
     onSuccess: (res) => {
       queryClient.setQueryData(["board"], res.board);
       void queryClient.invalidateQueries({ queryKey: ["board"] });
+      setRefreshNote(
+        res.failed.length > 0
+          ? `本次刷新有 ${res.failed.length} 项未取到新报价，仍显示旧值：${res.failed.join("、")}（持仓明细中以「旧报价」标注，可再次刷新）`
+          : null,
+      );
     },
+    onError: () => setRefreshNote(null),
   });
   const cashMutation = useMutation({
     mutationFn: async (v: number | null) => await api.updateCash({ cash_cny: v }),
@@ -461,6 +518,15 @@ function Overview({
         {fetched ? `刷新于 ${fetched}（北京时间）` : "尚未刷新报价"}
         {refresh.isError ? " · 上次刷新失败，显示已存报价" : ""}
       </p>
+      {refreshNote && (
+        <p
+          className="mt-0.5 text-right text-xs"
+          style={{ color: STALE_COLOR }}
+          role="status"
+        >
+          {refreshNote}
+        </p>
+      )}
 
       {empty ? (
         <p className="mt-3 border border-dashed border-[var(--border)] px-3 py-4 text-sm text-[var(--dim)]">
@@ -629,10 +695,12 @@ function enrichHoldings(board: Board, totals: Totals): HoldingRow[] {
 function HoldingDetail({
   h,
   mask,
+  stale,
   onDone,
 }: {
   h: HoldingRow;
   mask: (s: string) => string;
+  stale: boolean;
   onDone: () => void;
 }) {
   const queryClient = useQueryClient();
@@ -705,6 +773,17 @@ function HoldingDetail({
         <div>
           <dt className="text-xs text-[var(--dim)]">市值占比</dt>
           <dd>{h.share != null ? `${h.share.toFixed(2)}%` : "—"}</dd>
+        </div>
+        <div>
+          <dt className="text-xs text-[var(--dim)]">报价日期</dt>
+          <dd>
+            {h.quote?.quote_date ? fmtQuoteDate(h.quote.quote_date) : "—"}
+            {stale && (
+              <span className="ml-1" style={{ color: STALE_COLOR }}>
+                旧报价，未随最近刷新更新
+              </span>
+            )}
+          </dd>
         </div>
       </dl>
       <form
@@ -804,6 +883,7 @@ function HoldingsSection({
 
   const rows = enrichHoldings(board, totals);
   const byShare = [...rows].sort((a, b) => (b.share ?? -1) - (a.share ?? -1));
+  const latestQuoteDate = latestHoldingQuoteDate(board);
 
   const pickDensity = (d: "standard" | "table") => {
     setDensity(d);
@@ -918,6 +998,9 @@ function HoldingsSection({
             <span className="block text-xs whitespace-nowrap text-[var(--dim)]">
               {displayName(h.symbol, h.name)}
             </span>
+            {isStaleQuote(h, latestQuoteDate) && h.quote?.quote_date && (
+              <StaleTag date={h.quote.quote_date} className="block text-xs" />
+            )}
           </span>
         );
       case "chg":
@@ -1094,6 +1177,13 @@ function HoldingsSection({
                       v={h.quote?.change_percent ?? null}
                       className="ml-2 text-xs"
                     />
+                    {isStaleQuote(h, latestQuoteDate) &&
+                      h.quote?.quote_date && (
+                        <StaleTag
+                          date={h.quote.quote_date}
+                          className="ml-2 text-xs"
+                        />
+                      )}
                   </span>
                 </span>
                 <span className="tnum mt-1 flex items-baseline justify-between gap-2 text-xs text-[var(--dim)]">
@@ -1112,6 +1202,7 @@ function HoldingsSection({
                 <HoldingDetail
                   h={h}
                   mask={mask}
+                  stale={isStaleQuote(h, latestQuoteDate)}
                   onDone={() => setExpanded(null)}
                 />
               )}

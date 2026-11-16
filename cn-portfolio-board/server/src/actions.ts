@@ -116,8 +116,9 @@ async function fetchJsonWithHosts(
   hosts: string[],
   path: string,
   attempts = 3,
+  accept?: (json: unknown) => boolean,
 ): Promise<unknown | null> {
-  const backoffMs = [0, 400, 1200];
+  const backoffMs = [0, 400, 1200, 2500];
   for (let attempt = 0; attempt < attempts; attempt++) {
     const wait = backoffMs[attempt] ?? 0;
     if (wait > 0) await new Promise((r) => setTimeout(r, wait));
@@ -125,10 +126,21 @@ async function fetchJsonWithHosts(
       try {
         const res = await fetch(`https://${host}${path}`, {
           headers: { "User-Agent": "Mozilla/5.0" },
+          signal: AbortSignal.timeout(10000),
         });
         if (!res.ok) continue;
         const json: unknown = await res.json();
-        if (json != null) return json;
+        if (json == null) continue;
+        // An HTTP 200 can still carry no usable payload: Eastmoney
+        // answers throttled or not-yet-ready requests with
+        // `data: null` (and intermittently with empty bodies, which
+        // fail res.json() above). When the caller supplies an accept
+        // check, an unusable body counts as a failed attempt and the
+        // retry loop keeps going — accepting it as success used to
+        // end the fetch there, silently leaving the instrument on
+        // its previous session's stored quote.
+        if (accept && !accept(json)) continue;
+        return json;
       } catch {
         // fall through to the next host / attempt
       }
@@ -155,7 +167,10 @@ type EmQuote = {
 // (unix seconds).
 async function fetchEmQuote(secid: string): Promise<EmQuote | null> {
   const path = `/api/qt/stock/get?secid=${encodeURIComponent(secid)}&fields=f43,f57,f58,f59,f60,f86,f169,f170`;
-  const json = (await fetchJsonWithHosts(PUSH2_HOSTS, path)) as {
+  const json = (await fetchJsonWithHosts(PUSH2_HOSTS, path, 4, (j) => {
+    const d = (j as { data?: { f43?: unknown } | null } | null)?.data;
+    return !!d && typeof d.f43 === "number" && d.f43 > 0;
+  })) as {
     data?: {
       f43?: number;
       f58?: string;
@@ -191,7 +206,11 @@ async function fetchEmBenchmarkQuotes(): Promise<Map<string, EmQuote>> {
   const out = new Map<string, EmQuote>();
   const secids = BENCHMARKS.map((b) => b.secid).join(",");
   const path = `/api/qt/ulist.np/get?secids=${encodeURIComponent(secids)}&fields=f2,f3,f4,f12,f13,f14,f124`;
-  const json = (await fetchJsonWithHosts(PUSH2_HOSTS, path)) as {
+  const json = (await fetchJsonWithHosts(PUSH2_HOSTS, path, 4, (j) => {
+    const diff = (j as { data?: { diff?: unknown } | null } | null)?.data
+      ?.diff;
+    return Array.isArray(diff) && diff.length > 0;
+  })) as {
     data?: {
       diff?: {
         f2?: number;
@@ -238,7 +257,11 @@ async function fetchEmKlines(
   beg: string,
 ): Promise<{ date: string; close: number }[] | null> {
   const path = `/api/qt/stock/kline/get?secid=${encodeURIComponent(secid)}&fields1=f1,f2,f3&fields2=f51,f52,f53,f54,f55,f56&klt=101&fqt=0&beg=${beg}&end=20500101&lmt=100000`;
-  const json = (await fetchJsonWithHosts(["push2his.eastmoney.com"], path)) as {
+  const json = (await fetchJsonWithHosts(["push2his.eastmoney.com"], path, 3, (j) => {
+    const klines = (j as { data?: { klines?: unknown } | null } | null)?.data
+      ?.klines;
+    return Array.isArray(klines) && klines.length > 0;
+  })) as {
     data?: { klines?: string[] } | null;
   } | null;
   const klines = json?.data?.klines ?? [];
@@ -490,6 +513,20 @@ async function refreshQuotesInternal(ctx: Ctx): Promise<RefreshOutcome> {
   const now = new Date();
 
   const benchQuotes = await fetchEmBenchmarkQuotes();
+  // Gap-fill: a throttled batch response can omit individual rows;
+  // give the missing benchmarks one more batch fetch after a pause
+  // before any of them is written off as failed.
+  const missingBench = BENCHMARKS.filter(
+    (b) => !benchQuotes.get(b.secid.toUpperCase()),
+  );
+  if (missingBench.length > 0) {
+    await new Promise((r) => setTimeout(r, 2500));
+    const retryQuotes = await fetchEmBenchmarkQuotes();
+    for (const b of missingBench) {
+      const q = retryQuotes.get(b.secid.toUpperCase());
+      if (q) benchQuotes.set(b.secid.toUpperCase(), q);
+    }
+  }
   const marketRows = await db.select().from(schema.marketSnapshots);
   const marketByKey = new Map(marketRows.map((m) => [m.key, m]));
   let quoteDate: string | null = null;
@@ -535,12 +572,11 @@ async function refreshQuotesInternal(ctx: Ctx): Promise<RefreshOutcome> {
     updated += 1;
   }
 
-  for (const h of holdingRows) {
+  const storeHoldingQuote = async (
+    h: (typeof holdingRows)[number],
+  ): Promise<boolean> => {
     const q = await fetchEmQuote(secidForSymbol(h.symbol));
-    if (!q) {
-      failed.push(h.symbol);
-      continue;
-    }
+    if (!q) return false;
     const values = {
       symbol: h.symbol,
       price: q.price,
@@ -568,6 +604,25 @@ async function refreshQuotesInternal(ctx: Ctx): Promise<RefreshOutcome> {
         .where(eq(schema.holdings.id, h.id));
     }
     updated += 1;
+    return true;
+  };
+  const failedHoldings: typeof holdingRows = [];
+  for (const h of holdingRows) {
+    if (!(await storeHoldingQuote(h))) failedHoldings.push(h);
+  }
+  if (failedHoldings.length > 0) {
+    // Second-chance sweep: the per-instrument endpoint drops
+    // individual requests intermittently, and a symbol that failed
+    // the first pass usually answers a few seconds later. Without
+    // this sweep a refresh that reported success (fresh 刷新于 stamp
+    // from the instruments that did update) silently left part of
+    // the book showing the previous session's price and 涨跌幅 —
+    // the failure the user reported on 2026-11-16, when 5 of 14
+    // holdings kept their 11/13 quotes through a 09:55 refresh.
+    await new Promise((r) => setTimeout(r, 2500));
+    for (const h of failedHoldings) {
+      if (!(await storeHoldingQuote(h))) failed.push(h.symbol);
+    }
   }
 
   const board = await loadBoard(ctx);
@@ -1436,7 +1491,7 @@ export const Actions = {
 
   refreshQuotes: defineAction({
     description:
-      "Fetches Eastmoney realtime quotes for all holdings and the ten benchmarks (five A-share indices plus 恒生科技 / 金龙中国 / 日经225 / 越南胡志明 / 上海黄金； live intraday, closing prices after the close), updates stored quotes and 3-year peaks, and returns the board. Never writes a snapshot.",
+      "Fetches Eastmoney realtime quotes for all holdings and the ten benchmarks (five A-share indices plus 恒生科技 / 金龙中国 / 日经225 / 越南胡志明 / 上海黄金； live intraday, closing prices after the close), updates stored quotes and 3-year peaks, and returns the board. Responses with no usable payload (data: null / empty) count as failed attempts and are retried; instruments still failing after a second-chance sweep keep their stored quotes and are named in `failed`. Never writes a snapshot.",
     request: z.object({}),
     response: refreshResponse,
     async handler(ctx): Promise<z.infer<typeof refreshResponse>> {
