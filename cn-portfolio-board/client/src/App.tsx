@@ -6,6 +6,7 @@
 // shows 等待录入 states until the user records holdings / cash.
 
 import {
+Fragment,
 useEffect,
 useRef,
 useState,
@@ -1234,30 +1235,53 @@ function HoldingsSection({
                 </tr>
               </thead>
               <tbody>
-                {tableRows.map((h) => (
-                  <tr
-                    key={h.id}
-                    className="cursor-pointer border-t border-[var(--border)]"
-                    onClick={() => {
-                      pickDensity("standard");
-                      setExpanded(h.id);
-                    }}
-                  >
-                    {columns.map((c, i) => (
-                      <td
-                        key={c.key}
-                        className={`px-2 py-2 whitespace-nowrap ${i === 0 ? "sticky left-0 bg-[var(--surface)]" : "text-right"}`}
+                {tableRows.map((h) => {
+                  const isOpen = expanded === h.id;
+                  return (
+                    <Fragment key={h.id}>
+                      <tr
+                        className="cursor-pointer border-t border-[var(--border)]"
+                        onClick={() => setExpanded(isOpen ? null : h.id)}
                       >
-                        {cell(h, c.key)}
-                      </td>
-                    ))}
-                  </tr>
-                ))}
+                        {columns.map((c, i) => (
+                          <td
+                            key={c.key}
+                            className={`px-2 py-2 whitespace-nowrap ${i === 0 ? "sticky left-0 bg-[var(--surface)]" : "text-right"}`}
+                          >
+                            {cell(h, c.key)}
+                          </td>
+                        ))}
+                      </tr>
+                      {isOpen && (
+                        <tr>
+                          <td
+                            colSpan={columns.length}
+                            className="border-t border-[var(--border)] p-0"
+                          >
+                            <div
+                              className="sticky left-0"
+                              style={{
+                                width: "min(calc(100vw - 2rem), 46rem)",
+                              }}
+                            >
+                              <HoldingDetail
+                                h={h}
+                                mask={mask}
+                                stale={isStaleQuote(h, latestQuoteDate)}
+                                onDone={() => setExpanded(null)}
+                              />
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  );
+                })}
               </tbody>
             </table>
           </div>
           <p className="px-1 py-1.5 text-[11px] text-[var(--dim)]">
-            点任意行回到标准模式编辑该持仓；点表头排序仅本次会话有效。
+            点任意行在表格内展开该持仓明细（可直接编辑）；点表头排序仅本次会话有效。
           </p>
         </div>
       )}
