@@ -5,6 +5,7 @@ import { api, type ApiResponse } from "./api";
 
 type Today = ApiResponse<typeof api, "getToday">;
 type Account = Today["accounts"][number];
+type CnAccount = NonNullable<Today["cn_account"]>;
 type Mover = Today["movers"][number];
 type EventItem = Today["events"][number];
 
@@ -22,6 +23,12 @@ function fmtSignedMoney(v: number | null): string {
   if (v == null) return "—";
   const sign = v > 0 ? "+" : v < 0 ? "−" : "";
   return `${sign}$${fmtMoney(Math.abs(v))}`;
+}
+
+function fmtSignedCny(v: number | null): string {
+  if (v == null) return "—";
+  const sign = v > 0 ? "+" : v < 0 ? "−" : "";
+  return `${sign}¥${fmtMoney(Math.abs(v))}`;
 }
 
 // 红涨绿跌：red = up, green = down.
@@ -235,6 +242,39 @@ function AccountRow({ a, privacy }: { a: Account; privacy: boolean }) {
   );
 }
 
+// A-share account row: same layout and privacy treatment as the US
+// account rows (amounts masked, percentages visible), RMB amounts.
+function CnAccountRow({ a, privacy }: { a: CnAccount; privacy: boolean }) {
+  return (
+    <div className="flex items-center justify-between gap-3 py-2.5">
+      <span className="shrink-0 text-base text-[var(--text)]">{a.label}</span>
+      <span className="flex flex-col items-end tabular-nums">
+        <span className="text-lg leading-7 text-[var(--text)]">
+          {privacy ? "••••••" : a.total_cny == null ? "—" : `¥${fmtMoney(a.total_cny)}`}
+        </span>
+        <span className="flex items-baseline justify-end text-sm leading-5">
+          <span
+            className="w-[5.5rem] text-right"
+            style={{ color: pctColor(a.day_change_pct) }}
+          >
+            {fmtPct(a.day_change_pct)}
+          </span>
+          <span
+            className="w-[7rem] text-right"
+            style={{ color: privacy ? undefined : pctColor(a.day_change_cny) }}
+          >
+            {a.day_change_cny == null
+              ? ""
+              : privacy
+                ? "••••••"
+                : fmtSignedCny(a.day_change_cny)}
+          </span>
+        </span>
+      </span>
+    </div>
+  );
+}
+
 // 昨夜动向 selection (deterministic, page-side): from the full pushed
 // holdings set take the top 5 gainers and top 5 losers, then merge in
 // every stock whose |day change| ≥ 5% that the top-5 cut missed. Zero
@@ -415,6 +455,7 @@ export function App() {
 
   const data = today.data;
   const refreshedLabel = fmtBeijingTime(data?.market_refreshed_at ?? null);
+  const cnFetchedLabel = fmtBeijingTime(data?.cn_indices_fetched_at ?? null);
   const nowBj = beijingNow();
   const moverGroups = selectMoverGroups(data?.movers ?? []);
 
@@ -538,6 +579,36 @@ export function App() {
               </section>
             ) : null}
 
+            {/* A股行情（五大指数，页面自拉新浪行情） */}
+            {data.cn_indices.length > 0 ? (
+              <section
+                aria-label="A股行情"
+                className="mt-6 border-t border-[var(--border)] pt-3"
+              >
+                <SectionTitle
+                  right={cnFetchedLabel ? `更新于 ${cnFetchedLabel}` : undefined}
+                >
+                  A股行情
+                </SectionTitle>
+                <div className="grid grid-cols-3 gap-2">
+                  {data.cn_indices.map((ix) => (
+                    <div key={ix.key} className="flex min-w-0 flex-col">
+                      <span className="text-sm text-[var(--dim)]">{ix.label}</span>
+                      <span className="mt-0.5 whitespace-nowrap text-lg leading-7 tabular-nums text-[var(--text)]">
+                        {ix.price == null ? "—" : fmtMoney(ix.price)}
+                      </span>
+                      <span
+                        className="whitespace-nowrap text-base tabular-nums"
+                        style={{ color: pctColor(ix.change_pct) }}
+                      >
+                        {fmtPct(ix.change_pct)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            ) : null}
+
             {/* 账户总览 */}
             <section
               aria-label="账户总览"
@@ -610,6 +681,31 @@ export function App() {
                   ))}
                 </div>
               ) : null}
+            </section>
+
+            {/* A股账户（与美股账户同版式，人民币收盘口径） */}
+            <section
+              aria-label="A股账户"
+              className="mt-6 border-t border-[var(--border)] pt-3"
+            >
+              <SectionTitle
+                right={
+                  data.cn_account_as_of_date
+                    ? `收盘口径 · ${data.cn_account_as_of_date}`
+                    : undefined
+                }
+              >
+                A股账户
+              </SectionTitle>
+              {data.cn_account ? (
+                <div className="divide-y divide-[var(--border)]">
+                  <CnAccountRow a={data.cn_account} privacy={privacy} />
+                </div>
+              ) : (
+                <p className="py-2 text-base text-[var(--dim)]">
+                  A股账户数据待晨报推送后显示。
+                </p>
+              )}
             </section>
 
             {/* 今日事件（时间线列表） */}
@@ -758,23 +854,9 @@ export function App() {
               </section>
             ) : null}
 
-            {/* 技术要点（仅在助手推送当期总览句后显示） */}
-            {data.tech_line ? (
-              <section
-                aria-label="技术要点"
-                className="mt-6 border-t border-[var(--border)] pt-3"
-              >
-                <SectionTitle>技术要点</SectionTitle>
-                <BulletText
-                  text={data.tech_line}
-                  className="text-base leading-relaxed text-[var(--text)]"
-                />
-              </section>
-            ) : null}
-
             <footer className="mt-6 border-t border-[var(--border)] pt-3">
               <p className="text-xs leading-5 text-[var(--dim)]">
-                账户与昨夜动向为美股常规时段收盘口径；盘后异动单独标注。金额单位为美元（上海黄金为人民币/克）。
+                美股账户与昨夜动向为美股常规时段收盘口径，盘后异动单独标注；A股账户为A股收盘口径，A股行情为最近交易时段行情。金额单位：美股账户为美元，A股账户为人民币，上海黄金为人民币/克。
               </p>
             </footer>
           </>

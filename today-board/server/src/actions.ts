@@ -10,6 +10,16 @@
 // - Gold (spot XAU/USD + SGE Au99.99, Sina feed — never COMEX) and the
 //   benchmark index closes (Yahoo chart API) are pulled by `refreshToday`
 //   itself and cached in market_cache.
+// - A股 (2026-11-17, user request — the page now carries an A-share
+//   summary alongside the US one, and tech-domain content such as the
+//   SGLang brief no longer belongs on this page): the A-share account
+//   total comes through the same push channel (`cn_account` section of
+//   pushDigest, sourced from the A-share board); the five A-share index
+//   quotes （上证/沪深300/中证A500/创业板/科创50） are pulled from the Sina
+//   feed by getToday itself on a 20-minute cache throttle and cached in
+//   market_cache under "cn_indices". The old `tech_line` digest section
+//   was removed the same day: it is neither read nor rendered any more,
+//   and pushDigest no longer accepts it (unknown fields are ignored).
 // - Events are stored rows maintained by the assistant via
 //   `upsertEvent` / `deleteEvent`, seeded once with the user-supplied list.
 
@@ -51,6 +61,15 @@ const indexPoint = z.object({
   label: z.string(),
   price: z.number().nullable(),
   change_pct: z.number().nullable(),
+});
+
+// A-share account totals (RMB), pushed from the A-share board through the
+// same digest channel as the US accounts — never fetched server-side.
+const cnAccountShape = z.object({
+  label: z.string().min(1),
+  total_cny: z.number().nullable(),
+  day_change_cny: z.number().nullable(),
+  day_change_pct: z.number().nullable(),
 });
 
 const eventShape = z.object({
@@ -275,6 +294,47 @@ async function fetchYahooIndex(
   }
 }
 
+// Sina index feed (s_* codes): fields are name, last price, day change
+// (points), day change %, volume, turnover — the change % is read
+// directly from field [3]. Same host and Referer as the gold feed above.
+// (Eastmoney's push2 ulist endpoint was probed first on 2026-11-17 and
+// returned 502 through this fetch path, so Sina is the source.)
+const CN_INDEX_DEFS = [
+  { code: "s_sh000001", key: "SSE", label: "上证指数" },
+  { code: "s_sh000300", key: "CSI300", label: "沪深300" },
+  { code: "s_sh000510", key: "CSI500A", label: "中证A500" },
+  { code: "s_sz399006", key: "CYB", label: "创业板指" },
+  { code: "s_sh000688", key: "KC50", label: "科创50" },
+] as const;
+
+async function fetchSinaCnIndices(): Promise<IndexPoint[]> {
+  try {
+    const list = CN_INDEX_DEFS.map((d) => d.code).join(",");
+    const r = await fetch(`https://hq.sinajs.cn/list=${list}`, {
+      headers: { Referer: "https://finance.sina.com.cn" },
+    });
+    if (!r.ok) return [];
+    const text = await r.text();
+    const out: IndexPoint[] = [];
+    for (const def of CN_INDEX_DEFS) {
+      const m = text.match(new RegExp(`hq_str_${def.code}="([^"]*)"`));
+      if (!m || !m[1]) continue;
+      const f = m[1].split(",");
+      const price = num(f[1]);
+      if (price == null) continue;
+      out.push({
+        key: def.key,
+        label: def.label,
+        price,
+        change_pct: num(f[3]),
+      });
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
 // ---------- response schemas ----------
 
 const todayResponse = z.object({
@@ -291,13 +351,16 @@ const todayResponse = z.object({
   movers_updated_at: z.string().nullable(),
   indices: z.array(indexPoint),
   indices_fetched_at: z.string().nullable(),
+  cn_indices: z.array(indexPoint),
+  cn_indices_fetched_at: z.string().nullable(),
+  cn_account: cnAccountShape.nullable(),
+  cn_account_as_of_date: z.string().nullable(),
+  cn_account_updated_at: z.string().nullable(),
   gold: goldPayload.nullable(),
   gold_fetched_at: z.string().nullable(),
   events: z.array(eventShape),
   other_assets: z.string().nullable(),
   other_assets_updated_at: z.string().nullable(),
-  tech_line: z.string().nullable(),
-  tech_updated_at: z.string().nullable(),
   market_refreshed_at: z.string().nullable(),
 });
 
@@ -318,7 +381,7 @@ const refreshResponse = z.object({
 export const Actions = {
   getToday: defineAction({
     description:
-      "Returns everything the 今日页 renders: the report's issue date (date_beijing/weekday_beijing — the Beijing date of the most recent content write, persisted by pushDigest/refreshToday, NOT the read-time date), the assistant-pushed overview line, per-account totals （全局/券商A/券商B， close-basis), the full pushed movers set (the page itself selects the top-5 gainers, top-5 losers and every |change| ≥ 5% stock for display), the cached benchmark index closes and gold prices (spot XAU/USD + SGE Au99.99), upcoming events, and the optional other-assets and tech-brief lines (null when never pushed, so the page hides those blocks).",
+      "Returns everything the 今日页 renders: the report's issue date (date_beijing/weekday_beijing — the Beijing date of the most recent content write, persisted by pushDigest/refreshToday, NOT the read-time date), the assistant-pushed overview line, per-account totals （全局/券商A/券商B， close-basis), the full pushed movers set (the page itself selects the top-5 gainers, top-5 losers and every |change| ≥ 5% stock for display), the cached benchmark index closes and gold prices (spot XAU/USD + SGE Au99.99), the A-share block (five index quotes pulled from the Sina feed on a 20-minute cache throttle — latest trading session's values, intraday-live during A-share hours — plus the assistant-pushed A-share account total, RMB close-basis, null until first pushed), upcoming events, and the optional other-assets line (null when never pushed, so the page hides that block). Tech-domain content is not part of this page.",
     request: z.object({}),
     response: todayResponse,
     async handler(ctx): Promise<z.infer<typeof todayResponse>> {
@@ -331,7 +394,7 @@ export const Actions = {
       const accountsS = await getSection(ctx, "accounts");
       const moversS = await getSection(ctx, "movers");
       const otherS = await getSection(ctx, "other_assets");
-      const techS = await getSection(ctx, "tech_line");
+      const cnAccountS = await getSection(ctx, "cn_account");
 
       const overviewVal = overviewS?.value as { text?: string } | null;
       const accountsVal = accountsS?.value as {
@@ -344,7 +407,10 @@ export const Actions = {
         after_hours_notes?: string[];
       } | null;
       const otherVal = otherS?.value as { text?: string } | null;
-      const techVal = techS?.value as { text?: string } | null;
+      const cnAccountVal = cnAccountS?.value as {
+        as_of_date?: string | null;
+        account?: z.infer<typeof cnAccountShape> | null;
+      } | null;
 
       const goldC = await getCache(ctx, "gold");
       const indicesC = await getCache(ctx, "indices");
@@ -352,6 +418,25 @@ export const Actions = {
       const indicesParsed = indicesC
         ? z.array(indexPoint).safeParse(indicesC.payload)
         : null;
+
+      // A-share indices: cache-first with a 20-minute throttle (the same
+      // cadence as the A-share board's intraday refresh). A stale or
+      // missing cache triggers one Sina pull; a failed pull keeps the
+      // last cached values with their own timestamp rather than blanking
+      // the section. The feed reports the latest trading session, so
+      // outside A-share hours these are that session's closes.
+      let cnC = await getCache(ctx, "cn_indices");
+      if (!cnC || Date.now() - cnC.fetchedAt.getTime() > 20 * 60 * 1000) {
+        const fresh = await fetchSinaCnIndices();
+        if (fresh.length > 0) {
+          await setCache(ctx, "cn_indices", fresh);
+          cnC = { payload: fresh, fetchedAt: new Date() };
+        }
+      }
+      const cnIndicesParsed = cnC
+        ? z.array(indexPoint).safeParse(cnC.payload)
+        : null;
+      const cnIndices = cnIndicesParsed?.success ? cnIndicesParsed.data : [];
 
       const eventRows = await db
         .select()
@@ -404,6 +489,11 @@ export const Actions = {
         movers_updated_at: moversS?.updatedAt.toISOString() ?? null,
         indices: indicesParsed?.success ? indicesParsed.data : [],
         indices_fetched_at: indicesC?.fetchedAt.toISOString() ?? null,
+        cn_indices: cnIndices,
+        cn_indices_fetched_at: cnC?.fetchedAt.toISOString() ?? null,
+        cn_account: cnAccountVal?.account ?? null,
+        cn_account_as_of_date: cnAccountVal?.as_of_date ?? null,
+        cn_account_updated_at: cnAccountS?.updatedAt.toISOString() ?? null,
         gold: goldParsed?.success ? goldParsed.data : null,
         gold_fetched_at: goldC?.fetchedAt.toISOString() ?? null,
         events: upcoming.map((e) => ({
@@ -416,8 +506,6 @@ export const Actions = {
         })),
         other_assets: otherVal?.text ?? null,
         other_assets_updated_at: otherS?.updatedAt.toISOString() ?? null,
-        tech_line: techVal?.text ?? null,
-        tech_updated_at: techS?.updatedAt.toISOString() ?? null,
         market_refreshed_at:
           refreshedCandidates[0]?.toISOString() ?? null,
       };
@@ -426,7 +514,7 @@ export const Actions = {
 
   pushDigest: defineAction({
     description:
-      "Assistant push channel: writes one day's digest sections to the 今日页. Every field is optional — only the sections present are overwritten. `overview` is the one-line morning summary; `accounts` carries 全局/券商A/券商B totals with day change on the regular-close basis plus `accounts_as_of_date` (the US trading date); `movers` carries the FULL merged holdings set for the session — every holding's symbol, regular-session change %, close and optional after-hours note (the page deterministically selects the top-5 gainers, top-5 losers and every stock with |change| ≥ 5% from it) — with `movers_session_label` and `after_hours_notes`; `other_assets` is the one-line 10Y/WTI/DXY summary; `tech_line` is the weekly tech-brief overview sentence. Passing null for overview/other_assets/tech_line clears that section so its block hides.",
+      "Assistant push channel: writes one day's digest sections to the 今日页. Every field is optional — only the sections present are overwritten. `overview` is the one-line morning summary; `accounts` carries 全局/券商A/券商B totals with day change on the regular-close basis plus `accounts_as_of_date` (the US trading date); `movers` carries the FULL merged holdings set for the session — every holding's symbol, regular-session change %, close and optional after-hours note (the page deterministically selects the top-5 gainers, top-5 losers and every stock with |change| ≥ 5% from it) — with `movers_session_label` and `after_hours_notes`; `cn_account` carries the A-share account total (RMB, close-basis, from the A-share board) plus `cn_account_as_of_date` (the A-share trading date) — passing cn_account: null clears the account row; `other_assets` is the one-line 10Y/WTI/DXY summary. Passing null for overview/other_assets clears that section so its block hides. Tech-domain content (e.g. the SGLang brief) does not belong on this page and is no longer accepted.",
     request: z.object({
       overview: z.string().nullable().optional(),
       accounts: z.array(accountShape).optional(),
@@ -434,8 +522,9 @@ export const Actions = {
       movers: z.array(moverShape).optional(),
       movers_session_label: z.string().nullable().optional(),
       after_hours_notes: z.array(z.string()).optional(),
+      cn_account: cnAccountShape.nullable().optional(),
+      cn_account_as_of_date: z.string().nullable().optional(),
       other_assets: z.string().nullable().optional(),
-      tech_line: z.string().nullable().optional(),
     }),
     response: okResponse,
     async handler(ctx, args): Promise<z.infer<typeof okResponse>> {
@@ -492,6 +581,27 @@ export const Actions = {
         updated.push("movers");
       }
 
+      if (
+        args.cn_account !== undefined ||
+        args.cn_account_as_of_date !== undefined
+      ) {
+        const prev = (await getSection(ctx, "cn_account"))?.value as {
+          as_of_date?: string | null;
+          account?: unknown;
+        } | null;
+        await setSection(ctx, "cn_account", {
+          as_of_date:
+            args.cn_account_as_of_date !== undefined
+              ? args.cn_account_as_of_date
+              : (prev?.as_of_date ?? null),
+          account:
+            args.cn_account !== undefined
+              ? args.cn_account
+              : (prev?.account ?? null),
+        });
+        updated.push("cn_account");
+      }
+
       if (args.other_assets !== undefined) {
         if (args.other_assets == null) {
           const db = ctx.db<typeof schema>();
@@ -502,18 +612,6 @@ export const Actions = {
           await setSection(ctx, "other_assets", { text: args.other_assets });
         }
         updated.push("other_assets");
-      }
-
-      if (args.tech_line !== undefined) {
-        if (args.tech_line == null) {
-          const db = ctx.db<typeof schema>();
-          await db
-            .delete(schema.digestSections)
-            .where(eq(schema.digestSections.key, "tech_line"));
-        } else {
-          await setSection(ctx, "tech_line", { text: args.tech_line });
-        }
-        updated.push("tech_line");
       }
 
       if (updated.length > 0) {

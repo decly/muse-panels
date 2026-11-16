@@ -1,15 +1,16 @@
 // Drizzle schema for the 今日页 (daily today page).
 //
 // digest_sections: assistant-pushed digest content, one row per section key
-// ("overview" | "accounts" | "movers" | "other_assets" | "tech_line"),
+// ("overview" | "accounts" | "movers" | "cn_account" | "other_assets"),
 // value is a JSON string, updated_at is the push instant. An extra
 // "issue_date" row stores { date: "YYYY-MM-DD" } — the Beijing date of the
 // most recent content write (pushDigest or refreshToday) — which the page
-// header renders as the report's own date.
+// header renders as the report's own date. (The former "tech_line" section
+// was retired 2026-11-17; a stale row, if present, is never read.)
 // events: the assistant-maintained event list (earnings, macro releases,
 // ex-dividend dates), date/time_text are Beijing wall-clock strings.
-// market_cache: market data this page pulls itself on refresh
-// ("gold" | "indices"), payload is a JSON string.
+// market_cache: market data this page pulls itself
+// ("gold" | "indices" | "cn_indices"), payload is a JSON string.
 
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 
