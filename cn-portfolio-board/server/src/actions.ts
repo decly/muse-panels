@@ -30,6 +30,37 @@ function beijingToday(): string {
   return dateInTz(new Date(), BJ_TZ);
 }
 
+// Whether right now (Beijing) falls inside an A-share trading
+// session: Mon–Fri, 09:30–11:30 or 13:00–15:00. Exchange holidays
+// are not modelled — on a weekday holiday the quote feed simply
+// returns the previous trading day's quotes, which is harmless.
+function inAShareSession(at: Date = new Date()): boolean {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: BJ_TZ,
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(at);
+  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
+  const dow: Record<string, number> = {
+    Sun: 0,
+    Mon: 1,
+    Tue: 2,
+    Wed: 3,
+    Thu: 4,
+    Fri: 5,
+    Sat: 6,
+  };
+  const weekday = dow[get("weekday")] ?? 0;
+  if (weekday < 1 || weekday > 5) return false;
+  const minutes = Number(get("hour")) * 60 + Number(get("minute"));
+  return (
+    (minutes >= 9 * 60 + 30 && minutes <= 11 * 60 + 30) ||
+    (minutes >= 13 * 60 && minutes <= 15 * 60)
+  );
+}
+
 // YYYY-MM-DD exactly `years` calendar years before the given date
 // (Feb 29 clamps to Feb 28 in a non-leap target year).
 function yearsBefore(dateStr: string, years: number): string {
@@ -1442,6 +1473,14 @@ const refreshResponse = z.object({
   board: boardResponse,
 });
 
+const intradayRefreshResponse = z.object({
+  status: z.enum(["refreshed", "skipped_outside_session"]),
+  updated: z.number(),
+  failed: z.array(z.string()),
+  // Beijing date of the benchmark quotes after a refresh; null when skipped.
+  quote_date: z.string().nullable(),
+});
+
 const closeSnapshotResponse = z.object({
   status: z.enum(["written", "skipped_non_trading_day", "skipped_incomplete"]),
   // The snapshot date written, or the quote date observed when skipped.
@@ -1501,6 +1540,31 @@ export const Actions = {
         updated: outcome.updated,
         failed: outcome.failed,
         board: outcome.board,
+      };
+    },
+  }),
+
+  refreshIntradayQuotes: defineAction({
+    description:
+      "Scheduled intraday refresh (every 30 minutes): refreshes Eastmoney quotes exactly like the manual refreshQuotes, but only inside Beijing A-share trading sessions (Mon–Fri 09:30–11:30 and 13:00–15:00). Outside a session — lunch break, pre/post-market, weekends — it returns skipped_outside_session without fetching or writing anything. Never writes a snapshot. The manual refresh button is not gated by this.",
+    request: z.object({}),
+    response: intradayRefreshResponse,
+    async handler(ctx): Promise<z.infer<typeof intradayRefreshResponse>> {
+      if (!inAShareSession()) {
+        return {
+          status: "skipped_outside_session",
+          updated: 0,
+          failed: [],
+          quote_date: null,
+        };
+      }
+      const outcome = await refreshQuotesInternal(ctx);
+      ctx.invalidateQueries();
+      return {
+        status: "refreshed",
+        updated: outcome.updated,
+        failed: outcome.failed,
+        quote_date: outcome.quoteDate,
       };
     },
   }),
