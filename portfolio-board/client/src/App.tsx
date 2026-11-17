@@ -8,6 +8,20 @@ import {
 } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { SafeAreaTopScrim } from "@hatch/space-sdk/client";
+import {
+  Area,
+  AreaChart,
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Cell,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 import { api, type ApiResponse } from "./api";
 
 type Portfolio = ApiResponse<typeof api, "getPortfolio">;
@@ -161,7 +175,7 @@ function fmtUpdatedTime(iso: string | null): string | null {
     minute: "2-digit",
   }).formatToParts(d);
   const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
-  return `刷新于 ${get("month")}/${get("day")} ${get("hour")}:${get("minute")}`;
+  return `${get("month")}/${get("day")} ${get("hour")}:${get("minute")}`;
 }
 
 // Extended-hours detail time, one bare numeric time for every
@@ -442,6 +456,790 @@ const TRADE_SOURCE_LABELS: Record<TradeRow["source"], string> = {
 // thousands separators, up to 4 decimals, no forced trailing zeros.
 const fmtQty = (v: number) =>
   v.toLocaleString("en-US", { maximumFractionDigits: 4 });
+
+// ---------- 走势 section (account history, merged in 2026-11-17) ----------
+//
+// The old standalone history board's UI, ported onto this board's own
+// daily snapshots (getPortfolio already returns every account's
+// history plus the server-merged global history — no new action, no
+// data-model change). Sits between 集中度与结构 and 交易流水，
+// follows the account tabs and the board's single privacy switch, and
+// adds no tab / toggle / refresh control of its own. The five stat
+// cards and the four charts are always visible; only the daily
+// detail table folds (default folded, choice persisted — the same
+// habit as the trade ledger's fold).
+//
+// day_change_pct storage mixes two scales: screenshot-sourced rows
+// store a percent (3.04 means +3.04%), refresh-sourced rows may store
+// a fraction (0.0304 means +3.04%). normalizeDayPct disambiguates per
+// row against the row's own day change $ and total — the implied
+// percent day ÷ (total − day) × 100 — and keeps whichever reading
+// (as-is, or × 100) sits closer to it, so a screenshot row can never
+// render as +304% and a fraction row never as +0.03%. The global
+// view never trusts a stored pct at all: it recomputes from the
+// summed amounts, exactly like the old history board's client.
+
+type TrendSnapshot = Portfolio["accounts"][number]["history"][number];
+
+const TREND_ACCENT = "#c08a1e";
+// 红涨绿跌 (Chinese market convention): gains red, losses green.
+const TREND_UP = "#cf3a32";
+const TREND_DOWN = "#128a4c";
+const TREND_SPX_COLOR = "#5b7a99";
+const TREND_NDX_COLOR = "#2a7f6f";
+const TREND_GRID = "#d9dfe6";
+const TREND_TICK = { fill: "#5d6b78", fontSize: 13 } as const;
+const trendTooltipStyle = {
+  backgroundColor: "var(--surface)",
+  border: "1px solid var(--border)",
+  borderRadius: 8,
+  color: "var(--text)",
+  fontSize: 14,
+} as const;
+
+function trendDayLabel(date: string): string {
+  return `${Number(date.slice(5, 7))}/${Number(date.slice(8, 10))}`;
+}
+
+function trendFullDate(date: string): string {
+  return `${date.slice(0, 4)} 年 ${Number(date.slice(5, 7))} 月 ${Number(date.slice(8, 10))} 日`;
+}
+
+function normalizeDayPct(s: TrendSnapshot): number | null {
+  const stored = s.day_change_pct;
+  const day = s.day_change_usd;
+  if (day == null) return stored;
+  const prevTotal = s.account_value_usd - day;
+  if (prevTotal <= 0) return stored;
+  const implied = (day / prevTotal) * 100;
+  if (stored == null) return implied;
+  return Math.abs(stored * 100 - implied) < Math.abs(stored - implied)
+    ? stored * 100
+    : stored;
+}
+
+// Day-change badge for the trend detail rows: amount masked under
+// privacy (bullets), percentage always visible, 红涨绿跌 coloring
+// driven by the real sign — same convention as the old history board.
+function TrendChangeBadge({
+  usd,
+  pct,
+  masked,
+}: {
+  usd: number | null;
+  pct: number | null;
+  masked: boolean;
+}) {
+  if (usd == null) return <span className="text-[var(--dim)]">—</span>;
+  const up = usd >= 0;
+  return (
+    <span
+      className="num inline-block rounded-md px-1.5 py-0.5 font-medium"
+      style={{
+        color: up ? "var(--up)" : "var(--down)",
+        backgroundColor: up
+          ? "color-mix(in srgb, var(--up) 13%, transparent)"
+          : "color-mix(in srgb, var(--down) 13%, transparent)",
+      }}
+    >
+      {masked ? "••••" : signedMoney(usd)}
+      {pct != null ? ` (${signedPct(pct)})` : ""}
+    </span>
+  );
+}
+
+// One display row for the selected view. For a single account it is
+// that account's snapshot; for the global view it is the per-day sum
+// across accounts, with `parts` keeping each account's contribution
+// visible so the origin of every global row stays auditable.
+type TrendRow = {
+  date: string;
+  label: string;
+  usd: number;
+  cny: number | null;
+  day: number | null;
+  dayPct: number | null;
+  sec: number;
+  cash: number;
+  pnl: number | null;
+  fx: number | null;
+  spx: number | null;
+  ndx: number | null;
+  parts: { account_id: string; usd: number }[] | null;
+};
+
+function trendSumNullable(values: (number | null)[]): number | null {
+  const present = values.filter((v): v is number => v != null);
+  if (present.length === 0) return null;
+  return present.reduce((a, v) => a + v, 0);
+}
+
+function trendFirstNonNull(values: (number | null)[]): number | null {
+  for (const v of values) if (v != null) return v;
+  return null;
+}
+
+function buildTrendRows(snaps: TrendSnapshot[], view: string): TrendRow[] {
+  if (view !== "global") {
+    return snaps
+      .filter((s) => s.account_id === view)
+      .map((s) => ({
+        date: s.date,
+        label: trendDayLabel(s.date),
+        usd: s.account_value_usd,
+        cny: s.account_value_cny,
+        day: s.day_change_usd,
+        dayPct: normalizeDayPct(s),
+        sec: s.securities_value_usd,
+        cash: s.cash_usd,
+        pnl: s.total_pnl_usd,
+        fx: s.fx_rate,
+        spx: s.spx_price,
+        ndx: s.ndx_price,
+        parts: null,
+      }));
+  }
+  // Global: group every account's snapshot by trading date and sum.
+  // A date with records from only some accounts sums just those —
+  // history never breaks and nothing is back-filled for an account
+  // that had no record that day.
+  const byDate = new Map<string, TrendSnapshot[]>();
+  for (const s of snaps) {
+    const group = byDate.get(s.date);
+    if (group) group.push(s);
+    else byDate.set(s.date, [s]);
+  }
+  return [...byDate.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
+    .map(([date, group]) => {
+      const usd = group.reduce((a, s) => a + s.account_value_usd, 0);
+      const day = trendSumNullable(group.map((s) => s.day_change_usd));
+      // Global day-change % is recomputed from the summed amounts:
+      // day ÷ (total − day). Summing per-account percentages would
+      // be wrong.
+      const prevTotal = day != null ? usd - day : null;
+      const dayPct =
+        day != null && prevTotal != null && prevTotal > 0
+          ? (day / prevTotal) * 100
+          : null;
+      const fx = trendFirstNonNull(group.map((s) => s.fx_rate));
+      return {
+        date,
+        label: trendDayLabel(date),
+        usd,
+        // CNY follows the board rule: global total × that day's rate.
+        cny:
+          fx != null
+            ? usd * fx
+            : trendSumNullable(group.map((s) => s.account_value_cny)),
+        day,
+        dayPct,
+        sec: group.reduce((a, s) => a + s.securities_value_usd, 0),
+        cash: group.reduce((a, s) => a + s.cash_usd, 0),
+        pnl: trendSumNullable(group.map((s) => s.total_pnl_usd)),
+        fx,
+        spx: trendFirstNonNull(group.map((s) => s.spx_price)),
+        ndx: trendFirstNonNull(group.map((s) => s.ndx_price)),
+        parts: group.map((s) => ({
+          account_id: s.account_id,
+          usd: s.account_value_usd,
+        })),
+      };
+    });
+}
+
+function TrendSection({
+  accounts,
+  viewKey,
+  privacy,
+  mask,
+}: {
+  accounts: Portfolio["accounts"];
+  // "global" or an account id — the board's own account tab value.
+  viewKey: string;
+  privacy: boolean;
+  mask: (s: string) => string;
+}) {
+  const [currency, setCurrency] = useState<"usd" | "cny">("usd");
+  // Daily-detail fold: DEFAULT FOLDED (unlike the trade ledger's
+  // default-expanded fold); the choice persists under its own key,
+  // so a stored "0" is the only thing that starts it expanded.
+  const [detailCollapsed, setDetailCollapsed] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("portfolio-board-trend-detail-collapsed") !== "0";
+    } catch {
+      return true;
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        "portfolio-board-trend-detail-collapsed",
+        detailCollapsed ? "1" : "0",
+      );
+    } catch {
+      /* storage unavailable */
+    }
+  }, [detailCollapsed]);
+
+  const accountName = (id: string) =>
+    accounts.find((a) => a.account.id === id)?.account.name ?? id;
+  const viewName = viewKey === "global" ? "全局" : accountName(viewKey);
+
+  const hist = useMemo(() => {
+    const snaps = accounts.flatMap((a) => a.history);
+    if (snaps.length === 0) return null;
+    const rows = buildTrendRows(snaps, viewKey);
+    if (rows.length === 0) return null;
+    const first = rows[0];
+    const last = rows[rows.length - 1];
+    if (!first || !last) return null;
+    const baseSpx = rows.find((r) => r.spx != null)?.spx ?? null;
+    const baseNdx = rows.find((r) => r.ndx != null)?.ndx ?? null;
+    const chart = rows.map((r) => ({
+      ...r,
+      acctIdx: (r.usd / first.usd) * 100,
+      spxIdx: r.spx != null && baseSpx != null ? (r.spx / baseSpx) * 100 : null,
+      ndxIdx: r.ndx != null && baseNdx != null ? (r.ndx / baseNdx) * 100 : null,
+    }));
+    const cum = last.usd - first.usd;
+    const peak = Math.max(...rows.map((r) => r.usd));
+    const dayRows = rows.filter((r) => r.day != null);
+    const best = dayRows.reduce<(typeof rows)[number] | null>(
+      (a, r) => (a == null || (r.day ?? 0) > (a.day ?? 0) ? r : a),
+      null,
+    );
+    const worst = dayRows.reduce<(typeof rows)[number] | null>(
+      (a, r) => (a == null || (r.day ?? 0) < (a.day ?? 0) ? r : a),
+      null,
+    );
+    return {
+      rows: chart,
+      days: rows.length,
+      first,
+      last,
+      cum,
+      cumPct: first.usd > 0 ? (cum / first.usd) * 100 : 0,
+      peak,
+      drawdownPct: peak > 0 ? ((last.usd - peak) / peak) * 100 : 0,
+      best,
+      worst,
+    };
+  }, [accounts, viewKey]);
+
+  return (
+    <section id="sec-trend" className="section-anchor mt-3">
+      <h2 className="text-lg font-semibold">走势</h2>
+
+      {hist == null ? (
+        <div className="mt-3 rounded-[var(--radius)] bg-[var(--surface)] p-4">
+          <p className="text-sm text-[var(--dim)]">
+            {viewName}暂无每日快照记录，待收盘数据积累后显示。
+          </p>
+        </div>
+      ) : (
+        <>
+          {/* Stat cards (always visible). The 证券市值 card and the
+              latest-total headline block from the old history board
+              are deliberately not ported — both duplicate 总览. */}
+          <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-3">
+            <div className="rounded-[var(--radius)] bg-[var(--surface)] p-3">
+              <p className="text-sm text-[var(--dim)]">记录天数</p>
+              <p className="num mt-1 text-lg font-medium">{hist.days} 天</p>
+              <p className="whitespace-nowrap text-[13px] text-[var(--dim)]">
+                自 {trendFullDate(hist.first.date)}
+              </p>
+            </div>
+            <div className="rounded-[var(--radius)] bg-[var(--surface)] p-3">
+              <p className="text-sm text-[var(--dim)]">累计变化</p>
+              <p
+                className="num mt-1 text-lg font-medium"
+                style={{ color: hist.cum >= 0 ? "var(--up)" : "var(--down)" }}
+              >
+                {mask(signedMoney(hist.cum))}
+              </p>
+              <p
+                className="num text-sm"
+                style={{ color: hist.cum >= 0 ? "var(--up)" : "var(--down)" }}
+              >
+                {signedPct(hist.cumPct)}
+              </p>
+            </div>
+            <div className="rounded-[var(--radius)] bg-[var(--surface)] p-3">
+              <p className="text-sm text-[var(--dim)]">历史最高</p>
+              <p className="num mt-1 text-lg font-medium">
+                {mask(`$${money(hist.peak, 0)}`)}
+              </p>
+              <p className="num text-sm text-[var(--dim)]">
+                距高点 {hist.drawdownPct.toFixed(2)}%
+              </p>
+            </div>
+            <div className="rounded-[var(--radius)] bg-[var(--surface)] p-3">
+              <p className="text-sm text-[var(--dim)]">最好单日</p>
+              {hist.best?.day != null ? (
+                <>
+                  <p
+                    className="num mt-1 text-lg font-medium"
+                    style={{
+                      color: hist.best.day >= 0 ? "var(--up)" : "var(--down)",
+                    }}
+                  >
+                    {mask(signedMoney(hist.best.day))}
+                  </p>
+                  <p className="whitespace-nowrap text-[13px] text-[var(--dim)]">
+                    {trendFullDate(hist.best.date)}
+                  </p>
+                </>
+              ) : (
+                <p className="num mt-1 text-lg font-medium">—</p>
+              )}
+            </div>
+            <div className="rounded-[var(--radius)] bg-[var(--surface)] p-3">
+              <p className="text-sm text-[var(--dim)]">最差单日</p>
+              {hist.worst?.day != null ? (
+                <>
+                  <p
+                    className="num mt-1 text-lg font-medium"
+                    style={{
+                      color: hist.worst.day >= 0 ? "var(--up)" : "var(--down)",
+                    }}
+                  >
+                    {mask(signedMoney(hist.worst.day))}
+                  </p>
+                  <p className="whitespace-nowrap text-[13px] text-[var(--dim)]">
+                    {trendFullDate(hist.worst.date)}
+                  </p>
+                </>
+              ) : (
+                <p className="num mt-1 text-lg font-medium">—</p>
+              )}
+            </div>
+          </div>
+
+          {/* Account value curve */}
+          <div className="mt-3 rounded-[var(--radius)] bg-[var(--surface)] p-4">
+            <div className="flex items-center justify-between gap-2">
+              <h3 className="text-base font-semibold">总值走势</h3>
+              <div
+                className="flex overflow-hidden rounded-md border border-[var(--border)]"
+                role="group"
+                aria-label="曲线币种"
+              >
+                {(
+                  [
+                    ["usd", "美元"],
+                    ["cny", "人民币"],
+                  ] as const
+                ).map(([k, label]) => (
+                  <button
+                    key={k}
+                    type="button"
+                    aria-pressed={currency === k}
+                    onClick={() => setCurrency(k)}
+                    className="px-3 py-1.5 text-sm font-medium"
+                    style={
+                      currency === k
+                        ? { backgroundColor: "var(--accent)", color: "#000" }
+                        : { color: "var(--dim)" }
+                    }
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="mt-3 h-64">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart
+                  data={hist.rows}
+                  margin={{ top: 6, right: 8, bottom: 0, left: 8 }}
+                >
+                  <CartesianGrid stroke={TREND_GRID} strokeDasharray="3 3" />
+                  <XAxis dataKey="label" tick={TREND_TICK} tickLine={false} />
+                  <YAxis
+                    tick={TREND_TICK}
+                    tickLine={false}
+                    width={72}
+                    domain={["auto", "auto"]}
+                    tickFormatter={(v: number) =>
+                      privacy
+                        ? "••••"
+                        : currency === "usd"
+                          ? `$${money(v, 0)}`
+                          : `¥${money(v, 0)}`
+                    }
+                  />
+                  <Tooltip
+                    contentStyle={trendTooltipStyle}
+                    formatter={(value) => [
+                      privacy
+                        ? "••••"
+                        : currency === "usd"
+                          ? `$${money(Number(value))}`
+                          : cny(Number(value)),
+                      currency === "usd" ? "总值（美元）" : "总值（人民币）",
+                    ]}
+                    labelFormatter={(label) => `${label}（月/日）`}
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey={currency}
+                    stroke={TREND_ACCENT}
+                    strokeWidth={2.5}
+                    dot={{ r: 4 }}
+                    activeDot={{ r: 5 }}
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+
+          {/* Daily change bars */}
+          <div className="mt-3 rounded-[var(--radius)] bg-[var(--surface)] p-4">
+            <h3 className="text-base font-semibold">每日涨跌</h3>
+            <div className="mt-3 h-52">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart
+                  data={hist.rows}
+                  margin={{ top: 6, right: 8, bottom: 0, left: 8 }}
+                >
+                  <CartesianGrid stroke={TREND_GRID} strokeDasharray="3 3" />
+                  <XAxis dataKey="label" tick={TREND_TICK} tickLine={false} />
+                  <YAxis
+                    tick={TREND_TICK}
+                    tickLine={false}
+                    width={72}
+                    tickFormatter={(v: number) =>
+                      privacy ? "••••" : `$${money(v, 0)}`
+                    }
+                  />
+                  <Tooltip
+                    contentStyle={trendTooltipStyle}
+                    formatter={(value) => [
+                      privacy ? "••••" : signedMoney(Number(value)),
+                      "当日变化",
+                    ]}
+                    labelFormatter={(label) => `${label}（月/日）`}
+                  />
+                  <Bar dataKey="day" radius={[3, 3, 0, 0]}>
+                    {hist.rows.map((r) => (
+                      <Cell
+                        key={r.date}
+                        fill={(r.day ?? 0) >= 0 ? TREND_UP : TREND_DOWN}
+                      />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+
+          {/* Securities vs cash structure */}
+          <div className="mt-3 rounded-[var(--radius)] bg-[var(--surface)] p-4">
+            <h3 className="text-base font-semibold">证券与现金结构</h3>
+            <div className="mt-2 flex gap-4 text-sm text-[var(--dim)]">
+              <span>
+                <span
+                  className="mr-1.5 inline-block h-2.5 w-2.5 rounded-sm align-middle"
+                  style={{ backgroundColor: TREND_ACCENT }}
+                />
+                证券市值
+              </span>
+              <span>
+                <span
+                  className="mr-1.5 inline-block h-2.5 w-2.5 rounded-sm align-middle"
+                  style={{ backgroundColor: TREND_SPX_COLOR }}
+                />
+                现金
+              </span>
+            </div>
+            <div className="mt-2 h-52">
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart
+                  data={hist.rows}
+                  margin={{ top: 6, right: 8, bottom: 0, left: 8 }}
+                >
+                  <CartesianGrid stroke={TREND_GRID} strokeDasharray="3 3" />
+                  <XAxis dataKey="label" tick={TREND_TICK} tickLine={false} />
+                  <YAxis
+                    tick={TREND_TICK}
+                    tickLine={false}
+                    width={72}
+                    domain={[0, "dataMax"]}
+                    tickFormatter={(v: number) =>
+                      privacy ? "••••" : `$${money(v, 0)}`
+                    }
+                  />
+                  <Tooltip
+                    contentStyle={trendTooltipStyle}
+                    formatter={(value, name) => [
+                      privacy ? "••••" : `$${money(Number(value))}`,
+                      name === "sec" ? "证券市值" : "现金",
+                    ]}
+                    labelFormatter={(label) => `${label}（月/日）`}
+                  />
+                  <Area
+                    type="monotone"
+                    dataKey="sec"
+                    stackId="1"
+                    stroke={TREND_ACCENT}
+                    fill={TREND_ACCENT}
+                    fillOpacity={0.75}
+                    dot={{ r: 3 }}
+                  />
+                  <Area
+                    type="monotone"
+                    dataKey="cash"
+                    stackId="1"
+                    stroke={TREND_SPX_COLOR}
+                    fill={TREND_SPX_COLOR}
+                    fillOpacity={0.55}
+                    dot={{ r: 3 }}
+                  />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+
+          {/* Account vs benchmarks, normalized to 100 */}
+          <div className="mt-3 rounded-[var(--radius)] bg-[var(--surface)] p-4">
+            <h3 className="text-base font-semibold">与大盘对比（起点 = 100）</h3>
+            <div className="mt-2 flex flex-wrap gap-4 text-sm text-[var(--dim)]">
+              <span>
+                <span
+                  className="mr-1.5 inline-block h-2.5 w-2.5 rounded-sm align-middle"
+                  style={{ backgroundColor: TREND_ACCENT }}
+                />
+                {viewKey === "global" ? "全部账户" : viewName}
+              </span>
+              <span>
+                <span
+                  className="mr-1.5 inline-block h-2.5 w-2.5 rounded-sm align-middle"
+                  style={{ backgroundColor: TREND_SPX_COLOR }}
+                />
+                标普500
+              </span>
+              <span>
+                <span
+                  className="mr-1.5 inline-block h-2.5 w-2.5 rounded-sm align-middle"
+                  style={{ backgroundColor: TREND_NDX_COLOR }}
+                />
+                纳指100
+              </span>
+            </div>
+            <div className="mt-2 h-52">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart
+                  data={hist.rows}
+                  margin={{ top: 6, right: 8, bottom: 0, left: 8 }}
+                >
+                  <CartesianGrid stroke={TREND_GRID} strokeDasharray="3 3" />
+                  <XAxis dataKey="label" tick={TREND_TICK} tickLine={false} />
+                  <YAxis
+                    tick={TREND_TICK}
+                    tickLine={false}
+                    width={48}
+                    domain={["auto", "auto"]}
+                    tickFormatter={(v: number) => v.toFixed(1)}
+                  />
+                  <Tooltip
+                    contentStyle={trendTooltipStyle}
+                    formatter={(value, name) => [
+                      Number(value).toFixed(2),
+                      name === "acctIdx"
+                        ? viewKey === "global"
+                          ? "全部账户"
+                          : viewName
+                        : name === "spxIdx"
+                          ? "标普500"
+                          : "纳指100",
+                    ]}
+                    labelFormatter={(label) => `${label}（月/日）`}
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="acctIdx"
+                    stroke={TREND_ACCENT}
+                    strokeWidth={2.5}
+                    dot={{ r: 4 }}
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="spxIdx"
+                    stroke={TREND_SPX_COLOR}
+                    strokeWidth={2}
+                    dot={{ r: 3 }}
+                  />
+                  <Line
+                    type="monotone"
+                    dataKey="ndxIdx"
+                    stroke={TREND_NDX_COLOR}
+                    strokeWidth={2}
+                    dot={{ r: 3 }}
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+
+          {/* Daily detail — the only folded part of this section. */}
+          <div className="mt-3 rounded-[var(--radius)] bg-[var(--surface)] p-4">
+            <h3 className="text-base font-semibold">
+              <button
+                type="button"
+                onClick={() => setDetailCollapsed((v) => !v)}
+                aria-expanded={!detailCollapsed}
+                aria-label={detailCollapsed ? "展开每日明细" : "折叠每日明细"}
+                className="-my-1 -ml-2 flex items-center gap-2 rounded-lg px-2 py-1 transition-colors hover:bg-[var(--surface-2)] active:opacity-60"
+              >
+                每日明细
+                <span
+                  aria-hidden
+                  className="flex h-6 items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--surface)] px-2 text-xs font-normal text-[var(--dim)]"
+                >
+                  {detailCollapsed ? "展开" : "收起"}
+                  <span className="text-[9px]">{detailCollapsed ? "▼" : "▲"}</span>
+                </span>
+              </button>
+            </h3>
+            {!detailCollapsed && (
+              <>
+                <div className="mt-3 hidden overflow-x-auto md:block">
+                  <table className="w-full text-base">
+                    <thead>
+                      <tr className="border-b border-[var(--border)] text-left text-sm text-[var(--dim)]">
+                        <th className="py-2 pr-2 font-medium">日期</th>
+                        <th className="py-2 pr-2 text-right font-medium">总值</th>
+                        <th className="py-2 pr-2 text-right font-medium">证券市值</th>
+                        <th className="py-2 pr-2 text-right font-medium">现金</th>
+                        <th className="py-2 pr-2 text-right font-medium">浮盈亏</th>
+                        <th className="py-2 pr-2 text-right font-medium">当日涨跌</th>
+                        <th className="py-2 pr-2 text-right font-medium">标普500收盘</th>
+                        <th className="py-2 text-right font-medium">纳指100收盘</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {[...hist.rows].reverse().map((r) => (
+                        <tr
+                          key={r.date}
+                          className="border-b border-[var(--border)] last:border-0"
+                        >
+                          <td className="num whitespace-nowrap py-2 pr-2">
+                            {r.date}
+                            {r.parts && (
+                              <div className="whitespace-nowrap text-sm font-normal text-[var(--dim)]">
+                                {r.parts
+                                  .map(
+                                    (p) =>
+                                      `${accountName(p.account_id)} ${mask(`$${money(p.usd, 0)}`)}`,
+                                  )
+                                  .join(" · ")}
+                              </div>
+                            )}
+                          </td>
+                          <td className="num whitespace-nowrap py-2 pr-2 text-right font-medium">
+                            {mask(`$${money(r.usd)}`)}
+                          </td>
+                          <td className="num whitespace-nowrap py-2 pr-2 text-right">
+                            {mask(`$${money(r.sec)}`)}
+                          </td>
+                          <td className="num whitespace-nowrap py-2 pr-2 text-right">
+                            {mask(`$${money(r.cash)}`)}
+                          </td>
+                          <td
+                            className="num whitespace-nowrap py-2 pr-2 text-right"
+                            style={{
+                              color:
+                                r.pnl == null
+                                  ? "var(--dim)"
+                                  : r.pnl >= 0
+                                    ? "var(--up)"
+                                    : "var(--down)",
+                            }}
+                          >
+                            {r.pnl != null ? mask(signedMoney(r.pnl)) : "—"}
+                          </td>
+                          <td className="whitespace-nowrap py-2 pr-2 text-right">
+                            <TrendChangeBadge
+                              usd={r.day}
+                              pct={r.dayPct}
+                              masked={privacy}
+                            />
+                          </td>
+                          <td className="num py-2 pr-2 text-right">
+                            {r.spx != null ? money(r.spx) : "—"}
+                          </td>
+                          <td className="num py-2 text-right">
+                            {r.ndx != null ? money(r.ndx) : "—"}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <ul className="mt-2 space-y-2 md:hidden">
+                  {[...hist.rows].reverse().map((r) => (
+                    <li
+                      key={r.date}
+                      className="rounded-[var(--radius)] bg-[var(--surface-2)] p-3"
+                    >
+                      <div className="flex items-baseline justify-between gap-2">
+                        <span className="num whitespace-nowrap font-medium">
+                          {r.date}
+                        </span>
+                        <span className="num whitespace-nowrap text-lg font-semibold">
+                          {mask(`$${money(r.usd)}`)}
+                        </span>
+                      </div>
+                      {r.parts && (
+                        <p className="num mt-1 whitespace-nowrap text-sm text-[var(--dim)]">
+                          {r.parts
+                            .map(
+                              (p) =>
+                                `${accountName(p.account_id)} ${mask(`$${money(p.usd, 0)}`)}`,
+                            )
+                            .join(" · ")}
+                        </p>
+                      )}
+                      <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-[var(--dim)]">
+                        <TrendChangeBadge
+                          usd={r.day}
+                          pct={r.dayPct}
+                          masked={privacy}
+                        />
+                        <span className="num">
+                          证券 {mask(`$${money(r.sec, 0)}`)}
+                        </span>
+                        <span className="num">
+                          现金 {mask(`$${money(r.cash, 0)}`)}
+                        </span>
+                        {r.pnl != null && (
+                          <span
+                            className="num"
+                            style={{
+                              color: r.pnl >= 0 ? "var(--up)" : "var(--down)",
+                            }}
+                          >
+                            浮盈亏 {mask(signedMoney(r.pnl))}
+                          </span>
+                        )}
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              </>
+            )}
+          </div>
+
+          <p className="mt-4 text-xs leading-relaxed text-[var(--dim)]">
+            口径：本区段数据为常规时段收盘口径的每日账户快照；全局为当日有记录账户的合计，当日无记录的账户不计入；当日涨跌幅按当日涨跌
+            ÷（总值 − 当日涨跌）计算；人民币金额按当日汇率换算。
+          </p>
+        </>
+      )}
+    </section>
+  );
+}
 
 // Trade ledger section （交易流水）, always the last section on the
 // page (after 集中度与结构）. Follows the account tabs: the global
@@ -1411,7 +2209,7 @@ function TradesSection({
 // ---------- sticky section nav ----------
 //
 // Lightweight jump bar (ported from the A-share board's final form,
-// 2026-11-15): four section anchors in board order. It lives in its
+// 2026-11-15): five section anchors in board order. It lives in its
 // own fixed layer (outside the market strip, so its clicks can never
 // trigger the strip's collapse toggle), stays hidden while the page
 // is at the very top so it costs no screen height, and fades in as
@@ -1422,6 +2220,7 @@ const NAV_ITEMS = [
   { id: "sec-overview", label: "总览" },
   { id: "sec-holdings", label: "持仓" },
   { id: "sec-concentration", label: "集中度" },
+  { id: "sec-trend", label: "走势" },
   { id: "sec-trades", label: "流水" },
 ] as const;
 
@@ -3519,6 +4318,18 @@ export function App() {
               </div>
             </section>
             )}
+
+            {/* 走势 (account history, merged in from the old history
+                board 2026-11-17): between 集中度与结构 and 交易流水.
+                Follows the account tabs and the board's privacy
+                switch; not keyed by view — its currency choice and
+                detail fold are the user's own, kept across tabs. */}
+            <TrendSection
+              accounts={data.accounts}
+              viewKey={view.key}
+              privacy={privacy}
+              mask={mask}
+            />
 
             {/* Trade ledger: always the last section (user-confirmed
                 placement 2026-11-11, after 集中度与结构）. Follows the
