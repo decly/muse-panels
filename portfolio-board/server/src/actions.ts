@@ -210,6 +210,15 @@ const portfolioResponse = z.object({
   // cash summed, history summed per date (account_id "global").
   holdings: z.array(holdingSchema),
   last_fetched_at: z.string().nullable(),
+  // Newest moment any displayed quote data was written: the full
+  // refresh stamp (fetched_at) OR a per-session extended-slot stamp
+  // from the 20-minute background saver (refreshExtendedQuotes never
+  // touches fetched_at by design, so during Beijing daytime the
+  // overnight prices on screen advance every 20 minutes while
+  // fetched_at sits at the last full refresh). The client's 刷新于
+  // label reads this field; the staleness gates keep using
+  // last_fetched_at.
+  last_updated_at: z.string().nullable(),
   fx: fxSchema.nullable(),
   cash: cashSchema.nullable(),
   market: z.array(marketSchema),
@@ -829,9 +838,26 @@ async function loadPortfolio(ctx: Ctx): Promise<PortfolioResponse> {
   const marketRows = await db.select().from(schema.marketSnapshots);
   const bySymbol = new Map(snaps.map((s) => [s.quoteSymbol, s]));
   let lastFetched: string | null = null;
+  let lastUpdated: string | null = null;
   for (const s of snaps) {
     const f = s.fetchedAt.toISOString();
     if (!lastFetched || f > lastFetched) lastFetched = f;
+    // The saver's slot stamps count toward the displayed freshness:
+    // overnight_as_of is the saver's own fetch moment, and the
+    // pre/post stamps are the session feed's update time converted
+    // to ISO at write time (≈ the write moment). Only ISO-shaped
+    // values count — legacy raw feed text never parses into the max.
+    let newest = f;
+    for (const slot of [s.preAsOf, s.postAsOf, s.overnightAsOf]) {
+      if (slot && /^\d{4}-\d{2}-\d{2}T/.test(slot)) {
+        const t = new Date(slot);
+        if (!Number.isNaN(t.getTime())) {
+          const iso = t.toISOString();
+          if (iso > newest) newest = iso;
+        }
+      }
+    }
+    if (!lastUpdated || newest > lastUpdated) lastUpdated = newest;
   }
   const session = currentUsSession();
   const allHoldings = rows.map((h) => toHoldingOut(h, bySymbol, session.key));
@@ -902,6 +928,7 @@ async function loadPortfolio(ctx: Ctx): Promise<PortfolioResponse> {
     accounts,
     holdings: mergeHoldings(allHoldings, accountNames),
     last_fetched_at: lastFetched,
+    last_updated_at: lastUpdated,
     market,
     history: mergeSnapshots(allSnapshots),
     fx: fxRow

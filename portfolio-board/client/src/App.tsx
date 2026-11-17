@@ -138,12 +138,17 @@ function fmtTime(iso: string | null): string {
   }).format(d);
 }
 
-// "刷新于 M/D HH:MM" for the server-recorded quote fetch time shown
-// under the refresh button. Takes the ISO instant getPortfolio returns
-// (quote_snapshots.fetched_at, max over the batch) and only formats it
-// in Beijing time — never a client-side clock. Null when there is no
-// usable timestamp, in which case the line is hidden entirely.
-function fmtFetchedAt(iso: string | null): string | null {
+// "M/D HH:MM" for the server-recorded data-update time shown under
+// the refresh button. Takes the ISO instant getPortfolio returns as
+// last_updated_at — the newest write of any displayed quote data:
+// the full-refresh stamp (quote_snapshots.fetched_at) or a
+// per-session extended-slot stamp from the 20-minute background
+// saver, whichever is later — and only formats it in Beijing time,
+// never a client-side clock. Null when there is no usable timestamp,
+// in which case the line is hidden entirely. The render splits the
+// bare time out of the 刷新于 prefix so the time itself can be
+// highlighted on its own (user request 2026-11-17).
+function fmtUpdatedTime(iso: string | null): string | null {
   if (!iso) return null;
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return null;
@@ -480,7 +485,7 @@ const TRADE_WINDOW_PRESETS: { days: number | null; label: string }[] = [
 ];
 // "Today" as an Asia/Shanghai calendar day (YYYY-MM-DD), NOT the
 // viewing device's local day: the board's dates and rhythms are
-// Beijing based (same convention as fmtFetchedAt above), and
+// Beijing based (same convention as fmtUpdatedTime above), and
 // anchoring to the viewer's local clock made the window depend on
 // the device's timezone — a client whose local date runs ahead of
 // Beijing (another timezone, a mis-set clock) pushed a short window
@@ -2432,9 +2437,16 @@ export function App() {
                     {refresh.isPending ? "刷新中…" : "刷新报价"}
                   </button>
                   </div>
-                  {fmtFetchedAt(data.last_fetched_at) && (
-                    <p className="num whitespace-nowrap text-right text-[11px] leading-none text-[var(--dim)]">
-                      {fmtFetchedAt(data.last_fetched_at)}
+                  {fmtUpdatedTime(
+                    data.last_updated_at ?? data.last_fetched_at,
+                  ) && (
+                    <p className="whitespace-nowrap text-right text-[11px] leading-none text-[var(--dim)]">
+                      刷新于{" "}
+                      <span className="num text-[13px] font-bold text-[var(--accent)]">
+                        {fmtUpdatedTime(
+                          data.last_updated_at ?? data.last_fetched_at,
+                        )}
+                      </span>
                     </p>
                   )}
                 </div>
