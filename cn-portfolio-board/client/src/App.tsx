@@ -1996,13 +1996,14 @@ function TradesSection({ mask }: { mask: (s: string) => string }) {
 const ACCOUNT_LINE_COLOR = "var(--up)";
 
 // Colour of the CSI 300 comparison series in the 与大盘对比 chart:
-// a warm amber that stays distinct from the account's red and the
-// SSE violet in both colour schemes.
-const CSI_LINE_COLOR = "#d97706";
+// a saturated deep blue — far in hue from the account's red and the
+// SSE violet in both colour schemes (the previous warm amber sat too
+// close to the account's red to tell apart at a glance).
+const CSI_LINE_COLOR = "#2563eb";
 
 // Colour of the SSE Composite （上证指数） series in the history
 // charts: a violet clearly apart from the account's red and the
-// CSI 300 amber in both colour schemes.
+// CSI 300 deep blue in both colour schemes.
 const SSE_LINE_COLOR = "#7c3aed";
 
 // 证券与现金结构 series colours: a saturated deep blue for securities
