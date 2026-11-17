@@ -1609,6 +1609,49 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionKey]);
 
+  // Foreground auto-refresh (user request 2026-11-17): a page left
+  // sitting in the phone's memory keeps showing the moment it was
+  // first opened — the background saver writes fresh extended-session
+  // slots every 20 minutes, but nothing re-read them. When the page
+  // comes back to the foreground (visibilitychange → visible, or the
+  // window regains focus), re-read the stored portfolio so the latest
+  // saved quotes land immediately, and when the stored quotes are
+  // past the same staleness window the fetch-on-open path uses
+  // (2 min in a live extended session, 5 min otherwise) pull a fresh
+  // quote refresh on top. A short cooldown collapses the
+  // visibilitychange + focus pair (and rapid app-switch flicker)
+  // into a single pass, and an in-flight refresh is never doubled.
+  const lastForegroundAt = useRef(0);
+  useEffect(() => {
+    const onForeground = () => {
+      if (document.hidden) return;
+      const now = Date.now();
+      if (now - lastForegroundAt.current < 10 * 1000) return;
+      lastForegroundAt.current = now;
+      const data = queryClient.getQueryData<Portfolio>(["portfolio"]);
+      queryClient.invalidateQueries({ queryKey: ["portfolio"] });
+      queryClient.invalidateQueries({ queryKey: ["trades"] });
+      if (!data || data.holdings.length === 0) return;
+      if (refreshPending.current) return;
+      const sk = data.session.key;
+      const staleMs =
+        sk === "pre" || sk === "post" || sk === "overnight"
+          ? 2 * 60 * 1000
+          : 5 * 60 * 1000;
+      const last = data.last_fetched_at;
+      if (!last || now - new Date(last).getTime() > staleMs) {
+        refresh.mutate();
+      }
+    };
+    document.addEventListener("visibilitychange", onForeground);
+    window.addEventListener("focus", onForeground);
+    return () => {
+      document.removeEventListener("visibilitychange", onForeground);
+      window.removeEventListener("focus", onForeground);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [queryClient]);
+
   const seed = useMutation({
     mutationFn: () => api.seedHoldings({}),
     onSuccess: () => {
