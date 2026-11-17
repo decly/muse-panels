@@ -65,11 +65,20 @@ const indexPoint = z.object({
 
 // A-share account totals (RMB), pushed from the A-share board through the
 // same digest channel as the US accounts — never fetched server-side.
+// day_change_pct is the TOTAL-ACCOUNT basis (day change ÷ previous-day
+// total assets including cash — the A-share board's snapshot/history
+// basis, NOT its overview's securities-only basis). The cumulative
+// unrealized P&L fields (vs diluted cost, same figure as the A-share
+// board's overview/history) are optional for backward compatibility:
+// pushes made before 2026-11-17 do not carry them, and the page renders
+// them as — until a push supplies them.
 const cnAccountShape = z.object({
   label: z.string().min(1),
   total_cny: z.number().nullable(),
   day_change_cny: z.number().nullable(),
   day_change_pct: z.number().nullable(),
+  unrealized_pnl_cny: z.number().nullable().optional(),
+  unrealized_pnl_pct: z.number().nullable().optional(),
 });
 
 const eventShape = z.object({
@@ -381,7 +390,7 @@ const refreshResponse = z.object({
 export const Actions = {
   getToday: defineAction({
     description:
-      "Returns everything the 今日页 renders: the report's issue date (date_beijing/weekday_beijing — the Beijing date of the most recent content write, persisted by pushDigest/refreshToday, NOT the read-time date), the assistant-pushed overview line, per-account totals （全局/券商A/券商B， close-basis), the full pushed movers set (the page itself selects the top-5 gainers, top-5 losers and every |change| ≥ 5% stock for display), the cached benchmark index closes and gold prices (spot XAU/USD + SGE Au99.99), the A-share block (five index quotes pulled from the Sina feed on a 20-minute cache throttle — latest trading session's values, intraday-live during A-share hours — plus the assistant-pushed A-share account total, RMB close-basis, null until first pushed), upcoming events, and the optional other-assets line (null when never pushed, so the page hides that block). Tech-domain content is not part of this page.",
+      "Returns everything the 今日页 renders: the report's issue date (date_beijing/weekday_beijing — the Beijing date of the most recent content write, persisted by pushDigest/refreshToday, NOT the read-time date), the assistant-pushed overview line, per-account totals （全局/券商A/券商B， close-basis), the full pushed movers set (the page itself selects the top-5 gainers, top-5 losers and every |change| ≥ 5% stock for display), the cached benchmark index closes and gold prices (spot XAU/USD + SGE Au99.99), the A-share block (five index quotes pulled from the Sina feed on a 20-minute cache throttle — latest trading session's values, intraday-live during A-share hours — plus the assistant-pushed A-share account, RMB close-basis, null until first pushed; its day_change_pct is the total-account basis and it also carries unrealized_pnl_cny/unrealized_pnl_pct, the cumulative unrealized P&L vs diluted cost, null when a push has not supplied them yet), upcoming events, and the optional other-assets line (null when never pushed, so the page hides that block). Page structure: one 市场行情 section （美股指数 / A股指数 / 黄金 as parallel groups), one 账户总览 section （美股账户 / A股账户 as parallel groups), then 昨夜动向 / 今日事件 / 其他资产. Tech-domain content is not part of this page.",
     request: z.object({}),
     response: todayResponse,
     async handler(ctx): Promise<z.infer<typeof todayResponse>> {
@@ -491,7 +500,13 @@ export const Actions = {
         indices_fetched_at: indicesC?.fetchedAt.toISOString() ?? null,
         cn_indices: cnIndices,
         cn_indices_fetched_at: cnC?.fetchedAt.toISOString() ?? null,
-        cn_account: cnAccountVal?.account ?? null,
+        cn_account: cnAccountVal?.account
+          ? {
+              ...cnAccountVal.account,
+              unrealized_pnl_cny: cnAccountVal.account.unrealized_pnl_cny ?? null,
+              unrealized_pnl_pct: cnAccountVal.account.unrealized_pnl_pct ?? null,
+            }
+          : null,
         cn_account_as_of_date: cnAccountVal?.as_of_date ?? null,
         cn_account_updated_at: cnAccountS?.updatedAt.toISOString() ?? null,
         gold: goldParsed?.success ? goldParsed.data : null,
@@ -514,7 +529,7 @@ export const Actions = {
 
   pushDigest: defineAction({
     description:
-      "Assistant push channel: writes one day's digest sections to the 今日页. Every field is optional — only the sections present are overwritten. `overview` is the one-line morning summary; `accounts` carries 全局/券商A/券商B totals with day change on the regular-close basis plus `accounts_as_of_date` (the US trading date); `movers` carries the FULL merged holdings set for the session — every holding's symbol, regular-session change %, close and optional after-hours note (the page deterministically selects the top-5 gainers, top-5 losers and every stock with |change| ≥ 5% from it) — with `movers_session_label` and `after_hours_notes`; `cn_account` carries the A-share account total (RMB, close-basis, from the A-share board) plus `cn_account_as_of_date` (the A-share trading date) — passing cn_account: null clears the account row; `other_assets` is the one-line 10Y/WTI/DXY summary. Passing null for overview/other_assets clears that section so its block hides. Tech-domain content (e.g. the SGLang brief) does not belong on this page and is no longer accepted.",
+      "Assistant push channel: writes one day's digest sections to the 今日页. Every field is optional — only the sections present are overwritten. `overview` is the one-line morning summary; `accounts` carries 全局/券商A/券商B totals with day change on the regular-close basis plus `accounts_as_of_date` (the US trading date); `movers` carries the FULL merged holdings set for the session — every holding's symbol, regular-session change %, close and optional after-hours note (the page deterministically selects the top-5 gainers, top-5 losers and every stock with |change| ≥ 5% from it) — with `movers_session_label` and `after_hours_notes`; `cn_account` carries the A-share account (RMB, close-basis, from the A-share board) plus `cn_account_as_of_date` (the A-share trading date) — passing cn_account: null clears the account row. Writers MUST populate `cn_account` with BOTH metrics on every push: (1) the day change — `day_change_cny` + `day_change_pct`, where `day_change_pct` is the TOTAL-ACCOUNT basis, day change ÷ previous-day total assets INCLUDING cash (the A-share board's snapshot/history basis, verified 2026-11-17; e.g. −¥1,000 ÷ ¥100,000 = −1.00%); do NOT substitute the A-share board overview's securities-only figure (day change ÷ previous-day securities value, cash excluded — the same −¥1,000 over a ¥95,000 securities-only base would read −1.05%), whose absolute value runs larger for the same amount; the A-share board is being unified to the total-account basis as well; and (2) the cumulative unrealized P&L vs diluted cost — `unrealized_pnl_cny` + `unrealized_pnl_pct`, the same figure as the A-share board's overview/history cumulative P&L (e.g. +¥3,000 / +3.00%). The page labels the day change explicitly as 当日涨跌 with its date and shows the cumulative figure on its own 累计浮盈亏 line, so the two can never be conflated. Omitting the cumulative fields on a cn_account push preserves any previously stored values. `other_assets` is the one-line 10Y/Brent/DXY summary. Passing null for overview/other_assets clears that section so its block hides. Tech-domain content (e.g. the SGLang brief) does not belong on this page and is no longer accepted.",
     request: z.object({
       overview: z.string().nullable().optional(),
       accounts: z.array(accountShape).optional(),
@@ -587,17 +602,33 @@ export const Actions = {
       ) {
         const prev = (await getSection(ctx, "cn_account"))?.value as {
           as_of_date?: string | null;
-          account?: unknown;
+          account?: z.infer<typeof cnAccountShape> | null;
         } | null;
+        // A cn_account push that omits the cumulative P&L fields keeps
+        // the previously stored ones instead of wiping them — older
+        // writers predate those fields.
+        const nextAccount =
+          args.cn_account !== undefined
+            ? args.cn_account == null
+              ? null
+              : {
+                  ...args.cn_account,
+                  unrealized_pnl_cny:
+                    args.cn_account.unrealized_pnl_cny ??
+                    prev?.account?.unrealized_pnl_cny ??
+                    null,
+                  unrealized_pnl_pct:
+                    args.cn_account.unrealized_pnl_pct ??
+                    prev?.account?.unrealized_pnl_pct ??
+                    null,
+                }
+            : (prev?.account ?? null);
         await setSection(ctx, "cn_account", {
           as_of_date:
             args.cn_account_as_of_date !== undefined
               ? args.cn_account_as_of_date
               : (prev?.as_of_date ?? null),
-          account:
-            args.cn_account !== undefined
-              ? args.cn_account
-              : (prev?.account ?? null),
+          account: nextAccount,
         });
         updated.push("cn_account");
       }

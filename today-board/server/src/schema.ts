@@ -2,7 +2,11 @@
 //
 // digest_sections: assistant-pushed digest content, one row per section key
 // ("overview" | "accounts" | "movers" | "cn_account" | "other_assets"),
-// value is a JSON string, updated_at is the push instant. An extra
+// value is a JSON string, updated_at is the push instant. The cn_account
+// value carries { label, total_cny, day_change_cny, day_change_pct
+// (total-account basis), unrealized_pnl_cny, unrealized_pnl_pct
+// (cumulative, vs diluted cost; absent on pre-2026-11-17 pushes) }.
+// An extra
 // "issue_date" row stores { date: "YYYY-MM-DD" } — the Beijing date of the
 // most recent content write (pushDigest or refreshToday) — which the page
 // header renders as the report's own date. (The former "tech_line" section

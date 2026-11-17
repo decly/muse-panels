@@ -242,35 +242,120 @@ function AccountRow({ a, privacy }: { a: Account; privacy: boolean }) {
   );
 }
 
-// A-share account row: same layout and privacy treatment as the US
-// account rows (amounts masked, percentages visible), RMB amounts.
-function CnAccountRow({ a, privacy }: { a: CnAccount; privacy: boolean }) {
+// Parallel group header used by every subgroup inside 市场行情 and
+// 账户总览 — same type, same layout, so 美股/A股/黄金 groups read as
+// equals under their section title.
+function GroupHead({ title, right }: { title: string; right?: string }) {
   return (
-    <div className="flex items-center justify-between gap-3 py-2.5">
-      <span className="shrink-0 text-base text-[var(--text)]">{a.label}</span>
-      <span className="flex flex-col items-end tabular-nums">
-        <span className="text-lg leading-7 text-[var(--text)]">
-          {privacy ? "••••••" : a.total_cny == null ? "—" : `¥${fmtMoney(a.total_cny)}`}
+    <p className="flex items-baseline justify-between gap-3">
+      <span className="text-sm font-semibold text-[var(--text)]">{title}</span>
+      {right ? (
+        <span className="shrink-0 text-xs text-[var(--dim)]">{right}</span>
+      ) : null}
+    </p>
+  );
+}
+
+// "2026-11-16" -> "11月16日"; anything else -> null.
+function cnDateShort(dateStr: string | null): string | null {
+  if (!dateStr) return null;
+  const parts = dateStr.split("-");
+  const m = Number(parts[1]);
+  const d = Number(parts[2]);
+  if (!Number.isFinite(m) || !Number.isFinite(d) || m < 1 || d < 1) return null;
+  return `${m}月${d}日`;
+}
+
+// One labelled metric row inside the A-share account block: label on
+// the left, % and amount in the same fixed columns as the US account
+// rows. Amounts are privacy-masked, percentages stay visible.
+function CnMetricRow({
+  label,
+  amount,
+  pct,
+  privacy,
+}: {
+  label: string;
+  amount: number | null;
+  pct: number | null;
+  privacy: boolean;
+}) {
+  return (
+    <div className="flex items-baseline justify-between gap-3 py-2">
+      <span className="min-w-0 text-base text-[var(--text)]">{label}</span>
+      <span className="flex shrink-0 items-baseline justify-end text-sm leading-5 tabular-nums">
+        <span
+          className="w-[5.5rem] text-right"
+          style={{ color: pctColor(pct) }}
+        >
+          {fmtPct(pct)}
         </span>
-        <span className="flex items-baseline justify-end text-sm leading-5">
-          <span
-            className="w-[5.5rem] text-right"
-            style={{ color: pctColor(a.day_change_pct) }}
-          >
-            {fmtPct(a.day_change_pct)}
-          </span>
-          <span
-            className="w-[7rem] text-right"
-            style={{ color: privacy ? undefined : pctColor(a.day_change_cny) }}
-          >
-            {a.day_change_cny == null
-              ? ""
-              : privacy
-                ? "••••••"
-                : fmtSignedCny(a.day_change_cny)}
-          </span>
+        <span
+          className="w-[7rem] text-right text-base"
+          style={{ color: privacy ? undefined : pctColor(amount) }}
+        >
+          {amount == null ? "—" : privacy ? "••••••" : fmtSignedCny(amount)}
         </span>
       </span>
+    </div>
+  );
+}
+
+// A-share account block (inside 账户总览, parallel to the US accounts
+// group): total assets, then the DAY change and the CUMULATIVE
+// unrealized P&L as two separate, explicitly labelled rows — the day
+// row carries its trading date so the total-account day % can never
+// be mistaken for the cumulative figure (the two are different
+// 口径 and were once conflated). Same privacy treatment as the US
+// rows (amounts masked, percentages visible), RMB amounts. Cumulative
+// fields are absent on older pushes and render as —.
+function CnAccountBlock({
+  a,
+  privacy,
+  asOfDate,
+}: {
+  a: CnAccount;
+  privacy: boolean;
+  asOfDate: string | null;
+}) {
+  const dayShort = cnDateShort(asOfDate);
+  const pnlCny = a.unrealized_pnl_cny ?? null;
+  const pnlPct = a.unrealized_pnl_pct ?? null;
+  return (
+    <div>
+      <div className="divide-y divide-[var(--border)]">
+        <div className="flex items-center justify-between gap-3 py-2.5">
+          <span className="shrink-0 text-base text-[var(--text)]">总资产</span>
+          <span className="text-lg leading-7 tabular-nums text-[var(--text)]">
+            {privacy
+              ? "••••••"
+              : a.total_cny == null
+                ? "—"
+                : `¥${fmtMoney(a.total_cny)}`}
+          </span>
+        </div>
+        <CnMetricRow
+          label={dayShort ? `当日涨跌（${dayShort}）` : "当日涨跌"}
+          amount={a.day_change_cny}
+          pct={a.day_change_pct}
+          privacy={privacy}
+        />
+        <CnMetricRow
+          label="累计浮盈亏"
+          amount={pnlCny}
+          pct={pnlPct}
+          privacy={privacy}
+        />
+      </div>
+      {/* 口径说明：当日涨跌幅是总账户口径 —— 当日变动 ÷ 昨日
+          总资产（含现金），与A股看板的收盘快照/历史一致。按证券
+          市值口径（不含现金）算同一笔变动时分母更小、百分比绝对
+          值略大，金额一致、差异只在分母。累计浮盈亏是相对摊薄
+          成本的未实现盈亏，与当日涨跌是两个口径，分行标清。 */}
+      <p className="mt-1.5 text-xs leading-5 text-[var(--dim)]">
+        当日涨跌幅为总账户口径（含现金）：当日变动 ÷
+        昨日总资产，与A股看板快照/历史一致；按证券市值口径（不含现金）计算时分母更小，百分比绝对值略大，当日变动金额一致。累计浮盈亏为相对摊薄成本的未实现盈亏。
+      </p>
     </div>
   );
 }
@@ -553,87 +638,170 @@ export function App() {
           </div>
         ) : data ? (
           <>
-            {/* 指数（三大指数，页面最前） */}
-            {data.indices.length > 0 ? (
+            {/* 市场行情（页面最前）：美股指数、A股指数、黄金三组
+                同级并列 — 此前黄金是页面后部一个独立大区块，与
+                顶部的指数/A股行情标题口径不对齐、层级也不清，现
+                三组统一在「市场行情」下，分组标题与版式完全对称。 */}
+            {data.indices.length > 0 ||
+            data.cn_indices.length > 0 ||
+            data.gold ? (
               <section
-                aria-label="指数"
+                aria-label="市场行情"
                 className="mt-5 border-t border-[var(--border)] pt-3"
               >
-                <SectionTitle>指数</SectionTitle>
-                <div className="grid grid-cols-3 gap-2">
-                  {data.indices.map((ix) => (
-                    <div key={ix.key} className="flex min-w-0 flex-col">
-                      <span className="text-sm text-[var(--dim)]">{ix.label}</span>
-                      <span className="mt-0.5 whitespace-nowrap text-lg leading-7 tabular-nums text-[var(--text)]">
-                        {ix.price == null ? "—" : fmtMoney(ix.price, 0)}
-                      </span>
-                      <span
-                        className="whitespace-nowrap text-base tabular-nums"
-                        style={{ color: pctColor(ix.change_pct) }}
-                      >
-                        {fmtPct(ix.change_pct)}
-                      </span>
+                <SectionTitle>市场行情</SectionTitle>
+                {data.indices.length > 0 ? (
+                  <div>
+                    <GroupHead title="美股指数" right="昨夜美股收盘" />
+                    <div className="mt-1.5 grid grid-cols-3 gap-2">
+                      {data.indices.map((ix) => (
+                        <div key={ix.key} className="flex min-w-0 flex-col">
+                          <span className="text-sm text-[var(--dim)]">{ix.label}</span>
+                          <span className="mt-0.5 whitespace-nowrap text-lg leading-7 tabular-nums text-[var(--text)]">
+                            {ix.price == null ? "—" : fmtMoney(ix.price, 0)}
+                          </span>
+                          <span
+                            className="whitespace-nowrap text-base tabular-nums"
+                            style={{ color: pctColor(ix.change_pct) }}
+                          >
+                            {fmtPct(ix.change_pct)}
+                          </span>
+                        </div>
+                      ))}
                     </div>
-                  ))}
-                </div>
+                  </div>
+                ) : null}
+                {data.cn_indices.length > 0 ? (
+                  <div className={data.indices.length > 0 ? "mt-4" : undefined}>
+                    <GroupHead
+                      title="A股指数"
+                      right={`最近交易时段${cnFetchedLabel ? ` · 更新于 ${cnFetchedLabel}` : ""}`}
+                    />
+                    <div className="mt-1.5 grid grid-cols-3 gap-2">
+                      {data.cn_indices.map((ix) => (
+                        <div key={ix.key} className="flex min-w-0 flex-col">
+                          <span className="text-sm text-[var(--dim)]">{ix.label}</span>
+                          <span className="mt-0.5 whitespace-nowrap text-lg leading-7 tabular-nums text-[var(--text)]">
+                            {ix.price == null ? "—" : fmtMoney(ix.price)}
+                          </span>
+                          <span
+                            className="whitespace-nowrap text-base tabular-nums"
+                            style={{ color: pctColor(ix.change_pct) }}
+                          >
+                            {fmtPct(ix.change_pct)}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+                {data.gold ? (
+                  <div
+                    className={
+                      data.indices.length > 0 || data.cn_indices.length > 0
+                        ? "mt-4"
+                        : undefined
+                    }
+                  >
+                    <GroupHead
+                      title="黄金"
+                      right={
+                        data.gold.source_date
+                          ? `数据日 ${data.gold.source_date}`
+                          : undefined
+                      }
+                    />
+                    <div className="divide-y divide-[var(--border)]">
+                      <div className="grid grid-cols-[1fr_7rem_6rem] items-baseline gap-2 py-2.5">
+                        <span className="min-w-0 text-base text-[var(--text)]">
+                          现货黄金{" "}
+                          <span className="text-sm text-[var(--dim)]">XAU/USD</span>
+                        </span>
+                        <span className="text-right text-lg tabular-nums text-[var(--text)]">
+                          {data.gold.xau.price == null
+                            ? "—"
+                            : `$${fmtMoney(data.gold.xau.price)}`}
+                        </span>
+                        <span
+                          className="text-right text-sm tabular-nums"
+                          style={{ color: pctColor(data.gold.xau.change_pct) }}
+                        >
+                          {fmtPct(data.gold.xau.change_pct)}
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-[1fr_7rem_6rem] items-baseline gap-2 py-2.5">
+                        <span className="min-w-0 text-base text-[var(--text)]">
+                          上海黄金{" "}
+                          <span className="text-sm text-[var(--dim)]">Au99.99 · 元/克</span>
+                        </span>
+                        <span className="text-right text-lg tabular-nums text-[var(--text)]">
+                          {data.gold.sgold.price == null
+                            ? "—"
+                            : `¥${fmtMoney(data.gold.sgold.price)}`}
+                        </span>
+                        <span
+                          className="text-right text-sm tabular-nums"
+                          style={{ color: pctColor(data.gold.sgold.change_pct) }}
+                        >
+                          {fmtPct(data.gold.sgold.change_pct)}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
               </section>
             ) : null}
 
-            {/* A股行情（五大指数，页面自拉新浪行情） */}
-            {data.cn_indices.length > 0 ? (
-              <section
-                aria-label="A股行情"
-                className="mt-6 border-t border-[var(--border)] pt-3"
-              >
-                <SectionTitle
-                  right={cnFetchedLabel ? `更新于 ${cnFetchedLabel}` : undefined}
-                >
-                  A股行情
-                </SectionTitle>
-                <div className="grid grid-cols-3 gap-2">
-                  {data.cn_indices.map((ix) => (
-                    <div key={ix.key} className="flex min-w-0 flex-col">
-                      <span className="text-sm text-[var(--dim)]">{ix.label}</span>
-                      <span className="mt-0.5 whitespace-nowrap text-lg leading-7 tabular-nums text-[var(--text)]">
-                        {ix.price == null ? "—" : fmtMoney(ix.price)}
-                      </span>
-                      <span
-                        className="whitespace-nowrap text-base tabular-nums"
-                        style={{ color: pctColor(ix.change_pct) }}
-                      >
-                        {fmtPct(ix.change_pct)}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              </section>
-            ) : null}
-
-            {/* 账户总览 */}
+            {/* 账户总览：美股账户与A股账户同级并列 — 此前A股账户
+                是页面后部一个独立大区块，与美股账户不在一处、层级
+                也不对齐，现两组统一在本区下，分组标题完全对称。 */}
             <section
               aria-label="账户总览"
               className="mt-6 border-t border-[var(--border)] pt-3"
             >
-              <SectionTitle
-                right={
-                  data.accounts_as_of_date
-                    ? `收盘口径 · ${data.accounts_as_of_date}`
-                    : undefined
-                }
-              >
-                账户总览
-              </SectionTitle>
-              {data.accounts.length > 0 ? (
-                <div className="divide-y divide-[var(--border)]">
-                  {data.accounts.map((a) => (
-                    <AccountRow key={a.id} a={a} privacy={privacy} />
-                  ))}
-                </div>
-              ) : (
-                <p className="py-2 text-base text-[var(--dim)]">
-                  账户数据待今日晨报推送后显示。
-                </p>
-              )}
+              <SectionTitle>账户总览</SectionTitle>
+              <div>
+                <GroupHead
+                  title="美股账户"
+                  right={
+                    data.accounts_as_of_date
+                      ? `收盘口径 · ${data.accounts_as_of_date}`
+                      : undefined
+                  }
+                />
+                {data.accounts.length > 0 ? (
+                  <div className="divide-y divide-[var(--border)]">
+                    {data.accounts.map((a) => (
+                      <AccountRow key={a.id} a={a} privacy={privacy} />
+                    ))}
+                  </div>
+                ) : (
+                  <p className="py-2 text-base text-[var(--dim)]">
+                    账户数据待今日晨报推送后显示。
+                  </p>
+                )}
+              </div>
+              <div className="mt-4">
+                <GroupHead
+                  title="A股账户"
+                  right={
+                    data.cn_account_as_of_date
+                      ? `收盘口径 · ${data.cn_account_as_of_date}`
+                      : undefined
+                  }
+                />
+                {data.cn_account ? (
+                  <CnAccountBlock
+                    a={data.cn_account}
+                    privacy={privacy}
+                    asOfDate={data.cn_account_as_of_date}
+                  />
+                ) : (
+                  <p className="py-2 text-base text-[var(--dim)]">
+                    A股账户数据待晨报推送后显示。
+                  </p>
+                )}
+              </div>
             </section>
 
             {/* 昨夜动向 */}
@@ -681,31 +849,6 @@ export function App() {
                   ))}
                 </div>
               ) : null}
-            </section>
-
-            {/* A股账户（与美股账户同版式，人民币收盘口径） */}
-            <section
-              aria-label="A股账户"
-              className="mt-6 border-t border-[var(--border)] pt-3"
-            >
-              <SectionTitle
-                right={
-                  data.cn_account_as_of_date
-                    ? `收盘口径 · ${data.cn_account_as_of_date}`
-                    : undefined
-                }
-              >
-                A股账户
-              </SectionTitle>
-              {data.cn_account ? (
-                <div className="divide-y divide-[var(--border)]">
-                  <CnAccountRow a={data.cn_account} privacy={privacy} />
-                </div>
-              ) : (
-                <p className="py-2 text-base text-[var(--dim)]">
-                  A股账户数据待晨报推送后显示。
-                </p>
-              )}
             </section>
 
             {/* 今日事件（时间线列表） */}
@@ -784,62 +927,6 @@ export function App() {
               )}
             </section>
 
-            {/* 黄金 */}
-            <section
-              aria-label="黄金"
-              className="mt-6 border-t border-[var(--border)] pt-3"
-            >
-              <SectionTitle
-                right={
-                  data.gold?.source_date ? `数据日 ${data.gold.source_date}` : undefined
-                }
-              >
-                黄金
-              </SectionTitle>
-              {data.gold ? (
-                <div className="divide-y divide-[var(--border)]">
-                  <div className="grid grid-cols-[1fr_7rem_6rem] items-baseline gap-2 py-2.5">
-                    <span className="min-w-0 text-base text-[var(--text)]">
-                      现货黄金{" "}
-                      <span className="text-sm text-[var(--dim)]">XAU/USD</span>
-                    </span>
-                    <span className="text-right text-lg tabular-nums text-[var(--text)]">
-                      {data.gold.xau.price == null
-                        ? "—"
-                        : `$${fmtMoney(data.gold.xau.price)}`}
-                    </span>
-                    <span
-                      className="text-right text-sm tabular-nums"
-                      style={{ color: pctColor(data.gold.xau.change_pct) }}
-                    >
-                      {fmtPct(data.gold.xau.change_pct)}
-                    </span>
-                  </div>
-                  <div className="grid grid-cols-[1fr_7rem_6rem] items-baseline gap-2 py-2.5">
-                    <span className="min-w-0 text-base text-[var(--text)]">
-                      上海黄金{" "}
-                      <span className="text-sm text-[var(--dim)]">Au99.99 · 元/克</span>
-                    </span>
-                    <span className="text-right text-lg tabular-nums text-[var(--text)]">
-                      {data.gold.sgold.price == null
-                        ? "—"
-                        : `¥${fmtMoney(data.gold.sgold.price)}`}
-                    </span>
-                    <span
-                      className="text-right text-sm tabular-nums"
-                      style={{ color: pctColor(data.gold.sgold.change_pct) }}
-                    >
-                      {fmtPct(data.gold.sgold.change_pct)}
-                    </span>
-                  </div>
-                </div>
-              ) : (
-                <p className="py-2 text-base text-[var(--dim)]">
-                  黄金价格待每日晨间生成后显示。
-                </p>
-              )}
-            </section>
-
             {/* 其他资产（仅在助手推送后显示） */}
             {data.other_assets ? (
               <section
@@ -856,7 +943,7 @@ export function App() {
 
             <footer className="mt-6 border-t border-[var(--border)] pt-3">
               <p className="text-xs leading-5 text-[var(--dim)]">
-                美股账户与昨夜动向为美股常规时段收盘口径，盘后异动单独标注；A股账户为A股收盘口径，A股行情为最近交易时段行情。金额单位：美股账户为美元，A股账户为人民币，上海黄金为人民币/克。
+                美股账户与昨夜动向为美股常规时段收盘口径，盘后异动单独标注；A股账户为A股收盘口径，A股指数为最近交易时段行情。金额单位：美股账户为美元，A股账户为人民币，上海黄金为人民币/克。
               </p>
             </footer>
           </>
