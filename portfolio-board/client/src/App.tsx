@@ -469,6 +469,16 @@ const fmtQty = (v: number) =>
 // detail table folds (default folded, choice persisted — the same
 // habit as the trade ledger's fold).
 //
+// Chart presentation follows the A-share board's 走势 charts
+// (aligned 2026-11-18, style only — data, series, the USD/CNY
+// toggle, privacy masking and 红涨绿跌 semantics unchanged): the
+// four charts render flat on the page background with no card
+// wrapper, headed by a slim title/legend line; heights are h-44
+// for the two line charts （总值走势 / 与大盘对比） and h-36 for
+// 每日涨跌 / 证券与现金结构； chart margins are
+// { top: 6, right: 8, bottom: 0, left: 4 }, Y axes are 52px wide,
+// axis ticks 11px, dots show only at ≤40 points.
+//
 // day_change_pct storage mixes two scales: screenshot-sourced rows
 // store a percent (3.04 means +3.04%), refresh-sourced rows may store
 // a fraction (0.0304 means +3.04%). normalizeDayPct disambiguates per
@@ -487,14 +497,19 @@ const TREND_UP = "#cf3a32";
 const TREND_DOWN = "#128a4c";
 const TREND_SPX_COLOR = "#5b7a99";
 const TREND_NDX_COLOR = "#2a7f6f";
-const TREND_GRID = "#d9dfe6";
-const TREND_TICK = { fill: "#5d6b78", fontSize: 13 } as const;
+// Chart chrome aligned with the A-share board's 走势 charts
+// (2026-11-18): grid / axis colours ride the theme tokens so both
+// colour schemes match, axis ticks are 11px, tooltips are the flat
+// bordered 13px box the A-share board uses.
+const TREND_GRID = "var(--border)";
+const TREND_TICK = { fill: "var(--dim)", fontSize: 11 } as const;
 const trendTooltipStyle = {
   backgroundColor: "var(--surface)",
   border: "1px solid var(--border)",
-  borderRadius: 8,
+  borderRadius: 0,
   color: "var(--text)",
-  fontSize: 14,
+  fontSize: 13,
+  padding: "6px 10px",
 } as const;
 
 function trendDayLabel(date: string): string {
@@ -817,49 +832,55 @@ function TrendSection({
           </div>
 
           {/* Account value curve */}
-          <div className="mt-3 rounded-[var(--radius)] bg-[var(--surface)] p-4">
-            <div className="flex items-center justify-between gap-2">
-              <h3 className="text-base font-semibold">总值走势</h3>
-              <div
-                className="flex overflow-hidden rounded-md border border-[var(--border)]"
-                role="group"
-                aria-label="曲线币种"
-              >
-                {(
-                  [
-                    ["usd", "美元"],
-                    ["cny", "人民币"],
-                  ] as const
-                ).map(([k, label]) => (
-                  <button
-                    key={k}
-                    type="button"
-                    aria-pressed={currency === k}
-                    onClick={() => setCurrency(k)}
-                    className="px-3 py-1.5 text-sm font-medium"
-                    style={
-                      currency === k
-                        ? { backgroundColor: "var(--accent)", color: "#000" }
-                        : { color: "var(--dim)" }
-                    }
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
+          <div className="tnum mt-4 mb-1 flex flex-wrap items-center justify-between gap-x-4 gap-y-1">
+            <span className="text-sm font-medium">总值走势</span>
+            <div
+              className="flex overflow-hidden rounded-md border border-[var(--border)]"
+              role="group"
+              aria-label="曲线币种"
+            >
+              {(
+                [
+                  ["usd", "美元"],
+                  ["cny", "人民币"],
+                ] as const
+              ).map(([k, label]) => (
+                <button
+                  key={k}
+                  type="button"
+                  aria-pressed={currency === k}
+                  onClick={() => setCurrency(k)}
+                  className="px-2.5 py-1 text-xs font-medium"
+                  style={
+                    currency === k
+                      ? { backgroundColor: "var(--accent)", color: "#000" }
+                      : { color: "var(--dim)" }
+                  }
+                >
+                  {label}
+                </button>
+              ))}
             </div>
-            <div className="mt-3 h-64">
+          </div>
+          <div className="h-44 w-full" aria-label="总值走势图">
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart
                   data={hist.rows}
-                  margin={{ top: 6, right: 8, bottom: 0, left: 8 }}
+                  margin={{ top: 6, right: 8, bottom: 0, left: 4 }}
                 >
                   <CartesianGrid stroke={TREND_GRID} strokeDasharray="3 3" />
-                  <XAxis dataKey="label" tick={TREND_TICK} tickLine={false} />
+                  <XAxis
+                    dataKey="label"
+                    tick={TREND_TICK}
+                    tickLine={false}
+                    axisLine={{ stroke: "var(--border)" }}
+                    minTickGap={40}
+                  />
                   <YAxis
                     tick={TREND_TICK}
                     tickLine={false}
-                    width={72}
+                    axisLine={false}
+                    width={52}
                     domain={["auto", "auto"]}
                     tickFormatter={(v: number) =>
                       privacy
@@ -885,30 +906,38 @@ function TrendSection({
                     type="monotone"
                     dataKey={currency}
                     stroke={TREND_ACCENT}
-                    strokeWidth={2.5}
-                    dot={{ r: 4 }}
-                    activeDot={{ r: 5 }}
+                    strokeWidth={1.8}
+                    dot={hist.rows.length <= 40}
+                    activeDot={{ r: 3 }}
                   />
                 </LineChart>
               </ResponsiveContainer>
-            </div>
           </div>
 
           {/* Daily change bars */}
-          <div className="mt-3 rounded-[var(--radius)] bg-[var(--surface)] p-4">
-            <h3 className="text-base font-semibold">每日涨跌</h3>
-            <div className="mt-3 h-52">
+          <div className="tnum mt-4 mb-1 flex flex-wrap items-baseline gap-x-4 gap-y-0.5 text-xs">
+            <span className="text-sm font-medium">每日涨跌</span>
+            <span className="text-[var(--dim)]">柱为账户当日涨跌额（美元）</span>
+          </div>
+          <div className="h-36 w-full" aria-label="每日涨跌图">
               <ResponsiveContainer width="100%" height="100%">
                 <BarChart
                   data={hist.rows}
-                  margin={{ top: 6, right: 8, bottom: 0, left: 8 }}
+                  margin={{ top: 6, right: 8, bottom: 0, left: 4 }}
                 >
                   <CartesianGrid stroke={TREND_GRID} strokeDasharray="3 3" />
-                  <XAxis dataKey="label" tick={TREND_TICK} tickLine={false} />
+                  <XAxis
+                    dataKey="label"
+                    tick={TREND_TICK}
+                    tickLine={false}
+                    axisLine={{ stroke: "var(--border)" }}
+                    minTickGap={40}
+                  />
                   <YAxis
                     tick={TREND_TICK}
                     tickLine={false}
-                    width={72}
+                    axisLine={false}
+                    width={52}
                     tickFormatter={(v: number) =>
                       privacy ? "••••" : `$${money(v, 0)}`
                     }
@@ -921,7 +950,7 @@ function TrendSection({
                     ]}
                     labelFormatter={(label) => `${label}（月/日）`}
                   />
-                  <Bar dataKey="day" radius={[3, 3, 0, 0]}>
+                  <Bar dataKey="day" maxBarSize={26}>
                     {hist.rows.map((r) => (
                       <Cell
                         key={r.date}
@@ -931,40 +960,45 @@ function TrendSection({
                   </Bar>
                 </BarChart>
               </ResponsiveContainer>
-            </div>
           </div>
 
           {/* Securities vs cash structure */}
-          <div className="mt-3 rounded-[var(--radius)] bg-[var(--surface)] p-4">
-            <h3 className="text-base font-semibold">证券与现金结构</h3>
-            <div className="mt-2 flex gap-4 text-sm text-[var(--dim)]">
-              <span>
-                <span
-                  className="mr-1.5 inline-block h-2.5 w-2.5 rounded-sm align-middle"
-                  style={{ backgroundColor: TREND_ACCENT }}
-                />
-                证券市值
-              </span>
-              <span>
-                <span
-                  className="mr-1.5 inline-block h-2.5 w-2.5 rounded-sm align-middle"
-                  style={{ backgroundColor: TREND_SPX_COLOR }}
-                />
-                现金
-              </span>
-            </div>
-            <div className="mt-2 h-52">
+          <div className="tnum mt-4 mb-1 flex flex-wrap items-baseline gap-x-4 gap-y-0.5 text-xs">
+            <span className="text-sm font-medium">证券与现金结构</span>
+            <span className="flex items-baseline gap-1.5">
+              <span
+                className="inline-block h-2 w-2 rounded-full"
+                style={{ background: TREND_ACCENT }}
+              />
+              证券市值
+            </span>
+            <span className="flex items-baseline gap-1.5">
+              <span
+                className="inline-block h-2 w-2 rounded-full"
+                style={{ background: TREND_SPX_COLOR }}
+              />
+              现金
+            </span>
+          </div>
+          <div className="h-36 w-full" aria-label="证券与现金结构图">
               <ResponsiveContainer width="100%" height="100%">
                 <AreaChart
                   data={hist.rows}
-                  margin={{ top: 6, right: 8, bottom: 0, left: 8 }}
+                  margin={{ top: 6, right: 8, bottom: 0, left: 4 }}
                 >
                   <CartesianGrid stroke={TREND_GRID} strokeDasharray="3 3" />
-                  <XAxis dataKey="label" tick={TREND_TICK} tickLine={false} />
+                  <XAxis
+                    dataKey="label"
+                    tick={TREND_TICK}
+                    tickLine={false}
+                    axisLine={{ stroke: "var(--border)" }}
+                    minTickGap={40}
+                  />
                   <YAxis
                     tick={TREND_TICK}
                     tickLine={false}
-                    width={72}
+                    axisLine={false}
+                    width={52}
                     domain={[0, "dataMax"]}
                     tickFormatter={(v: number) =>
                       privacy ? "••••" : `$${money(v, 0)}`
@@ -983,62 +1017,71 @@ function TrendSection({
                     dataKey="sec"
                     stackId="1"
                     stroke={TREND_ACCENT}
+                    strokeWidth={1.5}
                     fill={TREND_ACCENT}
                     fillOpacity={0.75}
-                    dot={{ r: 3 }}
+                    dot={hist.rows.length <= 40}
+                    activeDot={{ r: 3 }}
                   />
                   <Area
                     type="monotone"
                     dataKey="cash"
                     stackId="1"
                     stroke={TREND_SPX_COLOR}
+                    strokeWidth={1.5}
                     fill={TREND_SPX_COLOR}
                     fillOpacity={0.55}
-                    dot={{ r: 3 }}
+                    dot={hist.rows.length <= 40}
+                    activeDot={{ r: 3 }}
                   />
                 </AreaChart>
               </ResponsiveContainer>
-            </div>
           </div>
 
           {/* Account vs benchmarks, normalized to 100 */}
-          <div className="mt-3 rounded-[var(--radius)] bg-[var(--surface)] p-4">
-            <h3 className="text-base font-semibold">与大盘对比（起点 = 100）</h3>
-            <div className="mt-2 flex flex-wrap gap-4 text-sm text-[var(--dim)]">
-              <span>
-                <span
-                  className="mr-1.5 inline-block h-2.5 w-2.5 rounded-sm align-middle"
-                  style={{ backgroundColor: TREND_ACCENT }}
-                />
-                {viewKey === "global" ? "全部账户" : viewName}
-              </span>
-              <span>
-                <span
-                  className="mr-1.5 inline-block h-2.5 w-2.5 rounded-sm align-middle"
-                  style={{ backgroundColor: TREND_SPX_COLOR }}
-                />
-                标普500
-              </span>
-              <span>
-                <span
-                  className="mr-1.5 inline-block h-2.5 w-2.5 rounded-sm align-middle"
-                  style={{ backgroundColor: TREND_NDX_COLOR }}
-                />
-                纳指100
-              </span>
-            </div>
-            <div className="mt-2 h-52">
+          <div className="tnum mt-4 mb-1 flex flex-wrap items-baseline gap-x-4 gap-y-0.5 text-xs">
+            <span className="text-sm font-medium">与大盘对比（起点 = 100）</span>
+            <span className="flex items-baseline gap-1.5">
+              <span
+                className="inline-block h-2 w-2 rounded-full"
+                style={{ background: TREND_ACCENT }}
+              />
+              {viewKey === "global" ? "全部账户" : viewName}
+            </span>
+            <span className="flex items-baseline gap-1.5">
+              <span
+                className="inline-block h-2 w-2 rounded-full"
+                style={{ background: TREND_SPX_COLOR }}
+              />
+              标普500
+            </span>
+            <span className="flex items-baseline gap-1.5">
+              <span
+                className="inline-block h-2 w-2 rounded-full"
+                style={{ background: TREND_NDX_COLOR }}
+              />
+              纳指100
+            </span>
+          </div>
+          <div className="h-44 w-full" aria-label="与大盘对比图">
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart
                   data={hist.rows}
-                  margin={{ top: 6, right: 8, bottom: 0, left: 8 }}
+                  margin={{ top: 6, right: 8, bottom: 0, left: 4 }}
                 >
                   <CartesianGrid stroke={TREND_GRID} strokeDasharray="3 3" />
-                  <XAxis dataKey="label" tick={TREND_TICK} tickLine={false} />
+                  <XAxis
+                    dataKey="label"
+                    tick={TREND_TICK}
+                    tickLine={false}
+                    axisLine={{ stroke: "var(--border)" }}
+                    minTickGap={40}
+                  />
                   <YAxis
                     tick={TREND_TICK}
                     tickLine={false}
-                    width={48}
+                    axisLine={false}
+                    width={52}
                     domain={["auto", "auto"]}
                     tickFormatter={(v: number) => v.toFixed(1)}
                   />
@@ -1060,26 +1103,28 @@ function TrendSection({
                     type="monotone"
                     dataKey="acctIdx"
                     stroke={TREND_ACCENT}
-                    strokeWidth={2.5}
-                    dot={{ r: 4 }}
+                    strokeWidth={1.8}
+                    dot={hist.rows.length <= 40}
+                    activeDot={{ r: 3 }}
                   />
                   <Line
                     type="monotone"
                     dataKey="spxIdx"
                     stroke={TREND_SPX_COLOR}
-                    strokeWidth={2}
-                    dot={{ r: 3 }}
+                    strokeWidth={1.5}
+                    dot={hist.rows.length <= 40}
+                    activeDot={{ r: 3 }}
                   />
                   <Line
                     type="monotone"
                     dataKey="ndxIdx"
                     stroke={TREND_NDX_COLOR}
-                    strokeWidth={2}
-                    dot={{ r: 3 }}
+                    strokeWidth={1.5}
+                    dot={hist.rows.length <= 40}
+                    activeDot={{ r: 3 }}
                   />
                 </LineChart>
               </ResponsiveContainer>
-            </div>
           </div>
 
           {/* Daily detail — the only folded part of this section. */}
