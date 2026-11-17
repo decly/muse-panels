@@ -2002,9 +2002,10 @@ const ACCOUNT_LINE_COLOR = "var(--up)";
 const CSI_LINE_COLOR = "#2563eb";
 
 // Colour of the SSE Composite （上证指数） series in the history
-// charts: a violet clearly apart from the account's red and the
-// CSI 300 deep blue in both colour schemes.
-const SSE_LINE_COLOR = "#7c3aed";
+// charts: a teal clearly apart from the account's red and the
+// CSI 300 deep blue in both colour schemes (the previous violet
+// sat too close in hue to the CSI 300 blue to tell apart).
+const SSE_LINE_COLOR = "#0d9488";
 
 // 证券与现金结构 series colours: a saturated deep blue for securities
 // and a warm amber for cash — far apart in hue, and the fill
