@@ -525,7 +525,25 @@ function Overview({
         </span>
       </div>
       <p className="mt-0.5 text-right text-xs text-[var(--dim)]">
-        {fetched ? `刷新于 ${fetched}（北京时间）` : "尚未刷新报价"}
+        {fetched ? (
+          <>
+            刷新于{" "}
+            {/* Only the time itself is highlighted (user request
+                2026-11-17): bold, one size up, in the board's red —
+                the surrounding label stays dim so the eye lands on
+                the timestamp first and can judge freshness at a
+                glance. */}
+            <span
+              className="tnum text-sm font-bold"
+              style={{ color: "var(--up)" }}
+            >
+              {fetched}
+            </span>
+            （北京时间）
+          </>
+        ) : (
+          "尚未刷新报价"
+        )}
         {refresh.isError ? " · 上次刷新失败，显示已存报价" : ""}
       </p>
       {refreshNote && (
@@ -2426,17 +2444,29 @@ export function App() {
   }, [queryClient]);
 
   // 切回前台自动刷新：页面在后台/内存中停留时不会重读数据，回到
-  // 前台（visibilitychange → visible）时重新拉取看板与流水，
-  // 展示定时刷新已写入的最新数据，无需手动关开页面。
+  // 前台时重新拉取看板与流水，展示定时刷新已写入的最新数据，无需
+  // 手动关开页面。触发点不止 visibilitychange：部分手机 WebView
+  // 从后台恢复页面时走 bfcache（pageshow）或只补发 focus，并不
+  // 触发 visibilitychange——2026-11-17 用户在美股板复现「切回来
+  // 仍显示旧时间」即属此类，故三个事件都监听同一处理函数；
+  // React Query 对进行中的请求自动去重，多事件同至不会叠加。
   useEffect(() => {
-    const onVisible = () => {
-      if (document.visibilityState === "visible") {
-        void queryClient.refetchQueries({ queryKey: ["board"] });
-        void queryClient.refetchQueries({ queryKey: ["trades"] });
-      }
+    const refetch = () => {
+      if (document.visibilityState !== "visible") return;
+      void queryClient.refetchQueries({ queryKey: ["board"] });
+      void queryClient.refetchQueries({ queryKey: ["trades"] });
     };
-    document.addEventListener("visibilitychange", onVisible);
-    return () => document.removeEventListener("visibilitychange", onVisible);
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") refetch();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("focus", refetch);
+    window.addEventListener("pageshow", refetch);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("focus", refetch);
+      window.removeEventListener("pageshow", refetch);
+    };
   }, [queryClient]);
 
   const [privacy, setPrivacy] = useLocalBool("agu-board-privacy", false);
