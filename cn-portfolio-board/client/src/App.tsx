@@ -1995,10 +1995,16 @@ function TradesSection({ mask }: { mask: (s: string) => string }) {
 // accent in both colour schemes.
 const CSI_LINE_COLOR = "#d97706";
 
-// Fill of the cash layer in the 证券与现金结构 chart: a soft neutral
-// that reads as the quiet base under the securities layer in both
-// colour schemes.
-const CASH_AREA_COLOR = "#94a3b8";
+// 证券与现金结构 series colours: a saturated deep blue for securities
+// and a warm amber for cash — far apart in hue, and the fill
+// opacities are spread the other way than intuition suggests
+// (securities 0.7, cash 0.9): the cash band is thin, and at low
+// opacity it blends into the dark surface at nearly the same
+// luminance as the blue, so it is kept near-opaque to stay
+// unmistakable in both colour schemes. (The previous pair — slate
+// accent over light slate-grey — was too close to distinguish.)
+const SEC_AREA_COLOR = "#2563eb";
+const CASH_AREA_COLOR = "#f59e0b";
 
 // One 走势 stat card, in the overview's stat language: dim label,
 // medium figure, optional smaller lines under the figure. Amounts go
@@ -2473,7 +2479,7 @@ function HistorySection({
             <span className="flex items-baseline gap-1.5">
               <span
                 className="inline-block h-2 w-2 rounded-full"
-                style={{ background: "var(--accent)" }}
+                style={{ background: SEC_AREA_COLOR }}
               />
               证券
             </span>
@@ -2528,9 +2534,9 @@ function HistorySection({
                   type="monotone"
                   dataKey="securities_value_cny"
                   stackId="1"
-                  stroke="var(--accent)"
-                  fill="var(--accent)"
-                  fillOpacity={0.45}
+                  stroke={SEC_AREA_COLOR}
+                  fill={SEC_AREA_COLOR}
+                  fillOpacity={0.7}
                 />
                 <Area
                   type="monotone"
@@ -2538,7 +2544,7 @@ function HistorySection({
                   stackId="1"
                   stroke={CASH_AREA_COLOR}
                   fill={CASH_AREA_COLOR}
-                  fillOpacity={0.5}
+                  fillOpacity={0.9}
                 />
               </AreaChart>
             </ResponsiveContainer>
