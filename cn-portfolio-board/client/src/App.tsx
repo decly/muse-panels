@@ -1995,6 +1995,11 @@ function TradesSection({ mask }: { mask: (s: string) => string }) {
 // accent in both colour schemes.
 const CSI_LINE_COLOR = "#d97706";
 
+// Colour of the SSE Composite （上证指数） series in the 与大盘对比
+// chart: a violet clearly apart from the account's slate accent and
+// the CSI 300 amber in both colour schemes.
+const SSE_LINE_COLOR = "#7c3aed";
+
 // 证券与现金结构 series colours: a saturated deep blue for securities
 // and a warm amber for cash — far apart in hue, and the fill
 // opacities are spread the other way than intuition suggests
@@ -2119,14 +2124,17 @@ function HistorySection({
   const bestPct = bestDay ? derivedDayPct(bestDay) : null;
   const worstPct = worstDay ? derivedDayPct(worstDay) : null;
 
-  // Comparison series: the account value and the CSI 300 close stored
-  // on each snapshot are both rebased to cumulative % change since
-  // the first snapshot (both start at 0%), so the two series share
-  // one % axis. A snapshot without a stored CSI 300 close leaves a
-  // gap in the index line rather than an invented point.
+  // Comparison series: the account value and the benchmark closes
+  // stored on each snapshot (CSI 300, SSE Composite) are all rebased
+  // to cumulative % change since the first snapshot (every series
+  // starts at 0%), so they share one % axis. A snapshot without a
+  // stored close for a benchmark leaves a gap in that line rather
+  // than an invented point.
   const base = chartData[0];
   const csiBase =
     chartData.find((s) => s.csi300_price != null)?.csi300_price ?? null;
+  const sseBase =
+    chartData.find((s) => s.sse_price != null)?.sse_price ?? null;
   const cmpData = chartData.map((s) => ({
     date: s.date,
     snap: s,
@@ -2137,6 +2145,10 @@ function HistorySection({
     csi:
       csiBase != null && csiBase > 0 && s.csi300_price != null
         ? (s.csi300_price / csiBase - 1) * 100
+        : null,
+    sse:
+      sseBase != null && sseBase > 0 && s.sse_price != null
+        ? (s.sse_price / sseBase - 1) * 100
         : null,
   }));
   const lastCmp = cmpData[cmpData.length - 1];
@@ -2578,11 +2590,24 @@ function HistorySection({
                 {lastCmp?.csi != null ? fmtPct(lastCmp.csi) : "—"}
               </span>
             </span>
+            <span className="flex items-baseline gap-1.5">
+              <span
+                className="inline-block h-2 w-2 rounded-full"
+                style={{ background: SSE_LINE_COLOR }}
+              />
+              上证指数 累计
+              <span
+                className="font-medium"
+                style={{ color: moveColor(lastCmp?.sse) }}
+              >
+                {lastCmp?.sse != null ? fmtPct(lastCmp.sse) : "—"}
+              </span>
+            </span>
             <span className="text-[var(--dim)]">
               相对首条快照归一化 · 起点 0%
             </span>
           </div>
-          <div className="h-44 w-full" aria-label="账户与沪深300走势对比图">
+          <div className="h-44 w-full" aria-label="账户与沪深300、上证指数走势对比图">
             <ResponsiveContainer width="100%" height="100%">
               <LineChart
                 data={cmpData}
@@ -2639,9 +2664,27 @@ function HistorySection({
                             "—"
                           )}
                         </div>
+                        <div>
+                          上证指数{" "}
+                          {p.sse != null ? (
+                            <span style={{ color: moveColor(p.sse) }}>
+                              {fmtPct(p.sse)}
+                            </span>
+                          ) : (
+                            "—"
+                          )}
+                        </div>
                       </div>
                     );
                   }}
+                />
+                <Line
+                  type="monotone"
+                  dataKey="sse"
+                  stroke={SSE_LINE_COLOR}
+                  strokeWidth={1.5}
+                  dot={cmpData.length <= 40}
+                  activeDot={{ r: 3 }}
                 />
                 <Line
                   type="monotone"

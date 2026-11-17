@@ -93,8 +93,9 @@ export const marketSnapshots = sqliteTable("market_snapshots", {
 // One row per A-share trading day: overall account totals only (no
 // individual stock data). Written by refreshCloseSnapshot on trading
 // days and recomputed after holdings / cash / trade edits. The CSI 300
-// close rides along so the history view can compare against the
-// benchmark from the same rows. source: "refresh" | "manual".
+// close and the SSE Composite close ride along so the history view
+// can compare against both benchmarks from the same rows. source:
+// "refresh" | "manual".
 export const dailySnapshots = sqliteTable("daily_snapshots", {
   // Beijing trading date, YYYY-MM-DD.
   date: text("date").primaryKey(),
@@ -106,6 +107,11 @@ export const dailySnapshots = sqliteTable("daily_snapshots", {
   dayChangePct: real("day_change_pct"),
   csi300Price: real("csi300_price"),
   csi300ChangePct: real("csi300_change_pct"),
+  // SSE Composite （上证指数） close on the snapshot date; written by
+  // refreshCloseSnapshot alongside the CSI 300 close, backfilled for
+  // the pre-existing rows from Eastmoney daily klines (secid
+  // 1.000001). Null when the close could not be sourced.
+  ssePrice: real("sse_price"),
   source: text("source").notNull(),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()

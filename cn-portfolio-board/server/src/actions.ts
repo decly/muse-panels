@@ -492,6 +492,7 @@ const snapshotOut = z.object({
   day_change_pct: z.number().nullable(),
   csi300_price: z.number().nullable(),
   csi300_change_pct: z.number().nullable(),
+  sse_price: z.number().nullable(),
   source: z.string(),
 });
 
@@ -521,6 +522,7 @@ function toSnapshotOut(
     day_change_pct: s.dayChangePct,
     csi300_price: s.csi300Price,
     csi300_change_pct: s.csi300ChangePct,
+    sse_price: s.ssePrice,
     source: s.source,
   };
 }
@@ -805,6 +807,7 @@ async function writeSnapshot(
   const prev = rows.filter((r) => r.date < date).at(-1);
   const dayChange = prev ? totals.total - prev.accountValueCny : null;
   const csi = board.market.find((m) => m.key === "CSI300");
+  const sse = board.market.find((m) => m.key === "SSE");
   const values = {
     date,
     accountValueCny: totals.total,
@@ -818,6 +821,7 @@ async function writeSnapshot(
         : null,
     csi300Price: csi?.price ?? null,
     csi300ChangePct: csi?.change_percent ?? null,
+    ssePrice: sse?.price ?? null,
     source,
     createdAt: new Date(),
   };
@@ -1290,6 +1294,7 @@ async function buildExport(ctx: Ctx): Promise<ExportPayload> {
         day_change_pct: s.dayChangePct,
         csi300_price: s.csi300Price,
         csi300_change_pct: s.csi300ChangePct,
+        sse_price: s.ssePrice,
         source: s.source,
         created_at: s.createdAt.toISOString(),
       })),
@@ -1505,6 +1510,7 @@ async function importTables(
           dayChangePct: numOrNull(r.day_change_pct),
           csi300Price: numOrNull(r.csi300_price),
           csi300ChangePct: numOrNull(r.csi300_change_pct),
+          ssePrice: numOrNull(r.sse_price),
           source: strOr(r.source, "refresh"),
           createdAt: dateOr(r.created_at, now),
         }),
@@ -1593,6 +1599,13 @@ const baselineSnapshotResponse = z.object({
   board: boardResponse,
 });
 
+const sseBackfillResponse = z.object({
+  status: z.enum(["filled", "already_complete", "source_unavailable"]),
+  // Snapshot dates whose sse_price this call filled, ascending.
+  filled: z.array(z.string()),
+  board: boardResponse,
+});
+
 const editResponse = z.object({
   ok: z.literal(true),
   snapshot_recomputed: z.array(z.string()),
@@ -1670,7 +1683,7 @@ export const Actions = {
 
   refreshCloseSnapshot: defineAction({
     description:
-      "Scheduled close refresh (weekdays 15:10 Beijing): refreshes all quotes, then writes/updates today's daily snapshot on the close basis — but only when the Eastmoney quote date is today; on non-trading days it writes nothing and reports skipped_non_trading_day.",
+      "Scheduled close refresh (weekdays 15:10 Beijing): refreshes all quotes, then writes/updates today's daily snapshot on the close basis (including the CSI 300 and SSE Composite closes stored on the row) — but only when the Eastmoney quote date is today; on non-trading days it writes nothing and reports skipped_non_trading_day.",
     request: z.object({}),
     response: closeSnapshotResponse,
     async handler(ctx): Promise<z.infer<typeof closeSnapshotResponse>> {
@@ -1740,6 +1753,60 @@ export const Actions = {
       return {
         status: "written",
         date: "2026-01-09",
+        board: await loadBoard(ctx),
+      };
+    },
+  }),
+
+  backfillSseSnapshots: defineAction({
+    description:
+      "One-time backfill of the SSE Composite （上证指数） close into existing daily snapshots whose sse_price is still null, sourced from Eastmoney daily klines (secid 1.000001). Writes ONLY the sse_price column of those rows — every other snapshot field is left exactly as stored — and is a no-op once all rows carry a value. New snapshots get their sse_price from refreshCloseSnapshot directly.",
+    request: z.object({}),
+    response: sseBackfillResponse,
+    handler: async (ctx): Promise<z.infer<typeof sseBackfillResponse>> => {
+      const db = ctx.db<typeof schema>();
+      const rows = await db
+        .select()
+        .from(schema.dailySnapshots)
+        .orderBy(asc(schema.dailySnapshots.date));
+      const missing = rows.filter((r) => r.ssePrice == null);
+      if (missing.length === 0) {
+        return {
+          status: "already_complete",
+          filled: [],
+          board: await loadBoard(ctx),
+        };
+      }
+      const earliest = missing[0]?.date ?? rows[0]?.date ?? beijingToday();
+      const klines = await fetchEmKlines(
+        "1.000001",
+        shiftDate(earliest, -10).replaceAll("-", ""),
+      );
+      if (!klines) {
+        return {
+          status: "source_unavailable",
+          filled: [],
+          board: await loadBoard(ctx),
+        };
+      }
+      const filled: string[] = [];
+      for (const row of missing) {
+        // The snapshot date is a trading day, so its own kline row is
+        // the close; fall back to the latest close on or before the
+        // date only if that exact row is somehow absent.
+        const eligible = klines.filter((k) => k.date <= row.date);
+        const close = eligible.at(-1)?.close ?? null;
+        if (close == null) continue;
+        await db
+          .update(schema.dailySnapshots)
+          .set({ ssePrice: close })
+          .where(eq(schema.dailySnapshots.date, row.date));
+        filled.push(row.date);
+      }
+      if (filled.length > 0) ctx.invalidateQueries();
+      return {
+        status: filled.length > 0 ? "filled" : "source_unavailable",
+        filled,
         board: await loadBoard(ctx),
       };
     },
