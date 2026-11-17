@@ -16,6 +16,8 @@ type ReactNode,
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { SafeAreaTopScrim } from "@hatch/space-sdk/client";
 import {
+Area,
+AreaChart,
 Bar,
 CartesianGrid,
 Cell,
@@ -1993,6 +1995,30 @@ function TradesSection({ mask }: { mask: (s: string) => string }) {
 // accent in both colour schemes.
 const CSI_LINE_COLOR = "#d97706";
 
+// Fill of the cash layer in the 证券与现金结构 chart: a soft neutral
+// that reads as the quiet base under the securities layer in both
+// colour schemes.
+const CASH_AREA_COLOR = "#94a3b8";
+
+// One 走势 stat card, in the overview's stat language: dim label,
+// medium figure, optional smaller lines under the figure. Amounts go
+// through the board's privacy mask; percentages and dates stay
+// visible, and 红涨绿跌 colours match the rest of the board.
+function HistoryStat({
+  label,
+  children,
+}: {
+  label: string;
+  children: ReactNode;
+}) {
+  return (
+    <div>
+      <dt className="text-sm text-[var(--dim)]">{label}</dt>
+      <dd className="mt-0.5 text-base font-medium sm:text-lg">{children}</dd>
+    </div>
+  );
+}
+
 function HistorySection({
   history,
   mask,
@@ -2000,9 +2026,9 @@ function HistorySection({
   history: Snapshot[];
   mask: (s: string) => string;
 }) {
-  // The daily snapshot list folds away by default (same habit as the
-  // trade ledger's collapse, persisted); the two charts above it
-  // always stay visible.
+  // The daily snapshot table folds away by default (same habit as
+  // the trade ledger's collapse, persisted); the stat cards and the
+  // charts above it always stay visible.
   const [listCollapsed, setListCollapsed] = useLocalBool(
     "agu-board-history-list-collapsed",
     true,
@@ -2012,6 +2038,80 @@ function HistorySection({
   // rendered as single annotated dots (see the ReferenceDots below)
   // so the first point is visible today instead of an empty chart.
   const singlePoint = chartData.length === 1 ? chartData[0] : undefined;
+
+  // ----- stat cards -----
+  // Everything below is derived at render time from the stored
+  // snapshots; nothing here writes back.
+  const firstSnap = chartData[0];
+  const lastSnap = chartData[chartData.length - 1];
+  const cumChange =
+    firstSnap && lastSnap
+      ? lastSnap.account_value_cny - firstSnap.account_value_cny
+      : null;
+  const cumPct =
+    cumChange != null && firstSnap && firstSnap.account_value_cny > 0
+      ? (cumChange / firstSnap.account_value_cny) * 100
+      : null;
+  let peakSnap: Snapshot | undefined;
+  for (const s of chartData) {
+    if (!peakSnap || s.account_value_cny > peakSnap.account_value_cny) {
+      peakSnap = s;
+    }
+  }
+  const fromPeak =
+    peakSnap && lastSnap
+      ? lastSnap.account_value_cny - peakSnap.account_value_cny
+      : null;
+  const fromPeakPct =
+    fromPeak != null && peakSnap && peakSnap.account_value_cny > 0
+      ? (fromPeak / peakSnap.account_value_cny) * 100
+      : null;
+  // Maximum drawdown: the deepest fall from a running peak to a
+  // later trough over the chronological daily totals.
+  let ddAmount = 0;
+  let ddPeakValue = 0;
+  let ddPeakDate: string | null = null;
+  let ddTroughDate: string | null = null;
+  {
+    let runPeakValue = Number.NEGATIVE_INFINITY;
+    let runPeakDate = "";
+    for (const s of chartData) {
+      if (s.account_value_cny > runPeakValue) {
+        runPeakValue = s.account_value_cny;
+        runPeakDate = s.date;
+      }
+      const dd = s.account_value_cny - runPeakValue;
+      if (dd < ddAmount) {
+        ddAmount = dd;
+        ddPeakValue = runPeakValue;
+        ddPeakDate = runPeakDate;
+        ddTroughDate = s.date;
+      }
+    }
+  }
+  const ddPct = ddPeakValue > 0 ? (ddAmount / ddPeakValue) * 100 : null;
+  // Best / worst single day by stored day change. The percentage is
+  // derived on the account basis — day change ÷ (that day's total −
+  // day change), the previous day's account total — never read from
+  // the stored day_change_pct.
+  let bestDay: Snapshot | undefined;
+  let worstDay: Snapshot | undefined;
+  for (const s of chartData) {
+    if (s.day_change_cny == null) continue;
+    if (!bestDay || s.day_change_cny > (bestDay.day_change_cny ?? 0)) {
+      bestDay = s;
+    }
+    if (!worstDay || s.day_change_cny < (worstDay.day_change_cny ?? 0)) {
+      worstDay = s;
+    }
+  }
+  const derivedDayPct = (s: Snapshot): number | null => {
+    if (s.day_change_cny == null) return null;
+    const prev = s.account_value_cny - s.day_change_cny;
+    return prev > 0 ? (s.day_change_cny / prev) * 100 : null;
+  };
+  const bestPct = bestDay ? derivedDayPct(bestDay) : null;
+  const worstPct = worstDay ? derivedDayPct(worstDay) : null;
 
   // Comparison series: the account value and the CSI 300 close stored
   // on each snapshot are both rebased to cumulative % change since
@@ -2036,6 +2136,7 @@ function HistorySection({
   const lastCmp = cmpData[cmpData.length - 1];
   const pctTick = (v: number) => `${v > 0 ? "+" : ""}${v.toFixed(1)}%`;
   const axisTick = { fontSize: 11, fill: "var(--dim)" } as const;
+  const moneyTick = (v: number) => `${(v / 10000).toFixed(0)}万`;
 
   return (
     <section aria-label="走势" id="sec-history" className="section-anchor">
@@ -2062,8 +2163,389 @@ function HistorySection({
         </p>
       ) : (
         <>
-          <div className="tnum mb-1 flex flex-wrap items-baseline gap-x-4 gap-y-0.5 text-xs">
-            <span className="text-sm font-medium">走势对比</span>
+          <dl className="tnum grid grid-cols-2 gap-x-4 gap-y-4 sm:grid-cols-3">
+            <HistoryStat label="记录天数">{history.length}</HistoryStat>
+            <HistoryStat label="累计变化">
+              {cumChange != null ? (
+                <>
+                  <span style={{ color: moveColor(cumChange) }}>
+                    {mask(fmtSignedMoney(cumChange))}
+                  </span>
+                  {cumPct != null && (
+                    <span
+                      className="block text-sm font-normal"
+                      style={{ color: moveColor(cumChange) }}
+                    >
+                      {fmtPct(cumPct)}
+                    </span>
+                  )}
+                </>
+              ) : (
+                "—"
+              )}
+            </HistoryStat>
+            <HistoryStat label="历史最高/距高点">
+              {peakSnap ? (
+                <>
+                  {mask(fmtMoney(peakSnap.account_value_cny))}
+                  <span className="block text-xs font-normal text-[var(--dim)]">
+                    {peakSnap.date}
+                  </span>
+                  {fromPeak != null && (
+                    <span
+                      className="block text-sm font-normal"
+                      style={{ color: moveColor(fromPeak) }}
+                    >
+                      距高点 {mask(fmtSignedMoney(fromPeak))}
+                      {fromPeakPct != null ? ` · ${fmtPct(fromPeakPct)}` : ""}
+                    </span>
+                  )}
+                </>
+              ) : (
+                "—"
+              )}
+            </HistoryStat>
+            <HistoryStat label="最大回撤">
+              {chartData.length >= 2 ? (
+                <>
+                  <span style={{ color: moveColor(ddAmount) }}>
+                    {mask(fmtSignedMoney(ddAmount))}
+                  </span>
+                  {ddPct != null && (
+                    <span
+                      className="block text-sm font-normal"
+                      style={{ color: moveColor(ddAmount) }}
+                    >
+                      {fmtPct(ddPct)}
+                    </span>
+                  )}
+                  {ddPeakDate && ddTroughDate && (
+                    <span className="block text-xs font-normal text-[var(--dim)]">
+                      {ddPeakDate} → {ddTroughDate}
+                    </span>
+                  )}
+                </>
+              ) : (
+                "—"
+              )}
+            </HistoryStat>
+            <HistoryStat label="最好单日">
+              {bestDay && bestDay.day_change_cny != null ? (
+                <>
+                  <span style={{ color: moveColor(bestDay.day_change_cny) }}>
+                    {mask(fmtSignedMoney(bestDay.day_change_cny))}
+                  </span>
+                  {bestPct != null && (
+                    <span
+                      className="block text-sm font-normal"
+                      style={{ color: moveColor(bestDay.day_change_cny) }}
+                    >
+                      {fmtPct(bestPct)}
+                    </span>
+                  )}
+                  <span className="block text-xs font-normal text-[var(--dim)]">
+                    {bestDay.date}
+                  </span>
+                </>
+              ) : (
+                "—"
+              )}
+            </HistoryStat>
+            <HistoryStat label="最差单日">
+              {worstDay && worstDay.day_change_cny != null ? (
+                <>
+                  <span style={{ color: moveColor(worstDay.day_change_cny) }}>
+                    {mask(fmtSignedMoney(worstDay.day_change_cny))}
+                  </span>
+                  {worstPct != null && (
+                    <span
+                      className="block text-sm font-normal"
+                      style={{ color: moveColor(worstDay.day_change_cny) }}
+                    >
+                      {fmtPct(worstPct)}
+                    </span>
+                  )}
+                  <span className="block text-xs font-normal text-[var(--dim)]">
+                    {worstDay.date}
+                  </span>
+                </>
+              ) : (
+                "—"
+              )}
+            </HistoryStat>
+          </dl>
+
+          <div className="tnum mt-5 mb-1 flex flex-wrap items-baseline gap-x-4 gap-y-0.5 text-xs">
+            <span className="text-sm font-medium">总值走势</span>
+            <span className="flex items-baseline gap-1.5">
+              <span
+                className="inline-block h-2 w-2 rounded-full"
+                style={{ background: "var(--accent)" }}
+              />
+              账户总值
+            </span>
+          </div>
+          <div className="h-44 w-full" aria-label="账户总值走势图">
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart
+                data={chartData}
+                margin={{ top: 6, right: 8, bottom: 0, left: 4 }}
+              >
+                <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" />
+                <XAxis
+                  dataKey="date"
+                  tickFormatter={(d: string) => d.slice(5)}
+                  tick={axisTick}
+                  tickLine={false}
+                  axisLine={{ stroke: "var(--border)" }}
+                  minTickGap={40}
+                />
+                <YAxis
+                  domain={
+                    singlePoint
+                      ? [
+                          () => singlePoint.account_value_cny * 0.995,
+                          () => singlePoint.account_value_cny * 1.005,
+                        ]
+                      : ["auto", "auto"]
+                  }
+                  width={40}
+                  tick={axisTick}
+                  tickLine={false}
+                  axisLine={false}
+                  tickFormatter={moneyTick}
+                />
+                <Tooltip
+                  content={({ active, payload }) => {
+                    if (!active || !payload?.length) return null;
+                    const s = payload[0]?.payload as Snapshot | undefined;
+                    if (!s) return null;
+                    return (
+                      <div className="tnum border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1.5 text-xs">
+                        <div>
+                          {s.date} 周{weekdayOf(s.date)}
+                        </div>
+                        <div>总值 {mask(fmtMoney(s.account_value_cny))}</div>
+                        <div>
+                          当日{" "}
+                          {s.day_change_cny != null ? (
+                            <span
+                              style={{ color: moveColor(s.day_change_cny) }}
+                            >
+                              {mask(fmtSignedMoney(s.day_change_cny))}
+                            </span>
+                          ) : (
+                            "—"
+                          )}
+                        </div>
+                      </div>
+                    );
+                  }}
+                />
+                <Line
+                  type="monotone"
+                  dataKey="account_value_cny"
+                  stroke="var(--accent)"
+                  strokeWidth={1.8}
+                  dot={chartData.length <= 40}
+                  activeDot={{ r: 3 }}
+                />
+                {singlePoint && (
+                  <ReferenceDot
+                    x={singlePoint.date}
+                    y={singlePoint.account_value_cny}
+                    r={4.5}
+                    fill="var(--accent)"
+                    stroke="var(--surface)"
+                    strokeWidth={2}
+                  >
+                    <Label
+                      value={`${singlePoint.date.slice(5)} · ${mask(fmtMoney(singlePoint.account_value_cny))}`}
+                      position="top"
+                      offset={10}
+                      fill="var(--dim)"
+                      fontSize={11}
+                    />
+                  </ReferenceDot>
+                )}
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+
+          <div className="tnum mt-4 mb-1 flex flex-wrap items-baseline gap-x-4 gap-y-0.5 text-xs">
+            <span className="text-sm font-medium">每日涨跌</span>
+            <span className="text-[var(--dim)]">
+              柱为账户当日涨跌幅（红涨绿跌），线为沪深300 当日涨跌幅
+            </span>
+          </div>
+          <div className="h-36 w-full" aria-label="每日涨跌图">
+            <ResponsiveContainer width="100%" height="100%">
+              <ComposedChart
+                data={chartData}
+                margin={{ top: 6, right: 8, bottom: 0, left: 4 }}
+              >
+                <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" />
+                <XAxis
+                  dataKey="date"
+                  tickFormatter={(d: string) => d.slice(5)}
+                  tick={axisTick}
+                  tickLine={false}
+                  axisLine={{ stroke: "var(--border)" }}
+                  minTickGap={40}
+                />
+                <YAxis
+                  width={52}
+                  tick={axisTick}
+                  tickLine={false}
+                  axisLine={false}
+                  tickFormatter={pctTick}
+                />
+                <Tooltip
+                  content={({ active, payload }) => {
+                    if (!active || !payload?.length) return null;
+                    const s = payload[0]?.payload as Snapshot | undefined;
+                    if (!s) return null;
+                    return (
+                      <div className="tnum border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1.5 text-xs">
+                        <div>
+                          {s.date} 周{weekdayOf(s.date)}
+                        </div>
+                        <div>
+                          账户当日{" "}
+                          {s.day_change_pct != null ? (
+                            <span
+                              style={{ color: moveColor(s.day_change_pct) }}
+                            >
+                              {fmtPct(s.day_change_pct)}
+                              {s.day_change_cny != null
+                                ? ` (${mask(fmtSignedMoney(s.day_change_cny))})`
+                                : ""}
+                            </span>
+                          ) : (
+                            "—"
+                          )}
+                        </div>
+                        <div>
+                          沪深300 当日{" "}
+                          {s.csi300_change_pct != null ? (
+                            <span
+                              style={{ color: moveColor(s.csi300_change_pct) }}
+                            >
+                              {fmtPct(s.csi300_change_pct)}
+                            </span>
+                          ) : (
+                            "—"
+                          )}
+                        </div>
+                      </div>
+                    );
+                  }}
+                />
+                <ReferenceLine y={0} stroke="var(--border)" />
+                <Bar dataKey="day_change_pct" maxBarSize={26}>
+                  {chartData.map((s) => (
+                    <Cell
+                      key={s.date}
+                      fill={
+                        s.day_change_pct == null || s.day_change_pct === 0
+                          ? "var(--dim)"
+                          : s.day_change_pct > 0
+                            ? "var(--up)"
+                            : "var(--down)"
+                      }
+                    />
+                  ))}
+                </Bar>
+                <Line
+                  type="monotone"
+                  dataKey="csi300_change_pct"
+                  stroke={CSI_LINE_COLOR}
+                  strokeWidth={1.5}
+                  dot={{ r: 2 }}
+                  activeDot={{ r: 3 }}
+                />
+              </ComposedChart>
+            </ResponsiveContainer>
+          </div>
+
+          <div className="tnum mt-4 mb-1 flex flex-wrap items-baseline gap-x-4 gap-y-0.5 text-xs">
+            <span className="text-sm font-medium">证券与现金结构</span>
+            <span className="flex items-baseline gap-1.5">
+              <span
+                className="inline-block h-2 w-2 rounded-full"
+                style={{ background: "var(--accent)" }}
+              />
+              证券
+            </span>
+            <span className="flex items-baseline gap-1.5">
+              <span
+                className="inline-block h-2 w-2 rounded-full"
+                style={{ background: CASH_AREA_COLOR }}
+              />
+              现金
+            </span>
+          </div>
+          <div className="h-36 w-full" aria-label="证券与现金结构图">
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart
+                data={chartData}
+                margin={{ top: 6, right: 8, bottom: 0, left: 4 }}
+              >
+                <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" />
+                <XAxis
+                  dataKey="date"
+                  tickFormatter={(d: string) => d.slice(5)}
+                  tick={axisTick}
+                  tickLine={false}
+                  axisLine={{ stroke: "var(--border)" }}
+                  minTickGap={40}
+                />
+                <YAxis
+                  width={40}
+                  tick={axisTick}
+                  tickLine={false}
+                  axisLine={false}
+                  tickFormatter={moneyTick}
+                />
+                <Tooltip
+                  content={({ active, payload }) => {
+                    if (!active || !payload?.length) return null;
+                    const s = payload[0]?.payload as Snapshot | undefined;
+                    if (!s) return null;
+                    return (
+                      <div className="tnum border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1.5 text-xs">
+                        <div>
+                          {s.date} 周{weekdayOf(s.date)}
+                        </div>
+                        <div>证券 {mask(fmtMoney(s.securities_value_cny))}</div>
+                        <div>现金 {mask(fmtMoney(s.cash_cny))}</div>
+                        <div>总值 {mask(fmtMoney(s.account_value_cny))}</div>
+                      </div>
+                    );
+                  }}
+                />
+                <Area
+                  type="monotone"
+                  dataKey="securities_value_cny"
+                  stackId="1"
+                  stroke="var(--accent)"
+                  fill="var(--accent)"
+                  fillOpacity={0.45}
+                />
+                <Area
+                  type="monotone"
+                  dataKey="cash_cny"
+                  stackId="1"
+                  stroke={CASH_AREA_COLOR}
+                  fill={CASH_AREA_COLOR}
+                  fillOpacity={0.5}
+                />
+              </AreaChart>
+            </ResponsiveContainer>
+          </div>
+
+          <div className="tnum mt-4 mb-1 flex flex-wrap items-baseline gap-x-4 gap-y-0.5 text-xs">
+            <span className="text-sm font-medium">与大盘对比</span>
             <span className="flex items-baseline gap-1.5">
               <span
                 className="inline-block h-2 w-2 rounded-full"
@@ -2211,152 +2693,83 @@ function HistorySection({
             </ResponsiveContainer>
           </div>
 
-          <div className="tnum mt-4 mb-1 flex flex-wrap items-baseline gap-x-4 gap-y-0.5 text-xs">
-            <span className="text-sm font-medium">每日涨跌</span>
-            <span className="text-[var(--dim)]">
-              柱为账户当日涨跌幅（红涨绿跌），线为沪深300 当日涨跌幅
-            </span>
-          </div>
-          <div className="h-36 w-full" aria-label="每日涨跌图">
-            <ResponsiveContainer width="100%" height="100%">
-              <ComposedChart
-                data={chartData}
-                margin={{ top: 6, right: 8, bottom: 0, left: 4 }}
-              >
-                <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" />
-                <XAxis
-                  dataKey="date"
-                  tickFormatter={(d: string) => d.slice(5)}
-                  tick={axisTick}
-                  tickLine={false}
-                  axisLine={{ stroke: "var(--border)" }}
-                  minTickGap={40}
-                />
-                <YAxis
-                  width={52}
-                  tick={axisTick}
-                  tickLine={false}
-                  axisLine={false}
-                  tickFormatter={pctTick}
-                />
-                <Tooltip
-                  content={({ active, payload }) => {
-                    if (!active || !payload?.length) return null;
-                    const s = payload[0]?.payload as Snapshot | undefined;
-                    if (!s) return null;
-                    return (
-                      <div className="tnum border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1.5 text-xs">
-                        <div>
-                          {s.date} 周{weekdayOf(s.date)}
-                        </div>
-                        <div>
-                          账户当日{" "}
-                          {s.day_change_pct != null ? (
-                            <span
-                              style={{ color: moveColor(s.day_change_pct) }}
-                            >
-                              {fmtPct(s.day_change_pct)}
-                              {s.day_change_cny != null
-                                ? ` (${mask(fmtSignedMoney(s.day_change_cny))})`
-                                : ""}
-                            </span>
-                          ) : (
-                            "—"
-                          )}
-                        </div>
-                        <div>
-                          沪深300 当日{" "}
-                          {s.csi300_change_pct != null ? (
-                            <span
-                              style={{ color: moveColor(s.csi300_change_pct) }}
-                            >
-                              {fmtPct(s.csi300_change_pct)}
-                            </span>
-                          ) : (
-                            "—"
-                          )}
-                        </div>
-                      </div>
-                    );
-                  }}
-                />
-                <ReferenceLine y={0} stroke="var(--border)" />
-                <Bar dataKey="day_change_pct" maxBarSize={26}>
-                  {chartData.map((s) => (
-                    <Cell
-                      key={s.date}
-                      fill={
-                        s.day_change_pct == null || s.day_change_pct === 0
-                          ? "var(--dim)"
-                          : s.day_change_pct > 0
-                            ? "var(--up)"
-                            : "var(--down)"
-                      }
-                    />
-                  ))}
-                </Bar>
-                <Line
-                  type="monotone"
-                  dataKey="csi300_change_pct"
-                  stroke={CSI_LINE_COLOR}
-                  strokeWidth={1.5}
-                  dot={{ r: 2 }}
-                  activeDot={{ r: 3 }}
-                />
-              </ComposedChart>
-            </ResponsiveContainer>
-          </div>
-
           {!listCollapsed && (
-          <ul className="mt-2 divide-y divide-[var(--border)] border-y border-[var(--border)]">
-            {history.map((s) => (
-              <li key={s.date} className="px-1 py-2">
-                <div className="tnum flex items-baseline justify-between gap-2 text-sm">
-                  <span className="font-medium">
-                    {s.date.slice(5)}
-                    <span className="ml-1 text-xs font-normal text-[var(--dim)]">
-                      周{weekdayOf(s.date)}
-                    </span>
-                  </span>
-                  <span>{mask(fmtMoney(s.account_value_cny))}</span>
-                  <span
-                    className="w-36 whitespace-nowrap text-right"
-                    style={{ color: moveColor(s.day_change_cny) }}
-                  >
-                    {s.day_change_cny != null
-                      ? `${mask(fmtSignedMoney(s.day_change_cny))} (${fmtPct(s.day_change_pct ?? 0)})`
-                      : "—"}
-                  </span>
-                </div>
-                <div className="tnum mt-0.5 flex flex-wrap gap-x-3 text-xs text-[var(--dim)]">
-                  <span>证券 {mask(fmtMoney(s.securities_value_cny))}</span>
-                  <span>现金 {mask(fmtMoney(s.cash_cny))}</span>
-                  <span>
-                    浮盈亏{" "}
-                    <span style={{ color: moveColor(s.total_pnl_cny) }}>
-                      {s.total_pnl_cny != null
-                        ? mask(fmtSignedMoney(s.total_pnl_cny))
-                        : "—"}
-                    </span>
-                  </span>
-                  <span>
-                    沪深300{" "}
-                    {s.csi300_price != null
-                      ? Math.round(s.csi300_price).toLocaleString("zh-CN")
-                      : "—"}{" "}
-                    <Pct v={s.csi300_change_pct} />
-                  </span>
-                </div>
-              </li>
-            ))}
-          </ul>
+            <div className="mt-2 overflow-x-auto border-y border-[var(--border)]">
+              <table className="tnum w-full min-w-[600px] text-sm">
+                <thead>
+                  <tr className="border-b border-[var(--border)] text-xs text-[var(--dim)]">
+                    <th scope="col" className="px-1 py-1.5 text-left font-normal">
+                      日期
+                    </th>
+                    <th scope="col" className="px-1 py-1.5 text-right font-normal">
+                      总值
+                    </th>
+                    <th scope="col" className="px-1 py-1.5 text-right font-normal">
+                      证券
+                    </th>
+                    <th scope="col" className="px-1 py-1.5 text-right font-normal">
+                      现金
+                    </th>
+                    <th scope="col" className="px-1 py-1.5 text-right font-normal">
+                      当日涨跌
+                    </th>
+                    <th scope="col" className="px-1 py-1.5 text-right font-normal">
+                      涨跌幅
+                    </th>
+                    <th scope="col" className="px-1 py-1.5 text-right font-normal">
+                      沪深300 收盘
+                    </th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[var(--border)]">
+                  {history.map((s) => (
+                    <tr key={s.date}>
+                      <td className="px-1 py-1.5 font-medium whitespace-nowrap">
+                        {s.date.slice(5)}
+                        <span className="ml-1 text-xs font-normal text-[var(--dim)]">
+                          周{weekdayOf(s.date)}
+                        </span>
+                      </td>
+                      <td className="px-1 py-1.5 text-right whitespace-nowrap">
+                        {mask(fmtMoney(s.account_value_cny))}
+                      </td>
+                      <td className="px-1 py-1.5 text-right whitespace-nowrap">
+                        {mask(fmtMoney(s.securities_value_cny))}
+                      </td>
+                      <td className="px-1 py-1.5 text-right whitespace-nowrap">
+                        {mask(fmtMoney(s.cash_cny))}
+                      </td>
+                      <td
+                        className="px-1 py-1.5 text-right whitespace-nowrap"
+                        style={{ color: moveColor(s.day_change_cny) }}
+                      >
+                        {s.day_change_cny != null
+                          ? mask(fmtSignedMoney(s.day_change_cny))
+                          : "—"}
+                      </td>
+                      <td className="px-1 py-1.5 text-right whitespace-nowrap">
+                        <Pct v={s.day_change_pct} />
+                      </td>
+                      <td className="px-1 py-1.5 text-right whitespace-nowrap">
+                        {s.csi300_price != null
+                          ? Math.round(s.csi300_price).toLocaleString("zh-CN")
+                          : "—"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           )}
+          <p className="mt-3 text-xs text-[var(--dim)]">
+            走势数据为每日收盘口径快照（每个交易日 15:10
+            收盘刷新后落盘）；当日涨跌按总账户值（含现金）口径计算，与总览一致。
+          </p>
         </>
       )}
     </section>
   );
 }
-
 // ---------- data backup ----------
 
 function DataSection() {
