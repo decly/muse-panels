@@ -1990,14 +1990,19 @@ function TradesSection({ mask }: { mask: (s: string) => string }) {
 
 // ---------- history ----------
 
-// Colour of the CSI 300 comparison series in both history charts: a
-// warm amber that stays distinct from the account series' slate
-// accent in both colour schemes.
+// Colour of the account series in the history charts: the board's
+// theme red (--up), which resolves to #cf3527 in light mode and
+// #e5533d in dark mode — the account line reads red in both.
+const ACCOUNT_LINE_COLOR = "var(--up)";
+
+// Colour of the CSI 300 comparison series in the 与大盘对比 chart:
+// a warm amber that stays distinct from the account's red and the
+// SSE violet in both colour schemes.
 const CSI_LINE_COLOR = "#d97706";
 
-// Colour of the SSE Composite （上证指数） series in the 与大盘对比
-// chart: a violet clearly apart from the account's slate accent and
-// the CSI 300 amber in both colour schemes.
+// Colour of the SSE Composite （上证指数） series in the history
+// charts: a violet clearly apart from the account's red and the
+// CSI 300 amber in both colour schemes.
 const SSE_LINE_COLOR = "#7c3aed";
 
 // 证券与现金结构 series colours: a saturated deep blue for securities
@@ -2152,6 +2157,22 @@ function HistorySection({
         : null,
   }));
   const lastCmp = cmpData[cmpData.length - 1];
+  // 每日涨跌 overlay series: the SSE Composite's day change is not
+  // stored on snapshots, so it is derived here from the adjacent
+  // snapshots' sse_price closes (today ÷ previous snapshot day − 1).
+  // The first snapshot has no predecessor and gets no line point.
+  const dayChartData = chartData.map((s, i) => {
+    const prev = i > 0 ? chartData[i - 1] : undefined;
+    return {
+      ...s,
+      sse_day_pct:
+        prev?.sse_price != null &&
+        prev.sse_price > 0 &&
+        s.sse_price != null
+          ? (s.sse_price / prev.sse_price - 1) * 100
+          : null,
+    };
+  });
   const pctTick = (v: number) => `${v > 0 ? "+" : ""}${v.toFixed(1)}%`;
   const axisTick = { fontSize: 11, fill: "var(--dim)" } as const;
   const moneyTick = (v: number) => `${(v / 10000).toFixed(0)}万`;
@@ -2298,7 +2319,7 @@ function HistorySection({
             <span className="flex items-baseline gap-1.5">
               <span
                 className="inline-block h-2 w-2 rounded-full"
-                style={{ background: "var(--accent)" }}
+                style={{ background: ACCOUNT_LINE_COLOR }}
               />
               账户总值
             </span>
@@ -2363,7 +2384,7 @@ function HistorySection({
                 <Line
                   type="monotone"
                   dataKey="account_value_cny"
-                  stroke="var(--accent)"
+                  stroke={ACCOUNT_LINE_COLOR}
                   strokeWidth={1.8}
                   dot={chartData.length <= 40}
                   activeDot={{ r: 3 }}
@@ -2373,7 +2394,7 @@ function HistorySection({
                     x={singlePoint.date}
                     y={singlePoint.account_value_cny}
                     r={4.5}
-                    fill="var(--accent)"
+                    fill={ACCOUNT_LINE_COLOR}
                     stroke="var(--surface)"
                     strokeWidth={2}
                   >
@@ -2393,13 +2414,13 @@ function HistorySection({
           <div className="tnum mt-4 mb-1 flex flex-wrap items-baseline gap-x-4 gap-y-0.5 text-xs">
             <span className="text-sm font-medium">每日涨跌</span>
             <span className="text-[var(--dim)]">
-              柱为账户当日涨跌幅（红涨绿跌），线为沪深300 当日涨跌幅
+              柱为账户当日涨跌幅（红涨绿跌），线为上证指数 当日涨跌幅
             </span>
           </div>
           <div className="h-36 w-full" aria-label="每日涨跌图">
             <ResponsiveContainer width="100%" height="100%">
               <ComposedChart
-                data={chartData}
+                data={dayChartData}
                 margin={{ top: 6, right: 8, bottom: 0, left: 4 }}
               >
                 <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" />
@@ -2421,7 +2442,9 @@ function HistorySection({
                 <Tooltip
                   content={({ active, payload }) => {
                     if (!active || !payload?.length) return null;
-                    const s = payload[0]?.payload as Snapshot | undefined;
+                    const s = payload[0]?.payload as
+                      | (Snapshot & { sse_day_pct: number | null })
+                      | undefined;
                     if (!s) return null;
                     return (
                       <div className="tnum border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1.5 text-xs">
@@ -2444,12 +2467,12 @@ function HistorySection({
                           )}
                         </div>
                         <div>
-                          沪深300 当日{" "}
-                          {s.csi300_change_pct != null ? (
+                          上证指数 当日{" "}
+                          {s.sse_day_pct != null ? (
                             <span
-                              style={{ color: moveColor(s.csi300_change_pct) }}
+                              style={{ color: moveColor(s.sse_day_pct) }}
                             >
-                              {fmtPct(s.csi300_change_pct)}
+                              {fmtPct(s.sse_day_pct)}
                             </span>
                           ) : (
                             "—"
@@ -2461,7 +2484,7 @@ function HistorySection({
                 />
                 <ReferenceLine y={0} stroke="var(--border)" />
                 <Bar dataKey="day_change_pct" maxBarSize={26}>
-                  {chartData.map((s) => (
+                  {dayChartData.map((s) => (
                     <Cell
                       key={s.date}
                       fill={
@@ -2476,8 +2499,8 @@ function HistorySection({
                 </Bar>
                 <Line
                   type="monotone"
-                  dataKey="csi300_change_pct"
-                  stroke={CSI_LINE_COLOR}
+                  dataKey="sse_day_pct"
+                  stroke={SSE_LINE_COLOR}
                   strokeWidth={1.5}
                   dot={{ r: 2 }}
                   activeDot={{ r: 3 }}
@@ -2567,7 +2590,7 @@ function HistorySection({
             <span className="flex items-baseline gap-1.5">
               <span
                 className="inline-block h-2 w-2 rounded-full"
-                style={{ background: "var(--accent)" }}
+                style={{ background: ACCOUNT_LINE_COLOR }}
               />
               账户累计
               <span
@@ -2697,7 +2720,7 @@ function HistorySection({
                 <Line
                   type="monotone"
                   dataKey="acct"
-                  stroke="var(--accent)"
+                  stroke={ACCOUNT_LINE_COLOR}
                   strokeWidth={1.8}
                   dot={cmpData.length <= 40}
                   activeDot={{ r: 3 }}
@@ -2725,7 +2748,7 @@ function HistorySection({
                     x={singlePoint.date}
                     y={0}
                     r={4.5}
-                    fill="var(--accent)"
+                    fill={ACCOUNT_LINE_COLOR}
                     stroke="var(--surface)"
                     strokeWidth={2}
                   >
@@ -2766,7 +2789,7 @@ function HistorySection({
                       涨跌幅
                     </th>
                     <th scope="col" className="px-1 py-1.5 text-right font-normal">
-                      沪深300 收盘
+                      上证指数
                     </th>
                   </tr>
                 </thead>
@@ -2800,8 +2823,8 @@ function HistorySection({
                         <Pct v={s.day_change_pct} />
                       </td>
                       <td className="px-1 py-1.5 text-right whitespace-nowrap">
-                        {s.csi300_price != null
-                          ? Math.round(s.csi300_price).toLocaleString("zh-CN")
+                        {s.sse_price != null
+                          ? Math.round(s.sse_price).toLocaleString("zh-CN")
                           : "—"}
                       </td>
                     </tr>
