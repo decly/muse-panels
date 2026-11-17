@@ -464,10 +464,15 @@ const fmtQty = (v: number) =>
 // history plus the server-merged global history — no new action, no
 // data-model change). Sits between 集中度与结构 and 交易流水，
 // follows the account tabs and the board's single privacy switch, and
-// adds no tab / toggle / refresh control of its own. The five stat
+// adds no tab / toggle / refresh control of its own. The six stat
 // cards and the four charts are always visible; only the daily
 // detail table folds (default folded, choice persisted — the same
-// habit as the trade ledger's fold).
+// habit as the trade ledger's fold). The six cards, in fixed order:
+// 记录天数、累计变化、历史最高、最大回撤（running peak → later trough,
+// computed client-side from the view's daily total series), 最好单日、
+// 最差单日 — the last two also show the day's percent move, derived
+// the same way as the daily detail (day ÷ (total − day)), never the
+// raw stored day_change_pct.
 //
 // Chart presentation follows the A-share board's 走势 charts
 // (aligned 2026-11-18, style only — data, series, the USD/CNY
@@ -728,6 +733,43 @@ function TrendSection({
       (a, r) => (a == null || (r.day ?? 0) < (a.day ?? 0) ? r : a),
       null,
     );
+    // Max drawdown over the view's daily total series: the largest
+    // fall from a running peak to a later trough. Amount is the USD
+    // drop (peak − trough); the percent is relative to that peak, so
+    // it is currency-independent. Needs at least 2 snapshots.
+    let maxDrawdown: {
+      amount: number;
+      pct: number;
+      peakDate: string;
+      troughDate: string;
+    } | null = null;
+    if (rows.length >= 2) {
+      let runPeak = rows[0]?.usd ?? 0;
+      let runPeakDate = rows[0]?.date ?? "";
+      let bestDrop = 0;
+      let bestPeak = runPeak;
+      let bestPeakDate = runPeakDate;
+      let bestTroughDate = runPeakDate;
+      for (const r of rows) {
+        if (r.usd > runPeak) {
+          runPeak = r.usd;
+          runPeakDate = r.date;
+        }
+        const drop = runPeak - r.usd;
+        if (drop > bestDrop) {
+          bestDrop = drop;
+          bestPeak = runPeak;
+          bestPeakDate = runPeakDate;
+          bestTroughDate = r.date;
+        }
+      }
+      maxDrawdown = {
+        amount: -bestDrop,
+        pct: bestPeak > 0 ? (-bestDrop / bestPeak) * 100 : 0,
+        peakDate: bestPeakDate,
+        troughDate: bestTroughDate,
+      };
+    }
     return {
       rows: chart,
       days: rows.length,
@@ -737,6 +779,7 @@ function TrendSection({
       cumPct: first.usd > 0 ? (cum / first.usd) * 100 : 0,
       peak,
       drawdownPct: peak > 0 ? ((last.usd - peak) / peak) * 100 : 0,
+      maxDrawdown,
       best,
       worst,
     };
@@ -790,6 +833,41 @@ function TrendSection({
               </p>
             </div>
             <div className="rounded-[var(--radius)] bg-[var(--surface)] p-3">
+              <p className="text-sm text-[var(--dim)]">最大回撤</p>
+              {hist.maxDrawdown != null ? (
+                <>
+                  <p
+                    className="num mt-1 text-lg font-medium"
+                    style={{
+                      color:
+                        hist.maxDrawdown.amount >= 0
+                          ? "var(--up)"
+                          : "var(--down)",
+                    }}
+                  >
+                    {mask(signedMoney(hist.maxDrawdown.amount))}
+                  </p>
+                  <p
+                    className="num text-sm"
+                    style={{
+                      color:
+                        hist.maxDrawdown.pct >= 0
+                          ? "var(--up)"
+                          : "var(--down)",
+                    }}
+                  >
+                    {signedPct(hist.maxDrawdown.pct)}
+                  </p>
+                  <p className="text-[13px] text-[var(--dim)]">
+                    {trendFullDate(hist.maxDrawdown.peakDate)} →{" "}
+                    {trendFullDate(hist.maxDrawdown.troughDate)}
+                  </p>
+                </>
+              ) : (
+                <p className="num mt-1 text-lg font-medium">—</p>
+              )}
+            </div>
+            <div className="rounded-[var(--radius)] bg-[var(--surface)] p-3">
               <p className="text-sm text-[var(--dim)]">最好单日</p>
               {hist.best?.day != null ? (
                 <>
@@ -801,6 +879,17 @@ function TrendSection({
                   >
                     {mask(signedMoney(hist.best.day))}
                   </p>
+                  {hist.best.dayPct != null ? (
+                    <p
+                      className="num text-sm"
+                      style={{
+                        color:
+                          hist.best.dayPct >= 0 ? "var(--up)" : "var(--down)",
+                      }}
+                    >
+                      {signedPct(hist.best.dayPct)}
+                    </p>
+                  ) : null}
                   <p className="whitespace-nowrap text-[13px] text-[var(--dim)]">
                     {trendFullDate(hist.best.date)}
                   </p>
@@ -821,6 +910,19 @@ function TrendSection({
                   >
                     {mask(signedMoney(hist.worst.day))}
                   </p>
+                  {hist.worst.dayPct != null ? (
+                    <p
+                      className="num text-sm"
+                      style={{
+                        color:
+                          hist.worst.dayPct >= 0
+                            ? "var(--up)"
+                            : "var(--down)",
+                      }}
+                    >
+                      {signedPct(hist.worst.dayPct)}
+                    </p>
+                  ) : null}
                   <p className="whitespace-nowrap text-[13px] text-[var(--dim)]">
                     {trendFullDate(hist.worst.date)}
                   </p>
