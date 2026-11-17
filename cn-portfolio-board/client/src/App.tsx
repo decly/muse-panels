@@ -423,7 +423,18 @@ function computeTotals(board: Board): Totals {
     else dayChange += h.quote.change * h.qty;
   }
   const pnl = securities - cost;
-  const prevSecurities = securities - dayChange;
+  const total = board.cash_cny != null ? securities + board.cash_cny : null;
+  // 今日涨跌幅 uses the ACCOUNT-total basis — dayChange ÷ (total −
+  // dayChange), cash included — the same 口径 the daily snapshots
+  // store (writeSnapshot: dayChange ÷ previous account value) and
+  // the 今日页 A股账户 block reports. Dividing by the previous
+  // SECURITIES value instead (cash excluded) overstates the move
+  // whenever cash is non-trivial, and the overview then disagrees
+  // with the snapshot for the identical day-change amount. When
+  // cash has not been recorded the account basis cannot be stated,
+  // so fall back to the securities-only basis rather than hiding
+  // the figure.
+  const prevTotal = total != null ? total - dayChange : securities - dayChange;
   return {
     securities,
     cost,
@@ -431,10 +442,8 @@ function computeTotals(board: Board): Totals {
     pnlPct: cost > 0 ? (pnl / cost) * 100 : null,
     dayChange: dayKnown ? dayChange : null,
     dayChangePct:
-      dayKnown && prevSecurities > 0
-        ? (dayChange / prevSecurities) * 100
-        : null,
-    total: board.cash_cny != null ? securities + board.cash_cny : null,
+      dayKnown && prevTotal > 0 ? (dayChange / prevTotal) * 100 : null,
+    total,
     complete,
   };
 }
