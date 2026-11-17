@@ -2400,6 +2400,20 @@ export function App() {
     return () => clearInterval(timer);
   }, [queryClient]);
 
+  // 切回前台自动刷新：页面在后台/内存中停留时不会重读数据，回到
+  // 前台（visibilitychange → visible）时重新拉取看板与流水，
+  // 展示定时刷新已写入的最新数据，无需手动关开页面。
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === "visible") {
+        void queryClient.refetchQueries({ queryKey: ["board"] });
+        void queryClient.refetchQueries({ queryKey: ["trades"] });
+      }
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [queryClient]);
+
   const [privacy, setPrivacy] = useLocalBool("agu-board-privacy", false);
   const mask = (s: string) => (privacy ? "••••" : s);
 
