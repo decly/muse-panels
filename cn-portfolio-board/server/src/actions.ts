@@ -228,6 +228,77 @@ async function fetchEmQuote(secid: string): Promise<EmQuote | null> {
   };
 }
 
+// ---------- Tencent IOPV （参考净值） ----------
+//
+// Eastmoney's push2 quote carries no IOPV (f297 probed live
+// 2026-11-17:恒为 0), so an ETF's intraday indicative NAV comes from
+// Tencent's quote feed (qt.gtimg.cn), which relays the exchange-
+// published IOPV. The tilde-delimited payload is GBK-encoded; field
+// 78 is the IOPV and field 77 the feed's own premium % — the two were
+// verified consistent ((price − IOPV) / IOPV reproduces field 77 to
+// the displayed digit) across the board's ETF holdings at build
+// time, QDII included. Only IOPV is stored; the board derives the premium from
+// its own Eastmoney price so the two figures on a row always agree.
+// Prefix rule mirrors secidForSymbol: 5/6/9 → sh, else sz.
+function tencentCodeForSymbol(symbol: string): string {
+  const first = symbol.charAt(0);
+  return `${first === "5" || first === "6" || first === "9" ? "sh" : "sz"}${symbol}`;
+}
+
+// Batch IOPV for the given ETF symbols in one request. Returns a
+// symbol → IOPV map; symbols the feed omits or reports without a
+// usable IOPV are simply absent (callers keep the stored value).
+async function fetchTencentIopv(
+  symbols: string[],
+): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  if (symbols.length === 0) return out;
+  const codes = symbols.map(tencentCodeForSymbol).join(",");
+  for (let attempt = 0; attempt < 3 && out.size === 0; attempt++) {
+    if (attempt > 0) {
+      await new Promise((r) => setTimeout(r, attempt === 1 ? 400 : 1200));
+    }
+    try {
+      const res = await fetch(`https://qt.gtimg.cn/q=${codes}`, {
+        headers: { "User-Agent": "Mozilla/5.0" },
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!res.ok) continue;
+      const buf = await res.arrayBuffer();
+      let text: string;
+      try {
+        text = new TextDecoder("gbk").decode(buf);
+      } catch {
+        // Numeric fields are ASCII, so even a lossy decode keeps the
+        // tilde structure and the IOPV column readable.
+        text = new TextDecoder().decode(buf);
+      }
+      for (const line of text.split(";")) {
+        const eqAt = line.indexOf("=");
+        if (eqAt < 0) continue;
+        const body = line
+          .slice(eqAt + 1)
+          .replace(/^"/, "")
+          .replace(/"\s*$/, "");
+        const f = body.split("~");
+        const code = f[2];
+        const iopv = Number(f[78]);
+        if (
+          typeof code === "string" &&
+          /^\d{6}$/.test(code) &&
+          Number.isFinite(iopv) &&
+          iopv > 0
+        ) {
+          out.set(code, iopv);
+        }
+      }
+    } catch {
+      // fall through to the next attempt
+    }
+  }
+  return out;
+}
+
 // Batch quote for the ten benchmarks via ulist.np (all ten carry
 // 2 price decimals — verified per-instrument via stock/get f59, so
 // the batch scaling is unambiguous here — holding ETFs report a
@@ -384,6 +455,10 @@ const quoteOut = z.object({
   prev_close: z.number().nullable(),
   as_of: z.string().nullable(),
   quote_date: z.string().nullable(),
+  // ETF 参考净值 (IOPV, Tencent feed); null for non-ETFs / unfetched.
+  iopv: z.number().nullable(),
+  // (price − iopv) / iopv × 100, derived at read time; ETFs only.
+  premium_percent: z.number().nullable(),
 });
 
 const holdingOut = z.object({
@@ -486,6 +561,11 @@ async function loadBoard(ctx: Ctx): Promise<BoardResponse> {
               prev_close: q.prevClose,
               as_of: q.asOf,
               quote_date: q.quoteDate,
+              iopv: h.kind === "etf" ? q.iopv : null,
+              premium_percent:
+                h.kind === "etf" && q.iopv != null && q.iopv > 0
+                  ? ((q.price - q.iopv) / q.iopv) * 100
+                  : null,
             }
           : null,
     };
@@ -603,6 +683,19 @@ async function refreshQuotesInternal(ctx: Ctx): Promise<RefreshOutcome> {
     updated += 1;
   }
 
+  // ETF IOPV （参考净值） from Tencent, one batch request for every
+  // ETF holding; non-ETFs never get an IOPV. A symbol missing from
+  // the response keeps its stored IOPV (same keep-on-failure rule as
+  // the Eastmoney quotes), so a Tencent outage never blanks the
+  // premium column.
+  const existingQuotes = await db.select().from(schema.quoteSnapshots);
+  const storedIopv = new Map(
+    existingQuotes.map((q) => [q.symbol, q.iopv ?? null]),
+  );
+  const iopvBySymbol = await fetchTencentIopv(
+    holdingRows.filter((h) => h.kind === "etf").map((h) => h.symbol),
+  );
+
   const storeHoldingQuote = async (
     h: (typeof holdingRows)[number],
   ): Promise<boolean> => {
@@ -611,6 +704,10 @@ async function refreshQuotesInternal(ctx: Ctx): Promise<RefreshOutcome> {
     const values = {
       symbol: h.symbol,
       price: q.price,
+      iopv:
+        h.kind === "etf"
+          ? (iopvBySymbol.get(h.symbol) ?? storedIopv.get(h.symbol) ?? null)
+          : null,
       change: q.change,
       changePercent: q.changePercent,
       prevClose: q.prevClose,
@@ -1202,6 +1299,7 @@ async function buildExport(ctx: Ctx): Promise<ExportPayload> {
       quotes.map((q) => ({
         symbol: q.symbol,
         price: q.price,
+        iopv: q.iopv,
         change: q.change,
         change_percent: q.changePercent,
         prev_close: q.prevClose,
@@ -1424,6 +1522,7 @@ async function importTables(
         db.insert(schema.quoteSnapshots).values({
           symbol,
           price: numOrNull(r.price),
+          iopv: numOrNull(r.iopv),
           change: numOrNull(r.change),
           changePercent: numOrNull(r.change_percent),
           prevClose: numOrNull(r.prev_close),

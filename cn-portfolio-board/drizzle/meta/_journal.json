@@ -15,6 +15,13 @@
       "when": 1794673875197,
       "tag": "0002_a_share_portfolio_tables",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1794898773818,
+      "tag": "0003_add_iopv_to_quote_snapshots",
+      "breakpoints": true
     }
   ]
 }

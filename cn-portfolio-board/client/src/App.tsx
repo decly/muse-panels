@@ -784,6 +784,20 @@ function HoldingDetail({
           <dt className="text-xs text-[var(--dim)]">市值占比</dt>
           <dd>{h.share != null ? `${h.share.toFixed(2)}%` : "—"}</dd>
         </div>
+        {h.quote?.iopv != null && (
+          <div>
+            <dt className="text-xs text-[var(--dim)]">参考净值（IOPV）</dt>
+            <dd>{h.quote.iopv.toFixed(4)}</dd>
+          </div>
+        )}
+        {h.quote?.premium_percent != null && (
+          <div>
+            <dt className="text-xs text-[var(--dim)]">溢价率</dt>
+            <dd>
+              <Pct v={h.quote.premium_percent} />
+            </dd>
+          </div>
+        )}
         <div>
           <dt className="text-xs text-[var(--dim)]">报价日期</dt>
           <dd>
@@ -858,7 +872,7 @@ function HoldingDetail({
   );
 }
 
-type SortKey = "stock" | "chg" | "dayPnl" | "price" | "cost" | "pnlPct" | "pnl" | "mv" | "costAmt" | "qty" | "share";
+type SortKey = "stock" | "chg" | "dayPnl" | "premium" | "price" | "cost" | "pnlPct" | "pnl" | "mv" | "costAmt" | "qty" | "share";
 
 function HoldingsSection({
   board,
@@ -948,6 +962,8 @@ function HoldingsSection({
         return h.quote?.change_percent ?? null;
       case "dayPnl":
         return h.dayPnl;
+      case "premium":
+        return h.quote?.premium_percent ?? null;
       case "price":
         return h.quote?.price ?? null;
       case "cost":
@@ -988,6 +1004,7 @@ function HoldingsSection({
     { key: "stock", label: "股票" },
     { key: "chg", label: "涨跌幅" },
     { key: "dayPnl", label: "今日盈亏", masked: true },
+    { key: "premium", label: "溢价率" },
     { key: "price", label: "现价" },
     { key: "cost", label: "成本价" },
     { key: "pnlPct", label: "浮盈亏%" },
@@ -1023,6 +1040,8 @@ function HoldingsSection({
         ) : (
           "—"
         );
+      case "premium":
+        return <Pct v={h.quote?.premium_percent ?? null} />;
       case "price":
         return h.quote ? fmtPrice(h.quote.price) : "—";
       case "cost":
@@ -1200,6 +1219,12 @@ function HoldingsSection({
                   <span>
                     市值 {h.mv != null ? mask(fmtMoney(h.mv)) : "—"} · 占比{" "}
                     {h.share != null ? `${h.share.toFixed(2)}%` : "—"}
+                    {h.quote?.premium_percent != null && (
+                      <>
+                        {" · 溢价率 "}
+                        <Pct v={h.quote.premium_percent} />
+                      </>
+                    )}
                   </span>
                   <span style={{ color: moveColor(h.pnl) }}>
                     {h.pnl != null
@@ -1222,7 +1247,7 @@ function HoldingsSection({
       ) : (
         <div className="border-y border-[var(--border)]">
           <div className="overflow-auto" style={{ maxHeight: "75vh" }}>
-            <table className="tnum w-full min-w-[980px] border-collapse text-sm">
+            <table className="tnum w-full min-w-[1060px] border-collapse text-sm">
               <thead>
                 <tr>
                   {columns.map((c, i) => (

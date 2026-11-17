@@ -36,10 +36,16 @@ export const holdings = sqliteTable(
 // `price` is the latest traded price (intraday: live; after the close:
 // the closing price) — the only price basis that ever enters market
 // value, P/L and snapshots. quote_date is the Beijing date of the
-// quote's own timestamp, used to recognise trading days.
+// quote's own timestamp, used to recognise trading days. `iopv` is the
+// ETF's intraday indicative NAV （参考净值）, fetched from Tencent's
+// quote feed alongside the Eastmoney price (Eastmoney's push2 quote
+// carries no IOPV); null for non-ETFs and whenever the IOPV fetch
+// failed — the premium rate is derived from price vs iopv at read
+// time and never stored.
 export const quoteSnapshots = sqliteTable("quote_snapshots", {
   symbol: text("symbol").primaryKey(),
   price: real("price"),
+  iopv: real("iopv"),
   change: real("change"),
   changePercent: real("change_percent"),
   prevClose: real("prev_close"),
