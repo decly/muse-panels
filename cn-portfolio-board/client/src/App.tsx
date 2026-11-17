@@ -243,7 +243,7 @@ const NAV_ITEMS = [
   { id: "sec-overview", label: "总览" },
   { id: "sec-holdings", label: "持仓" },
   { id: "sec-concentration", label: "集中度" },
-  { id: "sec-history", label: "历史" },
+  { id: "sec-history", label: "走势" },
   { id: "sec-trades", label: "流水" },
 ] as const;
 
@@ -2000,6 +2000,13 @@ function HistorySection({
   history: Snapshot[];
   mask: (s: string) => string;
 }) {
+  // The daily snapshot list folds away by default (same habit as the
+  // trade ledger's collapse, persisted); the two charts above it
+  // always stay visible.
+  const [listCollapsed, setListCollapsed] = useLocalBool(
+    "agu-board-history-list-collapsed",
+    true,
+  );
   const chartData = [...history].reverse();
   // A lone snapshot has no line to draw; both comparison series are
   // rendered as single annotated dots (see the ReferenceDots below)
@@ -2031,8 +2038,24 @@ function HistorySection({
   const axisTick = { fontSize: 11, fill: "var(--dim)" } as const;
 
   return (
-    <section aria-label="历史" id="sec-history" className="section-anchor">
-      <SectionTitle>历史</SectionTitle>
+    <section aria-label="走势" id="sec-history" className="section-anchor">
+      <SectionTitle
+        right={
+          history.length > 0 ? (
+            <button
+              type="button"
+              aria-expanded={!listCollapsed}
+              aria-label={listCollapsed ? "展开每日数据" : "折叠每日数据"}
+              onClick={() => setListCollapsed(!listCollapsed)}
+              className="rounded-md border border-[var(--border)] px-2.5 text-xs"
+            >
+              {listCollapsed ? "展开每日数据" : "折叠每日数据"}
+            </button>
+          ) : undefined
+        }
+      >
+        走势
+      </SectionTitle>
       {history.length === 0 ? (
         <p className="border border-dashed border-[var(--border)] px-3 py-4 text-sm text-[var(--dim)]">
           暂无快照 · 等待录入。每个交易日 15:10 收盘刷新后自动落盘当日快照。
@@ -2284,6 +2307,7 @@ function HistorySection({
             </ResponsiveContainer>
           </div>
 
+          {!listCollapsed && (
           <ul className="mt-2 divide-y divide-[var(--border)] border-y border-[var(--border)]">
             {history.map((s) => (
               <li key={s.date} className="px-1 py-2">
@@ -2326,6 +2350,7 @@ function HistorySection({
               </li>
             ))}
           </ul>
+          )}
         </>
       )}
     </section>
