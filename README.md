@@ -1,6 +1,6 @@
 # muse-panels
 
-我用 Muse 搭建的全部面板（Web Artifact）源码归档库 — 七个面板各占一个
+我用 Muse 搭建的全部面板（Web Artifact）源码归档库 — 六个面板各占一个
 子目录，线上托管页面是运行副本、本仓库是源码的版本管理归档；代码与数据
 严格分离（见「维护机制」）。
 
@@ -8,8 +8,7 @@
 
 | 显示名 | 目录 | 用途 | slug |
 |---|---|---|---|
-| 看板 · 投资组合 | `portfolio-board/` | 多账户美股持仓总览：全局/单账户页签、行情条、集中度、隐私模式、延长时段价格层 | jia-xin-chi-cang-kan-ban |
-| 看板 · 投资历史 | `history-board/` | 账户整体总值的每日快照时间序列与曲线，只记总值、不记个股 | zhang-hu-li-shi-kan-ban |
+| 看板 · 投资组合 | `portfolio-board/` | 多账户美股持仓总览：全局/单账户页签、行情条、集中度、走势区段（账户每日快照历史，原投资历史看板已合并入内）、隐私模式、延长时段价格层 | jia-xin-chi-cang-kan-ban |
 | 看板 · 今日页 | `today-board/` | 静态晨报页：收盘口径的账户总览、昨夜动向、今日事件、金价与其他资产一行 | kan-ban-jin-ri-ye |
 | 看板 · 全天动态 | `stream-board/` | 24 小时全资产事件流：七类事件、顶部实时行情条，事件保留 7 天 | kan-ban-quan-tian-dong-tai |
 | 看板 · 待办总览 | `todo-board/` | 跨对话待办面板：待拍板 / 进行中 / 已办三区，面板内可拍板、巡检执行回写 | kan-ban-dai-ban-zong-lan |
@@ -45,8 +44,8 @@
   互不覆盖，绝不进入官方口径。
 - 涨跌配色红涨绿跌；隐私模式遮罩具体金额与当日涨跌额，百分比与公开
   价格保持可见（成本价列不遮罩）。
-- 历史看板中截图来源（`source = "screenshot"`）的记录受保护，不会被
-  自动同步或重算覆盖。
+- 持仓看板每日快照中截图来源（`source = "screenshot"`）的记录受保护，
+  不会被自动同步或重算覆盖。
 
 ## 运行环境说明
 
@@ -60,7 +59,6 @@
 
 ```
 portfolio-board/   看板 · 投资组合（client / server / drizzle）
-history-board/     看板 · 投资历史（client / server / drizzle）
 today-board/       看板 · 今日页（client / server / drizzle）
 stream-board/      看板 · 全天动态（client / server / drizzle）
 todo-board/        看板 · 待办总览（client / server / drizzle）
