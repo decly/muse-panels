@@ -1213,43 +1213,59 @@ function HoldingsSection({
                 onClick={() => setExpanded(expanded === h.id ? null : h.id)}
                 className="block w-full px-1 py-2.5 text-left"
               >
-                <span className="flex items-baseline justify-between gap-2">
-                  <span className="text-sm">
-                    <span className="tnum font-bold">{h.symbol}</span>
-                    <span className="ml-2 font-medium">
-                      {displayName(h.symbol, h.name)}
+                <span className="grid grid-cols-[minmax(0,1fr)_122px] gap-x-3">
+                  <span className="min-w-0">
+                    <span className="flex items-baseline text-sm">
+                      <span className="tnum shrink-0 font-bold">
+                        {h.symbol}
+                      </span>
+                      <span className="ml-2 min-w-0 truncate font-medium">
+                        {displayName(h.symbol, h.name)}
+                      </span>
+                      {isStaleQuote(h, latestQuoteDate) &&
+                        h.quote?.quote_date && (
+                          <StaleTag
+                            date={h.quote.quote_date}
+                            className="ml-2 shrink-0 text-xs whitespace-nowrap"
+                          />
+                        )}
+                    </span>
+                    <span className="tnum mt-1 block truncate text-xs text-[var(--dim)]">
+                      市值 {h.mv != null ? mask(fmtMoney(h.mv)) : "—"} · 占比{" "}
+                      {h.share != null ? `${h.share.toFixed(2)}%` : "—"}
+                    </span>
+                    <span className="tnum mt-1 block text-xs">
+                      {h.quote?.premium_percent != null ? (
+                        <>
+                          <span className="text-[var(--dim)]">溢价率 </span>
+                          <Pct v={h.quote.premium_percent} />
+                        </>
+                      ) : (
+                        <span aria-hidden="true">&nbsp;</span>
+                      )}
                     </span>
                   </span>
-                  <span className="tnum shrink-0 text-sm">
-                    {h.quote ? fmtPrice(h.quote.price) : "—"}
-                    <Pct
-                      v={h.quote?.change_percent ?? null}
-                      className="ml-2 text-xs"
-                    />
-                    {isStaleQuote(h, latestQuoteDate) &&
-                      h.quote?.quote_date && (
-                        <StaleTag
-                          date={h.quote.quote_date}
-                          className="ml-2 text-xs"
-                        />
+                  <span className="text-right">
+                    <span className="tnum block text-sm whitespace-nowrap">
+                      {h.quote ? fmtPrice(h.quote.price) : "—"}
+                      <Pct
+                        v={h.quote?.change_percent ?? null}
+                        className="ml-2 text-xs"
+                      />
+                    </span>
+                    <span
+                      className="tnum mt-1 block text-xs whitespace-nowrap"
+                      style={{ color: moveColor(h.pnl) }}
+                    >
+                      {h.pnl != null ? mask(fmtSignedMoney(h.pnl)) : "—"}
+                    </span>
+                    <span className="tnum mt-1 block text-xs whitespace-nowrap">
+                      {h.pnl != null ? (
+                        <Pct v={h.pnlPct} />
+                      ) : (
+                        <span>—</span>
                       )}
-                  </span>
-                </span>
-                <span className="tnum mt-1 flex items-baseline justify-between gap-2 text-xs text-[var(--dim)]">
-                  <span>
-                    市值 {h.mv != null ? mask(fmtMoney(h.mv)) : "—"} · 占比{" "}
-                    {h.share != null ? `${h.share.toFixed(2)}%` : "—"}
-                    {h.quote?.premium_percent != null && (
-                      <>
-                        {" · 溢价率 "}
-                        <Pct v={h.quote.premium_percent} />
-                      </>
-                    )}
-                  </span>
-                  <span style={{ color: moveColor(h.pnl) }}>
-                    {h.pnl != null
-                      ? `${mask(fmtSignedMoney(h.pnl))} (${fmtPct(h.pnlPct ?? 0)})`
-                      : "—"}
+                    </span>
                   </span>
                 </span>
               </button>
