@@ -1504,6 +1504,55 @@ function Concentration({
     });
   }
   list.sort((a, b) => b.share - a.share);
+  // Derived concentration stats (same 口径 as the US board): every
+  // share below uses the SECURITIES market value as denominator (cash
+  // excluded), only quoted holdings count, and 浮盈亏 is the enriched
+  // (price − diluted cost) × qty. Percentages show 1 decimal; bars
+  // have a 1.5% minimum width; amounts go through the privacy mask
+  // while percentages and bar widths stay visible.
+  const priced = rows.filter((h) => h.mv != null);
+  const secMv = totals.securities;
+  const pctOfSec = (mv: number) => (secMv > 0 ? (mv / secMv) * 100 : 0);
+  const byMvDesc = [...priced].sort((a, b) => (b.mv ?? 0) - (a.mv ?? 0));
+  const topHoldings = byMvDesc.slice(0, 5);
+  const losers = priced
+    .filter((h) => (h.pnl ?? 0) < 0)
+    .sort((a, b) => (a.pnl ?? 0) - (b.pnl ?? 0));
+  const totalLoss = losers.reduce((s, h) => s + Math.abs(h.pnl ?? 0), 0);
+  const loserRows = losers.slice(0, 4);
+  const winners = priced
+    .filter((h) => (h.pnl ?? 0) > 0)
+    .sort((a, b) => (b.pnl ?? 0) - (a.pnl ?? 0));
+  const totalGain = winners.reduce((s, h) => s + (h.pnl ?? 0), 0);
+  const winnerRows = winners.slice(0, 4);
+  const top3MvShare = pctOfSec(
+    byMvDesc.slice(0, 3).reduce((s, h) => s + (h.mv ?? 0), 0),
+  );
+  const top3LossShare =
+    totalLoss > 0
+      ? (losers
+          .slice(0, 3)
+          .reduce((s, h) => s + Math.abs(h.pnl ?? 0), 0) /
+          totalLoss) *
+        100
+      : 0;
+  const winCountShare =
+    priced.length > 0 ? (winners.length / priced.length) * 100 : 0;
+  const metricRows: { label: string; pct: number }[] = [
+    { label: "前三大持仓占证券市值", pct: top3MvShare },
+    ...(losers.length > 0
+      ? [
+          {
+            label: `前三浮亏股占总浮亏（${losers
+              .slice(0, 3)
+              .map((h) => h.symbol)
+              .join("、")}）`,
+            pct: top3LossShare,
+          },
+        ]
+      : []),
+    { label: "盈利持仓家数占比", pct: winCountShare },
+  ];
   return (
     <section aria-label="集中度" id="sec-concentration" className="section-anchor">
       <SectionTitle>集中度</SectionTitle>
@@ -1558,6 +1607,131 @@ function Concentration({
       <p className="mt-1.5 text-[11px] text-[var(--dim)]">
         按底层敞口归类，同一指数的多只 ETF 合并；占比按总账户值计（现金未录入时按证券市值计）。
       </p>
+      {priced.length > 0 && (
+        <>
+          <p className="mt-4 text-sm text-[var(--dim)]">前五大持仓（占证券市值）</p>
+          <div className="mt-1.5 space-y-2">
+            {topHoldings.map((h) => {
+              const pct = pctOfSec(h.mv ?? 0);
+              return (
+                <div key={h.symbol}>
+                  <div className="flex items-baseline justify-between gap-2 text-sm">
+                    <span className="min-w-0 truncate whitespace-nowrap">
+                      <span className="font-semibold">{h.symbol}</span>{" "}
+                      {displayName(h.symbol, h.name)}
+                    </span>
+                    <span className="tnum shrink-0 text-[var(--dim)]">
+                      {pct.toFixed(1)}%
+                    </span>
+                  </div>
+                  <div className="mt-1 h-2 overflow-hidden rounded-full bg-[var(--surface-alt)]">
+                    <div
+                      className="h-full rounded-full"
+                      style={{
+                        width: `${Math.max(pct, 1.5)}%`,
+                        background: "var(--accent)",
+                      }}
+                    />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+      {loserRows.length > 0 && (
+        <>
+          <p className="mt-4 text-sm text-[var(--dim)]">浮亏来源（占总浮亏）</p>
+          <div className="mt-1.5 space-y-2">
+            {loserRows.map((h) => {
+              const share =
+                totalLoss > 0
+                  ? (Math.abs(h.pnl ?? 0) / totalLoss) * 100
+                  : 0;
+              return (
+                <div key={h.symbol}>
+                  <div className="flex items-baseline justify-between gap-2 text-sm">
+                    <span className="font-semibold">{h.symbol}</span>
+                    <span
+                      className="tnum shrink-0 whitespace-nowrap"
+                      style={{ color: "var(--down)" }}
+                    >
+                      {h.pnl != null ? mask(fmtSignedMoney(h.pnl)) : "—"} ·{" "}
+                      {share.toFixed(1)}%
+                    </span>
+                  </div>
+                  <div className="mt-1 h-2 overflow-hidden rounded-full bg-[var(--surface-alt)]">
+                    <div
+                      className="h-full rounded-full"
+                      style={{
+                        width: `${Math.max(share, 1.5)}%`,
+                        background: "var(--down)",
+                      }}
+                    />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+      {winnerRows.length > 0 && (
+        <>
+          <p className="mt-4 text-sm text-[var(--dim)]">浮盈来源（占总浮盈）</p>
+          <div className="mt-1.5 space-y-2">
+            {winnerRows.map((h) => {
+              const share =
+                totalGain > 0 ? ((h.pnl ?? 0) / totalGain) * 100 : 0;
+              return (
+                <div key={h.symbol}>
+                  <div className="flex items-baseline justify-between gap-2 text-sm">
+                    <span className="font-semibold">{h.symbol}</span>
+                    <span
+                      className="tnum shrink-0 whitespace-nowrap"
+                      style={{ color: "var(--up)" }}
+                    >
+                      {h.pnl != null ? mask(fmtSignedMoney(h.pnl)) : "—"} ·{" "}
+                      {share.toFixed(1)}%
+                    </span>
+                  </div>
+                  <div className="mt-1 h-2 overflow-hidden rounded-full bg-[var(--surface-alt)]">
+                    <div
+                      className="h-full rounded-full"
+                      style={{
+                        width: `${Math.max(share, 1.5)}%`,
+                        background: "var(--up)",
+                      }}
+                    />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+      {priced.length > 0 && (
+        <div className="mt-4 space-y-2.5 border-t border-[var(--border)] pt-3">
+          {metricRows.map((m) => (
+            <div key={m.label} className="flex items-center gap-2.5">
+              <span className="min-w-0 flex-1 text-sm leading-snug text-[var(--dim)]">
+                {m.label}
+              </span>
+              <div className="h-1.5 w-20 shrink-0 overflow-hidden rounded-full bg-[var(--surface-alt)] min-[480px]:w-28">
+                <div
+                  className="h-full rounded-full"
+                  style={{
+                    width: `${Math.min(Math.max(m.pct, 1.5), 100)}%`,
+                    background: m.pct >= 30 ? "var(--up)" : "var(--accent)",
+                  }}
+                />
+              </div>
+              <span className="tnum w-14 shrink-0 text-right text-sm font-medium">
+                {m.pct.toFixed(1)}%
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
     </section>
   );
 }
