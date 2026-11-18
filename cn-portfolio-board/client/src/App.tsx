@@ -1042,7 +1042,7 @@ function HoldingsSection({
             <span className="tnum block font-bold whitespace-nowrap">
               {h.symbol}
             </span>
-            <span className="block text-xs whitespace-nowrap text-[var(--dim)]">
+            <span className="block max-w-[8rem] truncate text-xs text-[var(--dim)]">
               {displayName(h.symbol, h.name)}
             </span>
             {isStaleQuote(h, latestQuoteDate) && h.quote?.quote_date && (
@@ -1639,41 +1639,28 @@ function Concentration({
           </div>
         </>
       )}
-      {loserRows.length > 0 && (
-        <>
-          <p className="mt-4 text-sm text-[var(--dim)]">浮亏来源（占总浮亏）</p>
-          <div className="mt-1.5 space-y-2">
-            {loserRows.map((h) => {
-              const share =
-                totalLoss > 0
-                  ? (Math.abs(h.pnl ?? 0) / totalLoss) * 100
-                  : 0;
-              return (
-                <div key={h.symbol}>
-                  <div className="flex items-baseline justify-between gap-2 text-sm">
-                    <span className="font-semibold">{h.symbol}</span>
-                    <span
-                      className="tnum shrink-0 whitespace-nowrap"
-                      style={{ color: "var(--down)" }}
-                    >
-                      {h.pnl != null ? mask(fmtSignedMoney(h.pnl)) : "—"} ·{" "}
-                      {share.toFixed(1)}%
-                    </span>
-                  </div>
-                  <div className="mt-1 h-2 overflow-hidden rounded-full bg-[var(--surface-alt)]">
-                    <div
-                      className="h-full rounded-full"
-                      style={{
-                        width: `${Math.max(share, 1.5)}%`,
-                        background: "var(--down)",
-                      }}
-                    />
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </>
+      {priced.length > 0 && (
+        <div className="mt-4 space-y-2.5 border-t border-[var(--border)] pt-3">
+          {metricRows.map((m) => (
+            <div key={m.label} className="flex items-center gap-2.5">
+              <span className="min-w-0 flex-1 text-sm leading-snug text-[var(--dim)]">
+                {m.label}
+              </span>
+              <div className="h-1.5 w-20 shrink-0 overflow-hidden rounded-full bg-[var(--surface-alt)] min-[480px]:w-28">
+                <div
+                  className="h-full rounded-full"
+                  style={{
+                    width: `${Math.min(Math.max(m.pct, 1.5), 100)}%`,
+                    background: m.pct >= 30 ? "var(--up)" : "var(--accent)",
+                  }}
+                />
+              </div>
+              <span className="tnum w-14 shrink-0 text-right text-sm font-medium">
+                {m.pct.toFixed(1)}%
+              </span>
+            </div>
+          ))}
+        </div>
       )}
       {winnerRows.length > 0 && (
         <>
@@ -1685,7 +1672,10 @@ function Concentration({
               return (
                 <div key={h.symbol}>
                   <div className="flex items-baseline justify-between gap-2 text-sm">
-                    <span className="font-semibold">{h.symbol}</span>
+                    <span className="min-w-0 truncate whitespace-nowrap">
+                      <span className="font-semibold">{h.symbol}</span>{" "}
+                      {displayName(h.symbol, h.name)}
+                    </span>
                     <span
                       className="tnum shrink-0 whitespace-nowrap"
                       style={{ color: "var(--up)" }}
@@ -1709,28 +1699,44 @@ function Concentration({
           </div>
         </>
       )}
-      {priced.length > 0 && (
-        <div className="mt-4 space-y-2.5 border-t border-[var(--border)] pt-3">
-          {metricRows.map((m) => (
-            <div key={m.label} className="flex items-center gap-2.5">
-              <span className="min-w-0 flex-1 text-sm leading-snug text-[var(--dim)]">
-                {m.label}
-              </span>
-              <div className="h-1.5 w-20 shrink-0 overflow-hidden rounded-full bg-[var(--surface-alt)] min-[480px]:w-28">
-                <div
-                  className="h-full rounded-full"
-                  style={{
-                    width: `${Math.min(Math.max(m.pct, 1.5), 100)}%`,
-                    background: m.pct >= 30 ? "var(--up)" : "var(--accent)",
-                  }}
-                />
-              </div>
-              <span className="tnum w-14 shrink-0 text-right text-sm font-medium">
-                {m.pct.toFixed(1)}%
-              </span>
-            </div>
-          ))}
-        </div>
+      {loserRows.length > 0 && (
+        <>
+          <p className="mt-4 text-sm text-[var(--dim)]">浮亏来源（占总浮亏）</p>
+          <div className="mt-1.5 space-y-2">
+            {loserRows.map((h) => {
+              const share =
+                totalLoss > 0
+                  ? (Math.abs(h.pnl ?? 0) / totalLoss) * 100
+                  : 0;
+              return (
+                <div key={h.symbol}>
+                  <div className="flex items-baseline justify-between gap-2 text-sm">
+                    <span className="min-w-0 truncate whitespace-nowrap">
+                      <span className="font-semibold">{h.symbol}</span>{" "}
+                      {displayName(h.symbol, h.name)}
+                    </span>
+                    <span
+                      className="tnum shrink-0 whitespace-nowrap"
+                      style={{ color: "var(--down)" }}
+                    >
+                      {h.pnl != null ? mask(fmtSignedMoney(h.pnl)) : "—"} ·{" "}
+                      {share.toFixed(1)}%
+                    </span>
+                  </div>
+                  <div className="mt-1 h-2 overflow-hidden rounded-full bg-[var(--surface-alt)]">
+                    <div
+                      className="h-full rounded-full"
+                      style={{
+                        width: `${Math.max(share, 1.5)}%`,
+                        background: "var(--down)",
+                      }}
+                    />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </>
       )}
     </section>
   );
