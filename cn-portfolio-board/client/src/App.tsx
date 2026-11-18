@@ -1231,18 +1231,16 @@ function HoldingsSection({
                         )}
                     </span>
                     <span className="tnum mt-1 block truncate text-xs text-[var(--dim)]">
-                      市值 {h.mv != null ? mask(fmtMoney(h.mv)) : "—"} · 占比{" "}
-                      {h.share != null ? `${h.share.toFixed(2)}%` : "—"}
+                      市值 {h.mv != null ? mask(fmtMoney(h.mv)) : "—"}
                     </span>
-                    <span className="tnum mt-1 block text-xs">
-                      {h.quote?.premium_percent != null ? (
-                        <>
-                          <span className="text-[var(--dim)]">溢价率 </span>
-                          <Pct v={h.quote.premium_percent} />
-                        </>
-                      ) : (
-                        <span aria-hidden="true">&nbsp;</span>
-                      )}
+                    <span className="tnum mt-1 block text-xs whitespace-nowrap text-[var(--dim)]">
+                      占比 {h.share != null ? `${h.share.toFixed(2)}%` : "—"}{" "}
+                      · 溢价率{" "}
+                      <span className="text-[var(--text)]">
+                        {h.quote?.premium_percent != null
+                          ? fmtPct(h.quote.premium_percent)
+                          : "—"}
+                      </span>
                     </span>
                   </span>
                   <span className="text-right">
@@ -1261,7 +1259,10 @@ function HoldingsSection({
                     </span>
                     <span className="tnum mt-1 block text-xs whitespace-nowrap">
                       {h.pnl != null ? (
-                        <Pct v={h.pnlPct} />
+                        <>
+                          <span className="text-[var(--dim)]">浮盈亏 </span>
+                          <Pct v={h.pnlPct} />
+                        </>
                       ) : (
                         <span>—</span>
                       )}
