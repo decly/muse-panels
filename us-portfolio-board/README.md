@@ -1,4 +1,4 @@
-# portfolio-board（看板 · 投资组合）
+# us-portfolio-board（看板 · 投资组合）
 
 多账户美股持仓总览面板（slug：jia-xin-chi-cang-kan-ban）。
 

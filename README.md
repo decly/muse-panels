@@ -8,7 +8,7 @@
 
 | 显示名 | 目录 | 用途 | slug |
 |---|---|---|---|
-| 看板 · 投资组合 | `portfolio-board/` | 多账户美股持仓总览：全局/单账户页签、行情条、集中度、走势区段（账户每日快照历史，原投资历史看板已合并入内）、隐私模式、延长时段价格层 | jia-xin-chi-cang-kan-ban |
+| 看板 · 投资组合 | `us-portfolio-board/` | 多账户美股持仓总览：全局/单账户页签、行情条、集中度、走势区段（账户每日快照历史，原投资历史看板已合并入内）、隐私模式、延长时段价格层 | jia-xin-chi-cang-kan-ban |
 | 看板 · 今日页 | `today-board/` | 静态晨报页：收盘口径的账户总览、昨夜动向、今日事件、金价与其他资产一行 | kan-ban-jin-ri-ye |
 | 看板 · 全天动态 | `stream-board/` | 24 小时全资产事件流：七类事件、顶部实时行情条，事件保留 7 天 | kan-ban-quan-tian-dong-tai |
 | 看板 · 待办总览 | `todo-board/` | 跨对话待办面板：待拍板 / 进行中 / 已办三区，面板内可拍板、巡检执行回写 | kan-ban-dai-ban-zong-lan |
@@ -34,7 +34,7 @@
   每日 06:50 自动备份（导出格式 v2，自带校验和）；本仓库不含任何真实数据。
 - **提交规范**：按功能提交，一个 commit 只含一个功能或一组相关改动；
   标题格式「目录名: 简洁描述」（前缀用英文目录名，可带层级，如
-  `portfolio-board/server`），标题描述与正文用中文。
+  `us-portfolio-board/server`），标题描述与正文用中文。
 
 ## 口径约定（持仓类面板）
 
@@ -58,7 +58,7 @@
 ## 目录
 
 ```
-portfolio-board/   看板 · 投资组合（client / server / drizzle）
+us-portfolio-board/   看板 · 投资组合（client / server / drizzle）
 today-board/       看板 · 今日页（client / server / drizzle）
 stream-board/      看板 · 全天动态（client / server / drizzle）
 todo-board/        看板 · 待办总览（client / server / drizzle）
