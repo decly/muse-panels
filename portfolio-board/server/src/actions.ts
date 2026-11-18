@@ -902,8 +902,10 @@ async function loadPortfolio(ctx: Ctx): Promise<PortfolioResponse> {
   // stay in market_snapshots (history is kept) but are filtered out
   // here and no longer refreshed. Dow Jones + VIX joined on
   // 2026-11-15 (user request): indices first, VIX after them, gold
-  // last.
-  const marketOrder = ["SPX", "NDX", "IXIC", "DJI", "VIX", "GOLD"];
+  // last. ES / NQ index futures (ESF / NQF) were appended at the very
+  // end on 2026-11-18 (user request) — the collapsed strip still
+  // shows only the first two rows (SPX / NDX).
+  const marketOrder = ["SPX", "NDX", "IXIC", "DJI", "VIX", "GOLD", "ESF", "NQF"];
   const market = marketRows
     .filter((m) => marketOrder.includes(m.key))
     .map((m) => ({
@@ -1379,6 +1381,70 @@ async function fetchBenchmark(b: (typeof BENCHMARKS)[number]): Promise<{
       ? new Date(meta.regularMarketTime * 1000).toISOString()
       : new Date().toISOString();
   return { price: meta.regularMarketPrice, change, changePercent, asOf, note: b.note };
+}
+
+// Index futures (added 2026-11-18, user request): ES / NQ continuous
+// contracts, appended after the six cash benchmarks in the strip.
+// Same feed and basis as the 全天动态 board's strip: Yahoo chart API
+// (interval=1m&range=1d), price = regularMarketPrice, move measured
+// against chartPreviousClose. Futures trade nearly around the clock,
+// so regularMarketPrice is always the latest available trade —
+// overnight, pre/post sessions and weekends show the most recent
+// trading session's price rather than a stale close placeholder.
+// These rows never carry peaks: a continuous contract has no
+// spot-index 3-year-high basis, so the strip's 距高点 column stays
+// empty for them (peak fields are written null on every refresh).
+const FUTURES = [
+  { key: "ESF", label: "标普500期货", yahoo: "ES=F", note: "期货 · 连续合约" },
+  { key: "NQF", label: "纳指100期货", yahoo: "NQ=F", note: "期货 · 连续合约" },
+] as const;
+
+async function fetchFuturesQuote(f: (typeof FUTURES)[number]): Promise<{
+  price: number;
+  change: number;
+  changePercent: number;
+  asOf: string;
+  note: string;
+} | null> {
+  try {
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(f.yahoo)}?interval=1m&range=1d`;
+    const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+    if (!res.ok) return null;
+    const json = (await res.json()) as {
+      chart?: {
+        result?: {
+          meta?: {
+            regularMarketPrice?: number;
+            chartPreviousClose?: number;
+            regularMarketTime?: number;
+          };
+        }[];
+      };
+    };
+    const meta = json.chart?.result?.[0]?.meta;
+    const price =
+      typeof meta?.regularMarketPrice === "number"
+        ? meta.regularMarketPrice
+        : null;
+    const prev =
+      typeof meta?.chartPreviousClose === "number"
+        ? meta.chartPreviousClose
+        : null;
+    if (price == null || prev == null || prev === 0) return null;
+    const asOf =
+      typeof meta?.regularMarketTime === "number"
+        ? new Date(meta.regularMarketTime * 1000).toISOString()
+        : new Date().toISOString();
+    return {
+      price,
+      change: price - prev,
+      changePercent: ((price - prev) / prev) * 100,
+      asOf,
+      note: f.note,
+    };
+  } catch {
+    return null;
+  }
 }
 
 // ---------- All-time peak (highest close) seeds + rolling ratchet ----------
@@ -3257,7 +3323,7 @@ type PersonalImportResponse = z.infer<typeof personalImportResponse>;
 export const Actions = {
   getPortfolio: defineAction({
     description:
-      "Returns all accounts （券商A/券商B…) with their stored holdings, per-account cash and per-account daily history, plus the merged global view (same-symbol holdings combined across accounts, cash and history summed), the latest cached regular-close quotes, session-aware extended-hours annotations (pre-market / after-hours), the current US market session (America/New_York), the cached USD/CNY rate, and market benchmarks (S&P 500, Nasdaq-100, Nasdaq Composite, spot gold XAU/USD — the A-share / Hong Kong / Nikkei / Vietnam indices and Shanghai gold moved to the A-share board on 2026-11-15; their stored rows are filtered out) — each benchmark carrying both its all-time highest close (peak_price/peak_date) and its trailing-3-year highest close (peak3y_price/peak3y_date).",
+      "Returns all accounts （券商A/券商B…) with their stored holdings, per-account cash and per-account daily history, plus the merged global view (same-symbol holdings combined across accounts, cash and history summed), the latest cached regular-close quotes, session-aware extended-hours annotations (pre-market / after-hours), the current US market session (America/New_York), the cached USD/CNY rate, and market benchmarks (S&P 500, Nasdaq-100, Nasdaq Composite, spot gold XAU/USD, plus the ES / NQ index futures appended last since 2026-11-18 — latest available trade from Yahoo's continuous contracts, peaks always null so no drawdown is shown for them; the A-share / Hong Kong / Nikkei / Vietnam indices and Shanghai gold moved to the A-share board on 2026-11-15; their stored rows are filtered out) — each cash benchmark carrying both its all-time highest close (peak_price/peak_date) and its trailing-3-year highest close (peak3y_price/peak3y_date).",
     request: z.object({}),
     response: portfolioResponse,
     handler: async (ctx): Promise<PortfolioResponse> => loadPortfolio(ctx),
@@ -4161,6 +4227,46 @@ export const Actions = {
               });
           } catch {
             // keep the last cached benchmark row
+          }
+        }),
+      );
+
+      // Index futures (ES / NQ continuous contracts, added
+      // 2026-11-18): refreshed with the same Yahoo feed and basis as
+      // the 全天动态 strip, so both boards show the same latest
+      // available futures price at any moment — including overnight,
+      // pre/post sessions and weekends. Peaks stay null by design
+      // (no 距高点 for continuous contracts); a failed fetch keeps
+      // the last cached row.
+      await Promise.all(
+        FUTURES.map(async (f) => {
+          try {
+            const q = await fetchFuturesQuote(f);
+            if (!q) return;
+            const values = {
+              key: f.key,
+              label: f.label,
+              price: q.price,
+              change: q.change,
+              changePercent: q.changePercent,
+              asOf: q.asOf,
+              source: "Yahoo Finance",
+              note: q.note,
+              peakPrice: null,
+              peakDate: null,
+              peak3yPrice: null,
+              peak3yDate: null,
+              fetchedAt: now,
+            };
+            await db
+              .insert(schema.marketSnapshots)
+              .values(values)
+              .onConflictDoUpdate({
+                target: schema.marketSnapshots.key,
+                set: values,
+              });
+          } catch {
+            // keep the last cached futures row
           }
         }),
       );

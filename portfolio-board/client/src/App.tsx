@@ -3098,7 +3098,13 @@ export function App() {
                 VIX / 现货黄金）: the A-share, Hang Seng, Golden
                 Dragon, Nikkei, Vietnam and Shanghai-gold rows moved
                 to the A-share board; 道琼斯 + VIX were added the
-                same day. Prices render
+                same day. Two index-futures rows （标普500期货 ES /
+                纳指100期货 NQ, Yahoo continuous contracts) were
+                appended at the end on 2026-11-18 — they show only
+                price + day change (their peak fields stay null, so
+                the 距高点 column renders empty for them) and always
+                carry the latest available trade, sessions or not.
+                Prices render
                 as integers (display-only rounding via money(v, 0);
                 the stored price and the 距高点 math keep full
                 precision) — the one exception is VIX, whose level
@@ -3109,7 +3115,7 @@ export function App() {
                 clicking anywhere on the section — the header row or
                 any benchmark row — folds the strip down to the first
                 two rows （标普500 / 纳指100） or expands it back to
-                all six; default expanded and the choice persists.
+                all eight; default expanded and the choice persists.
                 Rows carry no links or buttons, so no click conflicts. */}
             {data.market.length > 0 && (
               <section
