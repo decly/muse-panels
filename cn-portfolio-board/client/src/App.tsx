@@ -2057,9 +2057,11 @@ function HistoryStat({
 function HistorySection({
   history,
   mask,
+  privacy,
 }: {
   history: Snapshot[];
   mask: (s: string) => string;
+  privacy: boolean;
 }) {
   // The daily snapshot table folds away by default (same habit as
   // the trade ledger's collapse, persisted); the stat cards and the
@@ -2194,7 +2196,12 @@ function HistorySection({
   });
   const pctTick = (v: number) => `${v > 0 ? "+" : ""}${v.toFixed(1)}%`;
   const axisTick = { fontSize: 11, fill: "var(--dim)" } as const;
-  const moneyTick = (v: number) => `${(v / 10000).toFixed(0)}万`;
+  // Money axes （总值走势 / 证券与现金结构） go through the same
+  // privacy rule as every other amount on the board: with privacy
+  // on the tick labels read •••• instead of the ¥万 figure (same
+  // convention as the US board's trend charts).
+  const moneyTick = (v: number) =>
+    privacy ? "••••" : `${(v / 10000).toFixed(0)}万`;
 
   return (
     <section aria-label="走势" id="sec-history" className="section-anchor">
@@ -3047,7 +3054,7 @@ export function App() {
         />
         <HoldingsSection board={data} totals={totals} mask={mask} />
         <Concentration board={data} totals={totals} mask={mask} />
-        <HistorySection history={data.history} mask={mask} />
+        <HistorySection history={data.history} mask={mask} privacy={privacy} />
         <TradesSection mask={mask} />
         <DataSection />
       </main>
